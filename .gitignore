@@ -9,3 +9,6 @@ __pycache__/
 
 # Generated reports shouldn't be committed either
 Camera_Reports_Master/
+
+# Skill-evaluation/benchmark scratch data, not project source
+.claude/skills/camera-audit-workspace/

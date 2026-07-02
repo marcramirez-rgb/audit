@@ -65,6 +65,21 @@ def classify_manufacturer(raw_value):
     return None
 
 
+def _extract_hik_channel_id(behavior_rule_url):
+    """Pulls the channel id back out of a successful Hikvision behaviorRule URL,
+    e.g. '.../channels/2/behaviorRule/1' -> '2'. Returns None for anything that
+    doesn't match that shape (an Axis URL, or the bracketed placeholder URL used
+    on a failed fetch)."""
+    marker = "/channels/"
+    if marker not in behavior_rule_url or "/behaviorRule/" not in behavior_rule_url:
+        return None
+    try:
+        candidate = behavior_rule_url.split(marker, 1)[1].split("/", 1)[0]
+    except IndexError:
+        return None
+    return candidate if candidate.isdigit() else None
+
+
 # --- OBJECT-ORIENTED ARCHITECTURE (OOP) ---
 
 class CameraHandler:
@@ -79,6 +94,13 @@ class CameraHandler:
     def fetch_analytics(self, session, port):
         raise NotImplementedError
 
+    def reposition_for_scene(self, session, port, channel_id, rule_index):
+        """Optional hook for camera types that need physical repositioning before a
+        snapshot will match an analytics rule's coordinate space (e.g. a PTZ camera
+        that binds a rule to a saved pan/tilt/zoom preset). No-op by default --
+        fixed cameras (and Axis, until proven otherwise) don't need this."""
+        return False
+
     def parse_analytics(self, data, img_w, img_h):
         raise NotImplementedError
 
@@ -87,6 +109,29 @@ class HikvisionHandler(CameraHandler):
     def __init__(self, ip, user, password):
         super().__init__(ip, user, password)
         self.fallback_dim = (1920, 1080)
+
+    # PTZ-capable Hikvision units bind an analytics rule's zone coordinates to a
+    # saved pan/tilt/zoom position (a "scenePtz"): the camera's own web UI issues a
+    # PUT to scenePtz/<id>/goto and waits before showing/editing a rule, because the
+    # rule's coordinates are only meaningful once the camera is actually parked at
+    # that position -- otherwise a live snapshot and the rule's coordinate space are
+    # simply looking at two different framings. This was reproduced and confirmed via
+    # a real HAR capture of the web UI against 10.23.27.20. The 6.5s wait mirrors the
+    # ~6.3s the web UI itself waited (polling lockPTZ) between issuing goto and using
+    # the rule/live view again -- an observed real value, not a guess.
+    PTZ_SETTLE_WAIT_SECONDS = 6.5
+
+    def reposition_for_scene(self, session, port, channel_id, rule_index):
+        goto_url = f"http://{self.ip}:{port}/ISAPI/Intelligent/channels/{channel_id}/scenePtz/{rule_index}/goto"
+        for auth in self.auth_strategies:
+            try:
+                response = session.put(goto_url, auth=auth, timeout=STRICT_TIMEOUT, verify=False)
+                if response.status_code == 200:
+                    time.sleep(self.PTZ_SETTLE_WAIT_SECONDS)
+                    return True
+            except requests.exceptions.RequestException:
+                continue
+        return False
 
     def fetch_snapshot(self, session, port):
         img_url = f"http://{self.ip}:{port}/ISAPI/Streaming/channels/101/picture"
@@ -615,6 +660,20 @@ def process_camera_row(args):
                 else:
                     hik_dead = True
 
+            # The snapshot above was only a vendor-detection probe, taken before we
+            # knew this port was Hikvision. If it's a PTZ-bound rule, that probe photo
+            # may not match the rule's saved scene framing -- reposition and re-fetch
+            # a correctly-framed snapshot now that we know which rule we're drawing.
+            if vendor_label == "Hikvision" and payload_data is not None:
+                channel_id = _extract_hik_channel_id(req_url)
+                if channel_id and handler.reposition_for_scene(sess, port, channel_id, "1"):
+                    results["logs"].append(f"    [+] Repositioned PTZ to analytics scene, re-fetching snapshot (Port {port}, Channel {channel_id}).")
+                    fresh_img, _, _, _ = handler.fetch_snapshot(sess, port)
+                    if fresh_img is not None:
+                        camera_image.close()
+                        camera_image = fresh_img
+                        img_w, img_h = camera_image.size
+
             pos_label = f"{pos} [{vendor_label}]"
 
             if payload_data is None:
@@ -659,6 +718,18 @@ def process_camera_row(args):
         bg_color = cam["color"]
         results["logs"].append(f" -> Testing {pos} Interface Port: {port}...")
 
+        payload_data, req_url, err_msg, analytics_auth_rejected = handler.fetch_analytics(sess, port)
+
+        # Analytics is fetched BEFORE the snapshot specifically so a PTZ-bound rule
+        # (Hikvision) can reposition the camera first -- otherwise the snapshot may
+        # capture whatever framing the camera happens to be resting at, which won't
+        # match the rule's coordinate space. No-op for Axis / non-PTZ Hikvision units.
+        if payload_data is not None:
+            channel_id = _extract_hik_channel_id(req_url)
+            if channel_id:
+                if handler.reposition_for_scene(sess, port, channel_id, "1"):
+                    results["logs"].append(f"    [+] Repositioned PTZ to analytics scene before snapshot (Port {port}, Channel {channel_id}).")
+
         camera_image, snap_url, snap_err, snap_auth_rejected = handler.fetch_snapshot(sess, port)
         if camera_image is None:
             img_w, img_h = handler.fallback_dim
@@ -667,8 +738,6 @@ def process_camera_row(args):
             results["missed"].append([timestamp, client_name, location, serial, f"{pos} ({port}) [SNAPSHOT]", snap_url, snap_err])
         else:
             img_w, img_h = camera_image.size
-
-        payload_data, req_url, err_msg, analytics_auth_rejected = handler.fetch_analytics(sess, port)
 
         if payload_data is None:
             err_msg = err_msg or "Unauthorized Connection (All auth variations failed)"
