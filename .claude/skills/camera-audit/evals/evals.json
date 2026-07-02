@@ -1,0 +1,47 @@
+{
+  "skill_name": "camera-audit",
+  "evals": [
+    {
+      "id": 0,
+      "name": "csv-batch",
+      "prompt": "I've got fullTesting.csv sitting in this folder with 6 cameras on it (mostly Hikvision/LVT units, one Axis, one Dahua we're not sure about). Can you run the camera audit against it and tag the report 'JulyCheck'?",
+      "expected_output": "Recognizes CSV batch mode, builds a run_audit.py --csv <path> --tag JulyCheck invocation, explains it needs to launch in a separate console window for credential prompts (does not ask for username/password in chat), and flags that the Dahua row and the blank-IP row will be skipped/flagged rather than guessed.",
+      "files": ["input/fullTesting.csv"],
+      "assertions": [
+        {"text": "Identifies this as CSV batch mode, not single-camera mode"},
+        {"text": "Constructs a run_audit.py command using --csv pointing at fullTesting.csv and --tag JulyCheck"},
+        {"text": "Does not ask the user to type a camera username or password into the chat"},
+        {"text": "Explains that credentials will be entered in a separate/new console window rather than inline"},
+        {"text": "Notes the Dahua row will be flagged/skipped (Missed Cameras) rather than guessed as Axis or Hikvision"},
+        {"text": "Notes the row with a blank IP will be skipped"}
+      ]
+    },
+    {
+      "id": 1,
+      "name": "single-camera-diagnostic",
+      "prompt": "Can you check camera 192.0.2.44? It's one of our Axis units and I just want to see what analytics rules are configured on it before we ship it out.",
+      "expected_output": "Recognizes single-camera mode, builds a run_audit.py --ip 192.0.2.44 --manufacturer axis invocation without asking for unnecessary info, and explains the separate-console-window credential step.",
+      "files": [],
+      "assertions": [
+        {"text": "Identifies this as single-camera mode, not CSV batch mode"},
+        {"text": "Constructs a run_audit.py command using --ip 192.0.2.44 --manufacturer axis"},
+        {"text": "Does not ask the user to type a camera username or password into the chat"},
+        {"text": "Explains that credentials will be entered in a separate/new console window rather than inline"},
+        {"text": "Does not ask the user to produce or locate a CSV file for this single-camera request"}
+      ]
+    },
+    {
+      "id": 2,
+      "name": "snowflake-no-csv-yet",
+      "prompt": "We need an analytics audit for unit TDC14016 for a client walkthrough tomorrow. I don't have a CSV yet -- what's the fastest way to get this done?",
+      "expected_output": "Points to the Snowflake query for pulling that unit's IP/manufacturer into a CSV (adjusting the WHERE clause to TDC14016), rather than guessing an IP or skipping straight to run_audit.py without one.",
+      "files": [],
+      "assertions": [
+        {"text": "Provides a Snowflake SQL query (or clearly points to one) filtered for unit TDC14016"},
+        {"text": "Does not fabricate or guess an IP address for the camera"},
+        {"text": "Explains the exported CSV needs an IP column (and ideally MANUFACTURER) before the audit tool can run"},
+        {"text": "Does not ask the user to type a camera username or password into the chat"}
+      ]
+    }
+  ]
+}

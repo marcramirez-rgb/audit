@@ -1,0 +1,11 @@
+# Real credentials -- never commit. Use .env.example as the template.
+.env
+access.env
+*.env
+!.env.example
+
+__pycache__/
+*.pyc
+
+# Generated reports shouldn't be committed either
+Camera_Reports_Master/
