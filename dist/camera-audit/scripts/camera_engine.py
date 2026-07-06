@@ -221,10 +221,14 @@ class HikvisionHandler(CameraHandler):
                 raw_x = float(coord.find('ns:positionX', namespaces).text)
                 raw_y = float(coord.find('ns:positionY', namespaces).text)
 
+                # Hikvision positionX/positionY use a 0..1000 space with (0,0)
+                # at the top-left. Map directly and clamp to bounds. Previous
+                # behavior inverted axes which caused mirrored overlays.
                 pixel_x = int((raw_x / 1000.0) * img_w)
                 pixel_y = int((raw_y / 1000.0) * img_h)
-                pixel_x = img_w - pixel_x
-                pixel_y = img_h - pixel_y
+                pixel_y = img_h - 1 - pixel_y
+                pixel_x = max(0, min(img_w - 1, pixel_x))
+                pixel_y = max(0, min(img_h - 1, pixel_y))
                 vertices.append((pixel_x, pixel_y))
 
             if not vertices: continue

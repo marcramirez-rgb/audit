@@ -1,0 +1,31 @@
+# Debug run log
+{
+  "timestamp": "20260706T150442Z",
+  "cwd": "C:\\Users\\MarcRamirez\\Downloads\\axis_api_testing",
+  "command": [
+    "C:\\Users\\MarcRamirez\\AppData\\Local\\Microsoft\\WindowsApps\\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\\python.exe",
+    "C:\\Users\\MarcRamirez\\Downloads\\axis_api_testing\\dist\\camera-audit\\scripts\\run_audit.py",
+    "--ip",
+    "10.23.19.107",
+    "--manufacturer",
+    "lvt"
+  ],
+  "env_snapshot": {
+    "PYTHONPATH": null,
+    "PYTHONFAULTHANDLER": "1",
+    "PYTHONWARNINGS": "default"
+  },
+  "python": "C:\\Users\\MarcRamirez\\AppData\\Local\\Microsoft\\WindowsApps\\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\\python.exe"
+}
+
+--- STDOUT / STDERR ---
+
+--- STDOUT ---
+(no stdout)
+
+--- STDERR ---
+  File "C:\Users\MarcRamirez\Downloads\axis_api_testing\dist\camera-audit\scripts\run_audit.py", line 161
+    parser.add_argument("--manufacturer", choices=["axis", "hikvision", "lvt", "mixed"],
+IndentationError: unexpected indent
+
+--- RETURN CODE: 1 ---

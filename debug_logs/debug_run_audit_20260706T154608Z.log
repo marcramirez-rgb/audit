@@ -1,0 +1,57 @@
+# Debug run log
+{
+  "timestamp": "20260706T154608Z",
+  "cwd": "C:\\Users\\MarcRamirez\\Downloads\\axis_api_testing",
+  "command": [
+    "C:\\Users\\MarcRamirez\\AppData\\Local\\Microsoft\\WindowsApps\\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\\python.exe",
+    "C:\\Users\\MarcRamirez\\Downloads\\axis_api_testing\\dist\\camera-audit\\scripts\\run_audit.py",
+    "--ip",
+    "10.23.19.107",
+    "--manufacturer",
+    "lvt"
+  ],
+  "env_snapshot": {
+    "PYTHONPATH": null,
+    "PYTHONFAULTHANDLER": "1",
+    "PYTHONWARNINGS": "default"
+  },
+  "python": "C:\\Users\\MarcRamirez\\AppData\\Local\\Microsoft\\WindowsApps\\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\\python.exe"
+}
+
+--- STDOUT / STDERR ---
+
+--- STDOUT ---
+=========================================
+  CAMERA AUDIT - CREDENTIAL PROMPT
+=========================================
+[+] Spinning up multi-threaded batch engine...
+
+#################################################################
+ INGESTING HOST NODE [1/1]: Single Test - Diagnostic (10.23.19.107) [HIKVISION]
+#################################################################
+ -> Testing CENTER Interface Port: 5010...
+    [+] Logged metrics for Port 5010 Scenario: RULE1 (1s)
+    [+] Logged metrics for Port 5010 Scenario: RULE2 (1s)
+ -> Testing LEFT Interface Port: 5015...
+    [+] Logged metrics for Port 5015 Scenario: RULE1 (1s)
+    [+] Logged metrics for Port 5015 Scenario: RULE2 (1s)
+ -> Testing RIGHT Interface Port: 5020...
+    [+] Logged metrics for Port 5020 Scenario: RULE1 (1s)
+    [+] Logged metrics for Port 5020 Scenario: RULE2 (1s)
+
+=================================================================
+ MASTER BATCH PROCESSING COMPLETED SUCCESSFULLY
+=================================================================
+ -> Total Run Duration: 0m 7s (7.16 total seconds)
+ -> Threads Utilized: 1
+ -> Master Report Saved: Diagnostic_Test_10_23_19_107_Master_20260706_094609.xlsx
+=================================================================
+
+
+[DONE] Report written to: C:\Users\MarcRamirez\Downloads\Camera_Reports_Master\Diagnostic_Test_10_23_19_107_Master_20260706_094609.xlsx
+[*] Opening results folder...
+
+--- STDERR ---
+(no stderr)
+
+--- RETURN CODE: 0 ---

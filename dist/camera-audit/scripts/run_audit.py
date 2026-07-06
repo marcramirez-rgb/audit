@@ -103,28 +103,33 @@ def dedupe_by_ip(rows):
 
 
 def build_single_row(args):
+    # Normalize known vendor aliases: treat 'lvt' as Hikvision-compatible
+    mfg = (args.manufacturer or "").strip().lower()
+    if mfg == "lvt":
+        mfg = "hikvision"
     return [{
         "CLIENT_NM": args.client or "Single Test",
         "LOCATION_NM": args.location or "Diagnostic",
         "LIVE_UNIT_SERIAL_NM": args.serial or "N/A",
         "IP": args.ip,
-        "MANUFACTURER": args.manufacturer,
+        "MANUFACTURER": mfg,
     }]
 
 
 def prompt_credentials(needs_axis, needs_hik):
     credentials = {"AXIS_USER": None, "AXIS_PASS": None, "HIK_USER": None, "HIK_PASS": None}
 
+    # Allow non-interactive debugging via environment variables
     if needs_axis:
-        credentials["AXIS_USER"] = input("Enter Axis camera username: ").strip()
-        credentials["AXIS_PASS"] = getpass.getpass("Enter Axis camera password: ").strip()
+        credentials["AXIS_USER"] = os.getenv("AXIS_USER") or input("Enter Axis camera username: ").strip()
+        credentials["AXIS_PASS"] = os.getenv("AXIS_PASSWORD") or getpass.getpass("Enter Axis camera password: ").strip()
         if not credentials["AXIS_USER"] or not credentials["AXIS_PASS"]:
             print("[-] Error: Axis username/password cannot be blank.")
             sys.exit(1)
 
     if needs_hik:
-        credentials["HIK_USER"] = input("Enter Hikvision camera username: ").strip()
-        credentials["HIK_PASS"] = getpass.getpass("Enter Hikvision camera password: ").strip()
+        credentials["HIK_USER"] = os.getenv("HIK_USER") or input("Enter Hikvision camera username: ").strip()
+        credentials["HIK_PASS"] = os.getenv("HIK_PASSWORD") or getpass.getpass("Enter Hikvision camera password: ").strip()
         if not credentials["HIK_USER"] or not credentials["HIK_PASS"]:
             print("[-] Error: Hikvision username/password cannot be blank.")
             sys.exit(1)
@@ -153,10 +158,11 @@ def main():
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--csv", help="Path to a CSV of cameras (columns: IP, MANUFACTURER, CLIENT_NM, LOCATION_NM, LIVE_UNIT_SERIAL_NM).")
     mode.add_argument("--ip", help="Single camera IP to test.")
-    parser.add_argument("--manufacturer", choices=["axis", "hikvision", "mixed"],
-                         help="Required with --ip. Use 'mixed' when the unit's three camera "
-                              "positions aren't all the same vendor -- this asks for both "
-                              "credential sets and figures out each port's vendor individually.")
+    parser.add_argument("--manufacturer", choices=["axis", "hikvision", "lvt", "mixed"],
+                        help="Required with --ip. Use 'mixed' when the unit's three camera "
+                             "positions aren't all the same vendor -- this asks for both "
+                             "credential sets and figures out each port's vendor individually. "
+                             "Note: 'lvt' is treated as Hikvision-compatible.")
     parser.add_argument("--client", help="Client name (single-camera mode only).")
     parser.add_argument("--location", help="Location name (single-camera mode only).")
     parser.add_argument("--serial", help="Unit serial (single-camera mode only).")

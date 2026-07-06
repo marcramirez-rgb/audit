@@ -62,7 +62,7 @@ Required column: `IP`. Recognized optional columns:
 
 | Column | Purpose | Default if blank |
 |---|---|---|
-| `MANUFACTURER` | Must contain "axis", "hik", or "lvt" (case-insensitive) | Row is flagged as unrecognized and skipped (see below) |
+| `MANUFACTURER` | Must contain "axis", "hik", or "lvt" (case-insensitive). Rows with `LVT` are treated as Hikvision-compatible. | Row is flagged as unrecognized and skipped (see below) |
 | `CLIENT_NM` | Client/customer name, shown in the report | blank |
 | `LOCATION_NM` | Site/location name | blank |
 | `LIVE_UNIT_SERIAL_NM` | Unit serial number | blank |
@@ -98,6 +98,21 @@ Reports land in `~/Downloads/Camera_Reports_Master/`, named
 - **Missed Cameras** — every failure: connection errors, timeouts, rejected
   credentials, or a camera running an analytics engine this tool doesn't
   support (see Known Limitations).
+
+### Debug artifacts
+
+Temporary debug outputs and diagnostics are written to `debug_overlay_tests/`.
+Keep the folder, and use it as the canonical place for overlay/debug artifacts
+from test runs and troubleshooting scripts.
+
+Example:
+
+```bash
+python overlay_debug.py --ip 10.23.19.107 --manufacturer lvt --username admin --password secret
+```
+
+Adjust the arguments to match the target camera and credentials for your
+environment.
 
 ## Known limitations
 
@@ -167,3 +182,6 @@ WHERE lu.live_unit_serial_nr in ('TDC14016')
 GROUP BY lu.CLIENT_NM, lu.LOCATION_NM, nc.PUBLIC_IP, lu.LIVE_UNIT_SERIAL_NR, cm.MANUFACTURER, cm.MODEL
 ORDER BY lu.LOCATION_NM
 |Use whatever filtering clause you want to retrieve the data but it the csv file for bulk upload most have those 6 columns
+
+## Snowflake access
+Access can be requested in via Okta 
