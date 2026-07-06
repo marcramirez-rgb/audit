@@ -48,14 +48,20 @@ if run_mode == "2":
     while not single_ip:
         single_ip = input("[!] IP Address cannot be blank. Enter Camera IP: ").strip()
 
-    print("\nSelect Camera Manufacturer:")
+    print("Select Camera Manufacturer:")
     print("1. Hikvision")
     print("2. Axis")
-    mfg_choice = input("Enter 1 or 2 [Default 1]: ").strip()
-    while mfg_choice not in ("", "1", "2"):
-        mfg_choice = input("[!] Invalid selection. Enter 1 or 2 [Default 1]: ").strip()
-    single_mfg = "Axis" if mfg_choice == "2" else "Hikvision"
-    print(f"[+] Manufacturer selected: {single_mfg}")
+    print("3. LVT (Hikvision-compatible)")
+    mfg_choice = input("Enter 1, 2, or 3 [Default 1]: ").strip()
+    while mfg_choice not in ("", "1", "2", "3"):
+        mfg_choice = input("[!] Invalid selection. Enter 1, 2, or 3 [Default 1]: ").strip()
+    if mfg_choice == "2":
+        single_mfg = "Axis"
+    elif mfg_choice == "3":
+        single_mfg = "LVT"
+    else:
+        single_mfg = "Hikvision"
+    print(f"[+] Manufacturer selected: {single_mfg} (LVT is treated as Hikvision-compatible)")
 
     camera_rows.append({
         "CLIENT_NM": input("\nEnter Client Name (Optional): ").strip() or "Single Test",
@@ -143,13 +149,13 @@ if needs_axis:
         print("[-] Error: Axis password cannot be blank. Exiting.")
         exit()
 if needs_hik:
-    USER_HIK = input("\n[!] Enter Hikvision camera username: ").strip()
+    USER_HIK = input("\n[!] Enter Hikvision/LVT camera username: ").strip()
     if not USER_HIK:
-        print("[-] Error: Hikvision username cannot be blank. Exiting.")
+        print("[-] Error: Hikvision/LVT username cannot be blank. Exiting.")
         exit()
-    PASS_HIK = getpass.getpass("[!] Enter Hikvision camera password: ").strip()
+    PASS_HIK = getpass.getpass("[!] Enter Hikvision/LVT camera password: ").strip()
     if not PASS_HIK:
-        print("[-] Error: Hikvision password cannot be blank. Exiting.")
+        print("[-] Error: Hikvision/LVT password cannot be blank. Exiting.")
         exit()
 
 credentials = {

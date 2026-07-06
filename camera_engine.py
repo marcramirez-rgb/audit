@@ -9,6 +9,7 @@ import concurrent.futures
 import time
 import xml.etree.ElementTree as ET
 from datetime import datetime
+import os
 from io import BytesIO
 from pathlib import Path
 
@@ -266,10 +267,18 @@ class HikvisionHandler(CameraHandler):
                 raw_x = float(coord.find('ns:positionX', namespaces).text)
                 raw_y = float(coord.find('ns:positionY', namespaces).text)
 
+                # Hikvision positionX/positionY are in a 0..1000 coordinate
+                # space where (0,0) is the top-left. Map directly to pixel
+                # coordinates and clamp to image bounds. Previous behavior
+                # inverted both axes which produced mirrored overlays vs the
+                # camera web UI.
                 pixel_x = int((raw_x / 1000.0) * img_w)
                 pixel_y = int((raw_y / 1000.0) * img_h)
-                pixel_x = img_w - pixel_x
-                pixel_y = img_h - pixel_y
+                # This camera's rule coordinates require a vertical flip to match
+                # the live snapshot orientation observed in test_variant_flip_y.
+                pixel_y = img_h - 1 - pixel_y
+                pixel_x = max(0, min(img_w - 1, pixel_x))
+                pixel_y = max(0, min(img_h - 1, pixel_y))
                 vertices.append((pixel_x, pixel_y))
 
             if not vertices: continue
@@ -442,15 +451,88 @@ def render_overlay_image(camera_image, vertices, index, img_w, img_h, rule_type=
 
     if vertices:
         is_line_rule = any(keyword in rule_type.lower() for keyword in ["line", "cross", "fence"])
-        if is_line_rule or len(vertices) <= 2:
-            draw.line(vertices, fill=rgb_color + (255,), width=4)
+        # For polygon rules, apply a centroid-angle sort to ensure a consistent
+        # non-self-intersecting drawing order. Line rules and tiny vertex sets
+        # are left as-is.
+        verts_to_draw = vertices
+        try:
+            if not is_line_rule and len(vertices) > 2:
+                import math
+                cx = sum([p[0] for p in vertices]) / len(vertices)
+                cy = sum([p[1] for p in vertices]) / len(vertices)
+                verts_to_draw = sorted(vertices, key=lambda p: math.atan2(p[1] - cy, p[0] - cx))
+        except Exception:
+            verts_to_draw = vertices
+
+        if is_line_rule or len(verts_to_draw) <= 2:
+            draw.line(verts_to_draw, fill=rgb_color + (255,), width=4)
         else:
-            draw.polygon(vertices, fill=rgb_color + (76,))
-            draw.polygon(vertices, outline=rgb_color + (255,), width=3)
-        for (x, y) in vertices:
+            draw.polygon(verts_to_draw, fill=rgb_color + (76,))
+            draw.polygon(verts_to_draw, outline=rgb_color + (255,), width=3)
+        for (x, y) in verts_to_draw:
             draw.ellipse((x - 6, y - 6, x + 6, y + 6), fill=(255, 255, 0, 255), outline=(0, 0, 0, 255), width=1)
 
     final_img = PILImage.alpha_composite(base_img, overlay).convert("RGB")
+
+    # Optional debug: save full-size overlay images and vertex lists when requested
+    try:
+        dbg_mode = os.getenv("DEBUG_OVERLAY", "0")
+        if dbg_mode in ("1", "2"):
+            root = Path(__file__).resolve().parent
+            dbg_dir = root / "debug_overlay_tests"
+            dbg_dir.mkdir(parents=True, exist_ok=True)
+            ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+            fname = dbg_dir / f"overlay_{ts}_{index}.png"
+            final_img.save(fname, format="PNG")
+            # also write vertices JSON for easier inspection
+            vfname = dbg_dir / f"overlay_{ts}_{index}_vertices.json"
+            try:
+                import json
+                with open(vfname, "w", encoding="utf-8") as vf:
+                    json.dump({"vertices": vertices, "rule_type": rule_type, "img_w": img_w, "img_h": img_h}, vf, indent=2)
+            except Exception:
+                pass
+
+            if dbg_mode == "2":
+                # Outline-only overlay for clearer edge inspection
+                try:
+                    overlay_outline = PILImage.new("RGBA", base_img.size, (0, 0, 0, 0))
+                    draw_outline = ImageDraw.Draw(overlay_outline)
+                    if vertices:
+                        draw_outline.polygon(vertices, outline=rgb_color + (255,), width=6)
+                        for (x, y) in vertices:
+                            draw_outline.ellipse((x - 6, y - 6, x + 6, y + 6), fill=(255, 255, 0, 255), outline=(0, 0, 0, 255), width=1)
+                    img_outline = PILImage.alpha_composite(base_img, overlay_outline).convert("RGB")
+                    fname_o = dbg_dir / f"overlay_{ts}_{index}_outline.png"
+                    img_outline.save(fname_o, format="PNG")
+                except Exception:
+                    pass
+
+                # Reordered vertices (centroid-angle sort) to see if ordering fixes shape
+                try:
+                    if vertices:
+                        import math, json as _json
+                        cx = sum([p[0] for p in vertices]) / len(vertices)
+                        cy = sum([p[1] for p in vertices]) / len(vertices)
+                        verts_sorted = sorted(vertices, key=lambda p: math.atan2(p[1] - cy, p[0] - cx))
+                        # save reordered overlay
+                        overlay_re = PILImage.new("RGBA", base_img.size, (0, 0, 0, 0))
+                        draw_re = ImageDraw.Draw(overlay_re)
+                        draw_re.polygon(verts_sorted, fill=rgb_color + (76,))
+                        draw_re.polygon(verts_sorted, outline=rgb_color + (255,), width=3)
+                        for (x, y) in verts_sorted:
+                            draw_re.ellipse((x - 6, y - 6, x + 6, y + 6), fill=(255, 255, 0, 255), outline=(0, 0, 0, 255), width=1)
+                        img_re = PILImage.alpha_composite(base_img, overlay_re).convert("RGB")
+                        fname_r = dbg_dir / f"overlay_{ts}_{index}_reordered.png"
+                        img_re.save(fname_r, format="PNG")
+                        # write reordered vertices json
+                        vfname_r = dbg_dir / f"overlay_{ts}_{index}_reordered_vertices.json"
+                        with open(vfname_r, "w", encoding="utf-8") as vf:
+                            _json.dump({"vertices": verts_sorted, "rule_type": rule_type, "img_w": img_w, "img_h": img_h}, vf, indent=2)
+                except Exception:
+                    pass
+    except Exception:
+        pass
 
     ratio = THUMB_H / final_img.height
     img_resized = final_img.resize((int(final_img.width * ratio), THUMB_H), PILImage.Resampling.LANCZOS)

@@ -4,6 +4,29 @@ description: Runs a quick single-camera Axis/Hikvision analytics check (camera_e
 ---
 ##This tool assumes you have access to snowflake and can provide unit/camera IP address. This is built to handle Axis and Hikvision camera. Dahua implemention to be added in later. This will not take a snapshot of quad view cameras 
 
+##You must be logged into the aws-prod.lvtops.net VPN in order for this to function
+
+ 
+## Getting data: You can find the camera/unit IP address in VMS for single use by searching TDC. If you need a bulk audit, use snowflake to find entire client/fleet wide units:
+| In snowflake you will want to use the below query:
+|SELECT
+    nc.PUBLIC_IP AS IP, 
+    lu.LIVE_UNIT_SERIAL_NR AS LIVE_UNIT_SERIAL_NM,
+    lu.LOCATION_NM,
+    lu.CLIENT_NM,
+    cm.MANUFACTURER,
+    cm.MODEL
+FROM STAGING.HORUS.NETWORK_CAMERAS nc
+JOIN EDW.DM_PRODUCT.LIVE_UNIT lu
+    ON nc.LIVE_UNIT_ID = lu.LIVE_UNIT_ID
+LEFT JOIN STAGING.HORUS.CAMERA_MFTRS cm
+    ON nc.CAMERA_MFTRS_ID = cm.ID
+WHERE lu.live_unit_serial_nr in ('TDC14016')
+GROUP BY lu.CLIENT_NM, lu.LOCATION_NM, nc.PUBLIC_IP, lu.LIVE_UNIT_SERIAL_NR, cm.MANUFACTURER, cm.MODEL
+ORDER BY lu.LOCATION_NM
+|Use whatever filtering clause you want to retrieve the data but it the csv file for bulk upload must have those 6 columns
+
+**due to flattening of client heirarchy it might be best to query by parent client 
 
 # Camera Audit
 
