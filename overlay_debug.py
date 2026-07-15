@@ -7,10 +7,10 @@ from requests.auth import HTTPDigestAuth, HTTPBasicAuth
 OUTPUT_DIR = Path(r'c:\Users\MarcRamirez\Downloads\axis_api_testing\debug_overlay_tests')
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-CAMERA_IP = '10.23.19.107'
+CAMERA_IP = '192.0.2.10'  # placeholder -- set to the target camera IP before running
 PORT = 5010
-USERNAME = 'admin'
-PASSWORD = 'REDACTED-CREDENTIAL'
+USERNAME = ''  # fill in before running -- do not commit real credentials
+PASSWORD = ''  # fill in before running -- do not commit real credentials
 SNAPSHOT_URL = f'http://{CAMERA_IP}:{PORT}/ISAPI/Streaming/channels/101/picture'
 
 JSON_FILE = OUTPUT_DIR / 'overlay_20260706T145800Z_1_vertices.json'

@@ -65,6 +65,43 @@ def classify_manufacturer(raw_value):
     return None
 
 
+def dedupe_camera_rows(rows):
+    """Collapse rows sharing the same IP into a single device row.
+
+    If an IP appears multiple times with more than one recognized vendor, the
+    resulting row is marked as MANUFACTURER='mixed' so the engine can probe each
+    port against both Axis and Hikvision APIs.
+    """
+    grouped = {}
+    order = []
+    passthrough = []
+    for row in rows:
+        ip = (row.get("IP", "") or "").strip()
+        if not ip:
+            passthrough.append(row)
+            continue
+        if ip not in grouped:
+            grouped[ip] = []
+            order.append(ip)
+        grouped[ip].append(row)
+
+    deduped = []
+    for ip in order:
+        group = grouped[ip]
+        if len(group) == 1:
+            deduped.append(group[0])
+            continue
+
+        classes = {classify_manufacturer(r.get("MANUFACTURER", "")) for r in group}
+        classes.discard(None)
+        base = dict(group[0])
+        if len(classes) > 1:
+            base["MANUFACTURER"] = "mixed"
+        deduped.append(base)
+
+    return deduped + passthrough
+
+
 # --- OBJECT-ORIENTED ARCHITECTURE (OOP) ---
 
 class CameraHandler:
@@ -212,30 +249,73 @@ class HikvisionHandler(CameraHandler):
                 target_node = rule.find('.//ns:detectionTarget', namespaces) or rule.find('.//ns:TargetType', namespaces)
             target_detection = target_node.text.capitalize() if (target_node is not None and target_node.text) else "All Targets"
 
-            region = rule.find('.//ns:RegionCoordinatesList', namespaces)
-            if region is None:
+            region_lists = rule.findall('.//ns:RegionCoordinatesList', namespaces)
+            polygons = []
+            for region in region_lists:
+                vertices = []
+                for coord in region.findall('ns:RegionCoordinates', namespaces):
+                    raw_x = float(coord.find('ns:positionX', namespaces).text)
+                    raw_y = float(coord.find('ns:positionY', namespaces).text)
+
+                    # Hikvision positionX/positionY use a 0..1000 space with (0,0)
+                    # at the top-left. Map directly and clamp to bounds. Previous
+                    # behavior inverted axes which caused mirrored overlays.
+                    pixel_x = int((raw_x / 1000.0) * img_w)
+                    pixel_y = int((raw_y / 1000.0) * img_h)
+                    pixel_y = img_h - 1 - pixel_y
+                    pixel_x = max(0, min(img_w - 1, pixel_x))
+                    pixel_y = max(0, min(img_h - 1, pixel_y))
+                    vertices.append((pixel_x, pixel_y))
+
+                if vertices:
+                    polygons.append(vertices)
+
+            if not polygons:
                 continue
 
-            vertices = []
-            for coord in region.findall('ns:RegionCoordinates', namespaces):
-                raw_x = float(coord.find('ns:positionX', namespaces).text)
-                raw_y = float(coord.find('ns:positionY', namespaces).text)
+            for zone_index, polygon in enumerate(polygons, start=1):
+                parsed_rules.append({
+                    "is_placeholder": False,
+                    "name": rule_name if len(polygons) == 1 else f"{rule_name} [Zone {zone_index}]",
+                    "type": event_type,
+                    "duration": duration_val,
+                    "target": target_detection,
+                    "vertices": polygon
+                })
 
-                # Hikvision positionX/positionY use a 0..1000 space with (0,0)
-                # at the top-left. Map directly and clamp to bounds. Previous
-                # behavior inverted axes which caused mirrored overlays.
-                pixel_x = int((raw_x / 1000.0) * img_w)
-                pixel_y = int((raw_y / 1000.0) * img_h)
-                pixel_y = img_h - 1 - pixel_y
-                pixel_x = max(0, min(img_w - 1, pixel_x))
-                pixel_y = max(0, min(img_h - 1, pixel_y))
-                vertices.append((pixel_x, pixel_y))
+        def normalize_vertices_key(verts):
+            if not verts:
+                return ()
+            if isinstance(verts[0], (list, tuple)) and verts[0] and isinstance(verts[0][0], (list, tuple)):
+                return tuple(tuple((int(x), int(y)) for x, y in polygon) for polygon in verts)
+            return tuple((int(x), int(y)) for x, y in verts)
 
-            if not vertices: continue
+        seen = set()
+        deduped = []
+        for r in parsed_rules:
+            verts_key = normalize_vertices_key(r.get("vertices", []))
+            key = (r.get("name"), r.get("type"), r.get("target"), r.get("duration"), verts_key)
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(r)
 
-            parsed_rules.append({"is_placeholder": False, "name": rule_name, "type": event_type, "duration": duration_val, "target": target_detection, "vertices": vertices})
+        if deduped:
+            return deduped
+        return [{"is_placeholder": True, "name": "No Scenarios Configured", "type": "N/A", "target": "No Analytics Configured", "duration": "N/A", "vertices": []}]
+        seen = set()
+        deduped = []
+        for r in parsed_rules:
+            verts_key = tuple((int(x), int(y)) for x, y in r.get("vertices", []))
+            key = (r.get("name"), r.get("type"), r.get("target"), r.get("duration"), verts_key)
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(r)
 
-        return parsed_rules if parsed_rules else [{"is_placeholder": True, "name": "No Scenarios Configured", "type": "N/A", "target": "No Analytics Configured", "duration": "N/A", "vertices": []}]
+        if deduped:
+            return deduped
+        return [{"is_placeholder": True, "name": "No Scenarios Configured", "type": "N/A", "target": "No Analytics Configured", "duration": "N/A", "vertices": []}]
 
 
 class AxisHandler(CameraHandler):
@@ -381,17 +461,26 @@ class AxisHandler(CameraHandler):
                     pixel_y = int(((1.0 - raw_y) / 2.0) * img_h)
                     vertices.append((pixel_x, pixel_y))
 
-            parsed_rules.append({"is_placeholder": False, "name": rule_name, "type": rule_type, "duration": duration_val, "target": target_detection, "vertices": vertices})
+            parsed_rules.append({
+                "is_placeholder": False,
+                "name": rule_name,
+                "type": rule_type,
+                "duration": duration_val,
+                "target": target_detection,
+                "vertices": vertices
+            })
+
         return parsed_rules
 
 
 # --- UNIVERSAL RENDERING ENGINE (JPEG COMPRESSION) ---
 
 def render_overlay_image(camera_image, vertices, index, img_w, img_h, rule_type=""):
+    snapshot_missing = (camera_image is None)
     if camera_image is not None:
         base_img = camera_image.copy().convert("RGBA")
     else:
-        base_img = PILImage.new("RGBA", (img_w, img_h), (50, 50, 50, 255))
+        base_img = PILImage.new("RGBA", (img_w, img_h), (40, 40, 40, 255))
 
     brand_colors = [(0, 161, 154), (0, 114, 110), (229, 245, 245)]
     rgb_color = brand_colors[index % 3]
@@ -399,15 +488,53 @@ def render_overlay_image(camera_image, vertices, index, img_w, img_h, rule_type=
     overlay = PILImage.new("RGBA", base_img.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
 
-    if vertices:
+    def _get_polygons(verts):
+        if not verts:
+            return []
+        if isinstance(verts[0], (list, tuple)) and verts[0] and isinstance(verts[0][0], (list, tuple)):
+            return verts
+        return [verts]
+
+    for polygon in _get_polygons(vertices):
         is_line_rule = any(keyword in rule_type.lower() for keyword in ["line", "cross", "fence"])
-        if is_line_rule or len(vertices) <= 2:
-            draw.line(vertices, fill=rgb_color + (255,), width=4)
+        polygon_to_draw = polygon
+        try:
+            if not is_line_rule and len(polygon) > 2:
+                import math
+                cx = sum([p[0] for p in polygon]) / len(polygon)
+                cy = sum([p[1] for p in polygon]) / len(polygon)
+                polygon_to_draw = sorted(polygon, key=lambda p: math.atan2(p[1] - cy, p[0] - cx))
+        except Exception:
+            polygon_to_draw = polygon
+
+        if is_line_rule or len(polygon_to_draw) <= 2:
+            draw.line(polygon_to_draw, fill=rgb_color + (255,), width=4)
         else:
-            draw.polygon(vertices, fill=rgb_color + (76,))
-            draw.polygon(vertices, outline=rgb_color + (255,), width=3)
-        for (x, y) in vertices:
+            draw.polygon(polygon_to_draw, fill=rgb_color + (76,))
+            draw.polygon(polygon_to_draw, outline=rgb_color + (255,), width=3)
+        for (x, y) in polygon_to_draw:
             draw.ellipse((x - 6, y - 6, x + 6, y + 6), fill=(255, 255, 0, 255), outline=(0, 0, 0, 255), width=1)
+
+    if snapshot_missing:
+        try:
+            from PIL import ImageFont
+            font = ImageFont.load_default()
+            text = "SNAPSHOT UNAVAILABLE"
+            try:
+                text_width, text_height = draw.textsize(text, font=font)
+            except Exception:
+                text_width, text_height = font.getsize(text)
+            padding = 12
+            text_box = [
+                (base_img.width - text_width) // 2 - padding,
+                (base_img.height - text_height) // 2 - padding,
+                (base_img.width + text_width) // 2 + padding,
+                (base_img.height + text_height) // 2 + padding,
+            ]
+            draw.rectangle(text_box, fill=(0, 0, 0, 200), outline=(255, 255, 255, 255), width=2)
+            draw.text(((base_img.width - text_width) // 2, (base_img.height - text_height) // 2), text, fill=(255, 255, 255, 255), font=font)
+        except Exception:
+            draw.text((10, 10), "SNAPSHOT UNAVAILABLE", fill=(255, 255, 255, 255))
 
     final_img = PILImage.alpha_composite(base_img, overlay).convert("RGB")
 
@@ -569,6 +696,7 @@ def process_camera_row(args):
         # since a MIXED device involves two independent logins, not one.
         axis_dead = axis_handler is None
         hik_dead = hik_handler is None
+        center_axis_only = None
 
         for cam in CAMERA_CONFIGS:
             port = cam["port"]
@@ -576,10 +704,37 @@ def process_camera_row(args):
             bg_color = cam["color"]
             results["logs"].append(f" -> Testing {pos} Interface Port: {port} (mixed-vendor unit, probing)...")
 
+            # If the center camera proves to be Axis-only, skip Axis probes on side ports.
+            if pos == "CENTER" and axis_handler and hik_handler and center_axis_only is None:
+                axis_probe_ok = False
+                hik_probe_ok = False
+
+                probe_img, _, _, probe_auth_rejected = axis_handler.fetch_snapshot(sess, port)
+                if probe_img is not None:
+                    probe_img.close()
+                    axis_probe_ok = True
+                elif probe_auth_rejected:
+                    axis_dead = True
+
+                probe_img, _, _, probe_auth_rejected = hik_handler.fetch_snapshot(sess, port)
+                if probe_img is not None:
+                    probe_img.close()
+                    hik_probe_ok = True
+                elif probe_auth_rejected:
+                    hik_dead = True
+
+                if axis_probe_ok and not hik_probe_ok:
+                    center_axis_only = True
+                    results["logs"].append("    [>] Mixed unit center port is Axis-only; skipping Axis probes on non-center ports.")
+                elif hik_probe_ok and not axis_probe_ok:
+                    center_axis_only = False
+                    results["logs"].append("    [>] Mixed unit center port is Hikvision-only; non-center ports will still be probed normally.")
+
             handler, vendor_label, camera_image = None, None, None
             probe_errors = []
 
-            if not axis_dead:
+            try_axis = not axis_dead and not (center_axis_only is True and pos != "CENTER")
+            if try_axis:
                 img, snap_url, snap_err, auth_rejected = axis_handler.fetch_snapshot(sess, port)
                 if img is not None:
                     handler, vendor_label, camera_image = axis_handler, "Axis", img
@@ -588,6 +743,8 @@ def process_camera_row(args):
                         axis_dead = True
                         results["logs"].append(f"    [!] Axis credentials flatly rejected on Port {port} -- won't retry Axis on this device's remaining ports.")
                     probe_errors.append(f"Axis: {snap_err}")
+            elif center_axis_only is True:
+                results["logs"].append(f"    [>] Skipping Axis probe on Port {port} because center port is Axis-only.")
 
             if handler is None and not hik_dead:
                 img, snap_url, snap_err, auth_rejected = hik_handler.fetch_snapshot(sess, port)
@@ -635,8 +792,11 @@ def process_camera_row(args):
             for index, rule in enumerate(rules):
                 try:
                     img_buf = render_overlay_image(camera_image, rule["vertices"], index, img_w, img_h, rule["type"])
+                    display_name = rule["name"]
+                    if camera_image is None:
+                        display_name = f"Snapshot Failed: {display_name}"
                     results["main"].append({
-                        "data": [client_name, location, serial, pos_label, rule["name"], rule["type"], rule["target"], rule["duration"]],
+                        "data": [client_name, location, serial, pos_label, display_name, rule["type"], rule["target"], rule["duration"]],
                         "bg": bg_color, "img": img_buf, "err": ""
                     })
                     if rule.get("is_placeholder"):
@@ -673,6 +833,8 @@ def process_camera_row(args):
             img_w, img_h = camera_image.size
 
         payload_data, req_url, err_msg, analytics_auth_rejected = handler.fetch_analytics(sess, port)
+        if payload_data is not None and camera_image is None:
+            results["logs"].append("    [!] Analytics retrieved but snapshot unavailable; rendering overlay on placeholder canvas.")
 
         if payload_data is None:
             err_msg = err_msg or "Unauthorized Connection (All auth variations failed)"

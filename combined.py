@@ -116,7 +116,10 @@ else:
     if rows_with_ip < len(camera_rows):
         print(f"[!] Warning: {len(camera_rows) - rows_with_ip} of {len(camera_rows)} row(s) are missing an IP "
               f"and will be skipped during processing.")
-
+    deduped_rows = camera_engine.dedupe_camera_rows(camera_rows)
+    if len(deduped_rows) < len(camera_rows):
+        print(f"[!] Note: Collapsed {len(camera_rows) - len(deduped_rows)} duplicate-IP row(s) into {len(deduped_rows)} unique device(s).")
+    camera_rows = deduped_rows
     custom_tag = input("\nEnter an optional custom tag/job name (or press Enter to use CSV name): ").strip()
     base_filename = custom_tag if custom_tag else csv_input_path.stem
 
@@ -133,8 +136,8 @@ if unrecognized_mfg_rows:
         print("[!] Every row failed to classify -- check that the CSV's MANUFACTURER column header "
               "is spelled/capitalized exactly as expected.")
 
-needs_axis = "AXIS" in mfg_classes
-needs_hik = "HIKVISION" in mfg_classes
+needs_axis = "AXIS" in mfg_classes or "MIXED" in mfg_classes
+needs_hik = "HIKVISION" in mfg_classes or "MIXED" in mfg_classes
 
 # Every run (single-test or batch) always asks for credentials fresh instead of
 # silently reusing whatever is cached in .env, so a stale/unexpected .env value

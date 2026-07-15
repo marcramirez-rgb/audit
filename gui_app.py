@@ -229,7 +229,7 @@ class App(ctk.CTk):
             return mfg_class == "AXIS", mfg_class == "HIKVISION"
         if self.csv_rows:
             classes = [camera_engine.classify_manufacturer(r.get("MANUFACTURER", "")) for r in self.csv_rows if r.get("IP", "").strip()]
-            return "AXIS" in classes, "HIKVISION" in classes
+            return "AXIS" in classes or "MIXED" in classes, "HIKVISION" in classes or "MIXED" in classes
         return False, False
 
     def _refresh_credential_requirements(self):
@@ -275,13 +275,20 @@ class App(ctk.CTk):
         if rows_with_ip < len(rows):
             status_lines.append(f"{len(rows) - rows_with_ip} row(s) missing an IP will be skipped.")
 
+        deduped_rows = camera_engine.dedupe_camera_rows(rows)
+        if len(deduped_rows) < len(rows):
+            status_lines.append(f"Collapsed {len(rows) - len(deduped_rows)} duplicate-IP row(s) into {len(deduped_rows)} unique device(s).")
+        rows = deduped_rows
+        self.csv_rows = rows
+
         classes = [camera_engine.classify_manufacturer(r.get("MANUFACTURER", "")) for r in rows if r.get("IP", "").strip()]
         unrecognized = sum(1 for c in classes if c is None)
         if unrecognized:
             status_lines.append(f"{unrecognized} row(s) have an unrecognized MANUFACTURER value and will be flagged, not processed.")
         axis_count = sum(1 for c in classes if c == "AXIS")
         hik_count = sum(1 for c in classes if c == "HIKVISION")
-        status_lines.append(f"Detected: {axis_count} Axis, {hik_count} Hikvision.")
+        mixed_count = sum(1 for c in classes if c == "MIXED")
+        status_lines.append(f"Detected: {axis_count} Axis, {hik_count} Hikvision, {mixed_count} Mixed.")
 
         self.csv_status_label.configure(text="\n".join(status_lines))
         self._refresh_credential_requirements()

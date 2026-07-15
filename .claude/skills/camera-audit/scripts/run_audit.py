@@ -51,55 +51,7 @@ def load_csv_rows(csv_path):
             label = r.get("LIVE_UNIT_SERIAL_NM") or r.get("LOCATION_NM") or r.get("CLIENT_NM") or "(no identifying columns)"
             print(f"    -> {label}")
 
-    return dedupe_by_ip(rows)
-
-
-def dedupe_by_ip(rows):
-    """The documented Snowflake export (references/snowflake_query.md) joins in
-    MODEL, so a unit with more than one camera model on record comes back as
-    multiple rows sharing the same IP -- one per manufacturer/model combination,
-    not one per physical unit. camera_engine.py tests an IP as a single 3-port
-    unit, so running each raw row separately would dial the same device multiple
-    times in one batch: wasted time, and real risk of tripping its account
-    lockout. Collapse each IP to one row, using MANUFACTURER='mixed' when its
-    rows span more than one recognized vendor."""
-    grouped = {}
-    order = []
-    passthrough = []  # blank-IP rows: harmless no-ops downstream, left as-is
-    for row in rows:
-        ip = row.get("IP", "").strip()
-        if not ip:
-            passthrough.append(row)
-            continue
-        if ip not in grouped:
-            grouped[ip] = []
-            order.append(ip)
-        grouped[ip].append(row)
-
-    deduped = []
-    collapsed_ips = []
-    for ip in order:
-        group = grouped[ip]
-        if len(group) == 1:
-            deduped.append(group[0])
-            continue
-
-        collapsed_ips.append(ip)
-        classes = {camera_engine.classify_manufacturer(r.get("MANUFACTURER", "")) for r in group}
-        classes.discard(None)
-        base = dict(group[0])
-        if len(classes) > 1:
-            base["MANUFACTURER"] = "mixed"
-        deduped.append(base)
-
-    if collapsed_ips:
-        print(f"[!] Note: {len(collapsed_ips)} IP(s) appeared as multiple CSV rows (one per camera "
-              f"model) and were collapsed to a single test per IP. IPs spanning more than one "
-              f"recognized vendor were marked 'mixed':")
-        for ip in collapsed_ips:
-            print(f"    -> {ip}")
-
-    return deduped + passthrough
+    return camera_engine.dedupe_camera_rows(rows)
 
 
 def build_single_row(args):

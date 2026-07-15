@@ -6,6 +6,8 @@ OEM units, which run Hikvision firmware) cameras, and generates an Excel
 report with a photo + overlay of each configured rule per camera, plus an
 audit log of anything that failed.
 
+## ALWAYS TRUST BUT VERIFY THE DETECTION SHAPE - if a detection zone looks incorrect log into the camera and verify 
+
 ## Prerequisites
 
 - Python 3.11+ (tested on 3.11.9)
@@ -120,7 +122,7 @@ environment.
   cameras use self-signed certificates over the local network. This is a
   reasonable tradeoff on a trusted internal network, not something to change
   without also fixing certificate management on the cameras themselves.
-- **AXIS Perimeter Defender** (used on fixed thermal cameras instead of the
+- **AXIS Perimeter Defender** (used on fixed thermal cameras and some center pano cameras
   standard AXIS Object Analytics app) is **detected but not supported** — the
   tool flags these as `[SPECIAL CASE]` in Missed Cameras rather than pulling
   real rule data, because Perimeter Defender's configuration is stored in an
@@ -152,6 +154,8 @@ environment.
 | A camera hits the wrong API (e.g. Axis URL for a Hikvision unit) | Check the exact `MANUFACTURER` value in the CSV, and the column header spelling — must be exactly `MANUFACTURER` |
 | `ModuleNotFoundError` on launch | Run `pip install -r requirements.txt` |
 | GUI window won't open / import error | Make sure `gui_app.py` and `camera_engine.py` are in the same folder — the GUI imports the engine module directly |
+| Verify the status of true 401 errors in VMS. If the unit is online, but errored out, try running a single unit audit on that unit. It could be the unit is in an area with poor connectivity
+
 
 ## File overview
 
@@ -166,7 +170,7 @@ environment.
 
 ## Getting data
 | In snowflake you will want to use the below query:
-|SELECT
+| SELECT
     nc.PUBLIC_IP AS IP, 
     lu.LIVE_UNIT_SERIAL_NR AS LIVE_UNIT_SERIAL_NM,
     lu.LOCATION_NM,
@@ -181,7 +185,7 @@ LEFT JOIN STAGING.HORUS.CAMERA_MFTRS cm
 WHERE lu.live_unit_serial_nr in ('TDC14016')
 GROUP BY lu.CLIENT_NM, lu.LOCATION_NM, nc.PUBLIC_IP, lu.LIVE_UNIT_SERIAL_NR, cm.MANUFACTURER, cm.MODEL
 ORDER BY lu.LOCATION_NM
-|Use whatever filtering clause you want to retrieve the data but it the csv file for bulk upload most have those 6 columns
+|Use whatever filtering clause you want to retrieve the data but it the csv file for bulk upload most have those 6 columns. For bulk data collection, you should be querying on the client_nm and with accounts with a flattened heirarchy, you should include a location filter for 'sub clients'
 
 ## Snowflake access
 Access can be requested in via Okta 

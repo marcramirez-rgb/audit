@@ -12,3 +12,17 @@ Camera_Reports_Master/
 
 # Skill-evaluation/benchmark scratch data, not project source
 .claude/skills/camera-audit-workspace/
+
+# Real fleet/client data exports -- never commit (client names, site addresses,
+# live-unit serials, camera IPs). Build these locally from Snowflake as needed.
+*.csv
+
+# Live-camera test/debug image outputs -- may contain real client scene imagery
+thermal_overlay_test.jpg
+thermal_test_output.jpg
+replay_hikviz_zone_*.jpg
+debug_overlay_tests/
+
+# Packet captures
+*.pcapng
+*.pcap
