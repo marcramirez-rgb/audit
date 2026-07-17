@@ -205,38 +205,12 @@ class HikvisionHandler(CameraHandler):
         fallback_url = f"http://{self.ip}:{port}/ISAPI/Streaming/channels/101/picture"
         return None, fallback_url, last_err, auth_rejected
 
-    # Known Hikvision thermal/bi-spectrum model prefix. Deliberately NOT matching on a
-    # bare "-T" -- Hikvision's regular optical turret cameras use "T" in their model
-    # codes too (e.g. DS-2CD2T...), which would false-positive on a normal fleet.
-    THERMAL_MODEL_MARKERS = ["2TD", "BISPECTRAL", "THERMAL"]
-
-    def _detect_device_model(self, session, port):
-        """Best-effort only: not verified against a real failing device (unlike the
-        Axis Perimeter Defender detection, which was confirmed via packet capture).
-        Uses Hikvision's standard deviceInfo endpoint to flag likely thermal/specialty
-        hardware when the normal behaviorRule analytics endpoint doesn't work."""
-        info_url = f"http://{self.ip}:{port}/ISAPI/System/deviceInfo"
-        for auth in self.auth_strategies:
-            try:
-                response = session.get(info_url, auth=auth, timeout=STRICT_TIMEOUT, verify=False)
-                if response.status_code == 200:
-                    try:
-                        root = ET.fromstring(response.text)
-                    except ET.ParseError:
-                        return None
-                    for elem in root.iter():
-                        if elem.tag.split('}')[-1] == 'model' and elem.text:
-                            return elem.text.strip()
-                    return None
-            except requests.exceptions.RequestException:
-                continue
-        return None
-
     def fetch_analytics(self, session, port):
         last_status = None
         last_snippet = None
         saw_401 = False
         saw_other = False
+        saw_ok = False
         for channel_id in [1, 2]:
             rule_url = f"http://{self.ip}:{port}/ISAPI/Intelligent/channels/{channel_id}/behaviorRule/1"
             for auth in self.auth_strategies:
@@ -247,8 +221,10 @@ class HikvisionHandler(CameraHandler):
                         temp_xml = response.text
                         if temp_xml and ("positionX" in temp_xml or "RegionCoordinates" in temp_xml):
                             return temp_xml, rule_url, None, False
+                        # A clean 200 with no coordinate tags means the camera answered
+                        # fine, it just has no analytic zones configured on this channel.
+                        saw_ok = True
                         last_snippet = (temp_xml[:200] + "...") if temp_xml and len(temp_xml) > 200 else (temp_xml or "(empty body)")
-                        saw_other = True
                     elif response.status_code == 401:
                         saw_401 = True
                     else:
@@ -257,18 +233,28 @@ class HikvisionHandler(CameraHandler):
                     saw_other = True
                     last_snippet = f"{type(e).__name__}: {e}"
                     continue
-        auth_rejected = saw_401 and not saw_other
+        auth_rejected = saw_401 and not saw_other and not saw_ok
         if last_status is None:
             diag = f"No response from any channel/auth combo (last error: {last_snippet})"
         else:
             diag = f"Last HTTP {last_status} response did not contain expected rule tags. Body snippet: {last_snippet}"
 
-        model = self._detect_device_model(session, port)
-        if model and any(marker in model.upper() for marker in self.THERMAL_MODEL_MARKERS):
-            return None, f"http://{self.ip}:{port}/ISAPI/Intelligent/channels/[1,2]/behaviorRule/1", \
-                (f"SPECIAL CASE: Device model '{model}' looks like a thermal/specialty unit -- standard behaviorRule "
-                 f"analytics API may not apply. Requires manual review, not confirmed against real device traffic. | {diag}"), auth_rejected
-        return None, f"http://{self.ip}:{port}/ISAPI/Intelligent/channels/[1,2]/behaviorRule/1", f"No active analytic perimeters found | {diag}", auth_rejected
+        url = f"http://{self.ip}:{port}/ISAPI/Intelligent/channels/[1,2]/behaviorRule/1"
+
+        # Thermal/bi-spectrum units (e.g. DS-2TD4237-7/V2) are intentionally NOT
+        # special-cased here. Verified against real device traffic (see
+        # test_thermal_channels.py): these cameras serve their VCA rules through the
+        # same behaviorRule endpoint on channels 1/2 and a snapshot on channel 201, so
+        # they flow through the identical path as any other Hikvision unit above.
+        #
+        # NO_RULES signals that the camera responded cleanly (HTTP 200) but has no
+        # analytic zones configured -- optical or thermal alike. The caller treats this
+        # as a normal empty result: it still renders the snapshot and does NOT log the
+        # unit to the Missed tab. Only genuine failures (auth/network/error status)
+        # below produce a Missed entry.
+        if saw_ok:
+            return None, url, f"NO_RULES: No active analytic perimeters configured on this device | {diag}", auth_rejected
+        return None, url, f"No active analytic perimeters found | {diag}", auth_rejected
 
     def parse_analytics(self, xml_data, img_w, img_h):
         namespaces = {'ns': 'http://www.std-cgi.com/ver20/XMLSchema'}
@@ -1080,10 +1066,17 @@ def process_camera_row(args):
             if payload_data is None:
                 err_msg = err_msg or "Unauthorized Connection (All auth variations failed)"
                 is_special_case = err_msg.startswith("SPECIAL CASE:")
-                timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                tag = "[SPECIAL CASE]" if is_special_case else ""
-                results["missed"].append([timestamp, client_name, location, serial, f"{pos_label} ({port}) {tag}".strip(), req_url, err_msg])
-                placeholder_name = "Non-Standard Analytics App (See Missed Tab)" if is_special_case else "Analytics Fetch Failed (Check Missed Tab)"
+                is_no_rules = err_msg.startswith("NO_RULES:")
+                if is_no_rules:
+                    # Camera answered fine but has no analytic zones configured. Not a
+                    # miss -- render the snapshot with a "no scenarios" placeholder.
+                    placeholder_name = "No Scenarios Configured"
+                    results["logs"].append(f"    [>] Port {port} responded with no analytics configured -- logging snapshot only (not a miss).")
+                else:
+                    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    tag = "[SPECIAL CASE]" if is_special_case else ""
+                    results["missed"].append([timestamp, client_name, location, serial, f"{pos_label} ({port}) {tag}".strip(), req_url, err_msg])
+                    placeholder_name = "Non-Standard Analytics App (See Missed Tab)" if is_special_case else "Analytics Fetch Failed (Check Missed Tab)"
                 rules = [{"is_placeholder": True, "name": placeholder_name, "type": "N/A", "target": "No Analytics Configured", "duration": "N/A", "vertices": []}]
             else:
                 rules = handler.parse_analytics(payload_data, img_w, img_h)
@@ -1163,10 +1156,17 @@ def process_camera_row(args):
         if payload_data is None:
             err_msg = err_msg or "Unauthorized Connection (All auth variations failed)"
             is_special_case = err_msg.startswith("SPECIAL CASE:")
-            timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            tag = "[SPECIAL CASE]" if is_special_case else ""
-            results["missed"].append([timestamp, client_name, location, serial, f"{pos} ({port}) {tag}".strip(), req_url, err_msg])
-            placeholder_name = "Non-Standard Analytics App (See Missed Tab)" if is_special_case else "Analytics Fetch Failed (Check Missed Tab)"
+            is_no_rules = err_msg.startswith("NO_RULES:")
+            if is_no_rules:
+                # Camera answered fine but has no analytic zones configured. Not a
+                # miss -- render the snapshot with a "no scenarios" placeholder.
+                placeholder_name = "No Scenarios Configured"
+                results["logs"].append(f"    [>] Port {port} responded with no analytics configured -- logging snapshot only (not a miss).")
+            else:
+                timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                tag = "[SPECIAL CASE]" if is_special_case else ""
+                results["missed"].append([timestamp, client_name, location, serial, f"{pos} ({port}) {tag}".strip(), req_url, err_msg])
+                placeholder_name = "Non-Standard Analytics App (See Missed Tab)" if is_special_case else "Analytics Fetch Failed (Check Missed Tab)"
             rules = [{"is_placeholder": True, "name": placeholder_name, "type": "N/A", "target": "No Analytics Configured", "duration": "N/A", "vertices": []}]
         else:
             rules = handler.parse_analytics(payload_data, img_w, img_h)
