@@ -1,10 +1,10 @@
 """LiveView Technologies -- Axis Analytics Writer.
 
-The write-side sibling of gui_app.py (the audit report GUI). Point at one Axis camera,
+The write-side sibling of audit_gui.py (the audit report GUI). Point at one Axis camera,
 pull a live snapshot, draw/edit AXIS Object Analytics scenarios (trigger + exclusion
 areas) on it, and push them to the camera -- no camera web UI required.
 
-Run with: python analytics_writer_gui.py
+Run with: python write_gui.py
 
 Capabilities (schema + write path validated live against AOA API 1.6):
     * Connect + fetch snapshot, read current scenarios (read-only)
@@ -33,7 +33,7 @@ try:
 except ImportError:
     pass
 
-# --- LiveView Technologies brand palette (lifted from gui_app.py) ---
+# --- LiveView Technologies brand palette (lifted from audit_gui.py) ---
 LVT_LIGHT = "#E5F5F5"
 LVT_TEAL = "#00A19A"
 LVT_TEAL_HOVER = "#008680"

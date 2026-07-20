@@ -30,7 +30,7 @@ ORDER BY lu.LOCATION_NM
 
 # Camera Audit
 
-Kicks off `camera_engine.run_batch()` (the same engine behind `gui_app.py` and
+Kicks off `camera_engine.run_batch()` (the same engine behind `audit_gui.py` and
 `combined.py`) through a script built for Claude to drive: `scripts/run_audit.py`
 takes plain CLI arguments instead of interactive menus or a Tkinter file picker.
 

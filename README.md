@@ -26,7 +26,7 @@ That's it — no `.env` file is required. See **Credentials** below.
 
 **GUI (recommended for most people):**
 ```
-python gui_app.py
+python audit_gui.py
 ```
 
 **Command-line (same engine, terminal-driven):**
@@ -153,7 +153,7 @@ environment.
 | Widespread `401 Unauthorized` across many devices | Check you can log into one device's web UI manually with the same credentials. If that works, it's likely an account lockout from a prior bad run, not this run's password |
 | A camera hits the wrong API (e.g. Axis URL for a Hikvision unit) | Check the exact `MANUFACTURER` value in the CSV, and the column header spelling — must be exactly `MANUFACTURER` |
 | `ModuleNotFoundError` on launch | Run `pip install -r requirements.txt` |
-| GUI window won't open / import error | Make sure `gui_app.py` and `camera_engine.py` are in the same folder — the GUI imports the engine module directly |
+| GUI window won't open / import error | Make sure `audit_gui.py` and `camera_engine.py` are in the same folder — the GUI imports the engine module directly |
 | Verify the status of true 401 errors in VMS. If the unit is online, but errored out, try running a single unit audit on that unit. It could be the unit is in an area with poor connectivity
 
 
@@ -161,7 +161,7 @@ environment.
 
 | File | Purpose |
 |---|---|
-| `gui_app.py` | Desktop GUI (CustomTkinter) — the primary way to run this |
+| `audit_gui.py` | Desktop GUI (CustomTkinter) — the primary way to run this |
 | `combined.py` | Terminal/CLI version, same engine |
 | `camera_engine.py` | All camera-fetching, parsing, and report-generation logic. No UI code. |
 | `requirements.txt` | Pinned dependency versions |
