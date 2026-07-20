@@ -26,3 +26,8 @@ debug_overlay_tests/
 # Packet captures
 *.pcapng
 *.pcap
+
+# AOA writer artifacts -- live camera config dumps + backups (real fleet IPs and
+# analytics config). Generated locally by probe_aoa.py / writer_gui.py, never commit.
+aoa_probes/
+aoa_backups/
