@@ -4,7 +4,7 @@ The write-side sibling of audit_gui.py (the audit report GUI). Point at one Axis
 pull a live snapshot, draw/edit AXIS Object Analytics scenarios (trigger + exclusion
 areas) on it, and push them to the camera -- no camera web UI required.
 
-Run with: python write_gui.py
+Run with: python analytics_writer_gui.py
 
 Capabilities (schema + write path validated live against AOA API 1.6):
     * Connect + fetch snapshot, read current scenarios (read-only)
