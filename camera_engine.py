@@ -1,7 +1,7 @@
 """Camera analytics engine: fetching, parsing, rendering, and report generation.
 
 No input()/print()/exit() here -- this module is a plain library used by both
-the CLI (combined.py) and the GUI (gui_app.py). Callers pass in credentials and
+the CLI (combined.py) and the GUI (audit_gui.py). Callers pass in credentials and
 a log/progress callback instead of relying on module-level globals or stdout.
 """
 
