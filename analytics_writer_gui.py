@@ -160,6 +160,9 @@ class WriterApp(ctk.CTk):
         self.name_entry = ctk.CTkEntry(side, placeholder_text="Scenario name (max 15)", textvariable=self.name_var)
         self.name_entry.pack(fill="x", padx=12, pady=4)
 
+        label("Detection type")
+        ctk.CTkLabel(side, text="Tick one, or both for a combined scenario.",
+                     text_color=LVT_TEXT_MUTED, font=ctk.CTkFont(size=10)).pack(anchor="w", padx=12)
         self.class_human = ctk.CTkCheckBox(side, text="Human", fg_color=LVT_TEAL, hover_color=LVT_TEAL_HOVER)
         self.class_human.select()
         self.class_human.pack(anchor="w", padx=12, pady=2)
