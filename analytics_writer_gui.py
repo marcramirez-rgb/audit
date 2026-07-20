@@ -1,17 +1,17 @@
-"""LiveView Technologies -- Axis Analytics Writer (working concept).
+"""LiveView Technologies -- Axis Analytics Writer.
 
-The write-side sibling of gui_app.py. Point at one Axis camera, pull a live snapshot,
-DRAW an analytics zone/line on it, and (once Step 0 schema validation is done) push it
-to AXIS Object Analytics -- no camera web UI required.
+The write-side sibling of gui_app.py (the audit report GUI). Point at one Axis camera,
+pull a live snapshot, draw/edit AXIS Object Analytics scenarios (trigger + exclusion
+areas) on it, and push them to the camera -- no camera web UI required.
 
-Run with: python writer_gui.py
+Run with: python analytics_writer_gui.py
 
-Status of the concept:
-    * Connect + fetch snapshot ......... working (read-only, safe)
-    * Draw zone/line -> normalized coords working
-    * Read current AOA scenarios ....... working (read-only, safe)
-    * Push scenario to camera .......... GATED. Set WRITE_ENABLED=True only after
-      probe_aoa.py confirms the setConfiguration schema on your firmware (Step 0/2).
+Capabilities (schema + write path validated live against AOA API 1.6):
+    * Connect + fetch snapshot, read current scenarios (read-only)
+    * Overlay existing scenarios on the snapshot in amber
+    * Draw intrusion / line-crossing / loitering scenarios + exclusion areas
+    * Edit an existing scenario in place (preserves perspective/presets/filters)
+    * Auto-backup before every write; one-click restore from backup
 """
 
 import os

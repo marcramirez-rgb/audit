@@ -28,6 +28,6 @@ debug_overlay_tests/
 *.pcap
 
 # AOA writer artifacts -- live camera config dumps + backups (real fleet IPs and
-# analytics config). Generated locally by probe_aoa.py / writer_gui.py, never commit.
+# analytics config). Generated locally by probe_aoa.py / analytics_writer_gui.py, never commit.
 aoa_probes/
 aoa_backups/
