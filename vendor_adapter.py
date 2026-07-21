@@ -205,8 +205,11 @@ def _text(el, path):
 
 def _size_rect(rule_el, box_tag):
     """Parse a Hik SizeFilter box (MinObjectSize/MaxObjectSize) into a neutral
-    (fx, fy, fw, fh) fraction rect, or None. positionX/Y/width/height are in the
-    0..1000 space; top-left origin (placement is best-effort -- verify visually)."""
+    (fx, fy, fw, fh) top-left fraction rect, or None. positionX/Y/width/height are in
+    the same 0..1000 grid as RuleRegion, so we apply the same vertical flip the region
+    coords use (camera_engine.py:306) -- the box spans rawY..rawY+h, which flips to a
+    top-left corner at (x/1000, 1-(y+h)/1000). Confirmed against a real min+max
+    SizeFilter (TESTZONE1 on 10.23.5.188:5020 ch2)."""
     box = rule_el.find(f".//ns:SizeFilter/ns:{box_tag}", hik_config.NS)
     if box is None:
         return None
@@ -216,7 +219,7 @@ def _size_rect(rule_el, box_tag):
     x, y, w, h = g("positionX"), g("positionY"), g("width"), g("height")
     if None in (x, y, w, h):
         return None
-    return (x / 1000.0, y / 1000.0, w / 1000.0, h / 1000.0)
+    return (x / 1000.0, 1 - (y + h) / 1000.0, w / 1000.0, h / 1000.0)
 
 
 def _require(caps, sc):
