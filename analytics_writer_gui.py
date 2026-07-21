@@ -95,6 +95,7 @@ class WriterApp(ctk.CTk):
         self.existing_scenarios = []   # neutral vendor_adapter.Scenario list from last read
         self.editing = None            # native_id being edited, or None = new
         self.adapter = None            # current vendor adapter
+        self.edit_size = []            # [(rect, label)] min/max size of the scenario being edited
 
         self._build_header()
         self._build_body()
@@ -351,6 +352,7 @@ class WriterApp(ctk.CTk):
             self.editing = None
             self.name_var.set("")
             self.points, self.exclude_zones, self.current_exclude = [], [], []
+            self.edit_size = []
             self._redraw()
             self._log("[.] New scenario mode.")
             return
@@ -383,9 +385,11 @@ class WriterApp(ctk.CTk):
         self.points = [self._frac_to_canvas(fx, fy) for (fx, fy) in sc.points]
         self.exclude_zones = [[self._frac_to_canvas(fx, fy) for (fx, fy) in z] for z in sc.exclusions]
         self.current_exclude = []
+        self.edit_size = [(r, lbl) for r, lbl in ((sc.min_size, "min"), (sc.max_size, "max")) if r]
         self.mode_var.set("Include")
         self._redraw()
-        self._log(f"[.] Editing '{choice}'. Adjust and Push to update it in place.")
+        size_msg = " Min/max size shown." if self.edit_size else ""
+        self._log(f"[.] Editing '{choice}'. Adjust and Push to update it in place.{size_msg}")
 
     def _make_adapter(self):
         ip = self.ip_entry.get().strip()
@@ -471,6 +475,7 @@ class WriterApp(ctk.CTk):
         self.exclude_zones = []
         self.current_exclude = []
         self.existing_overlays = []
+        self.edit_size = []
         self.editing = None
         if hasattr(self, "edit_var"):
             self.edit_var.set(NEW_SCENARIO)
@@ -566,6 +571,15 @@ class WriterApp(ctk.CTk):
             self.canvas.create_line(*self._flat(self.current_exclude), fill=EXCL_OUTLINE, width=2, dash=(4, 3))
         for (x, y) in self.current_exclude:
             self.canvas.create_oval(x - 4, y - 4, x + 4, y + 4, fill=EXCL_OUTLINE, outline=LVT_WHITE)
+
+        # Min/max object-size boxes for the scenario being edited (purple), so selecting
+        # a rule shows its sizing even when the full read-overlays aren't present.
+        for (fx, fy, fw, fh), lbl in self.edit_size:
+            x0, y0 = self._frac_to_canvas(fx, fy)
+            x1, y1 = self._frac_to_canvas(fx + fw, fy + fh)
+            self.canvas.create_rectangle(x0, y0, x1, y1, outline=SIZE_OUTLINE, width=2)
+            self.canvas.create_text(x0 + 2, y0 - 7, text=lbl, fill=SIZE_OUTLINE,
+                                    anchor="sw", font=("Consolas", 8, "bold"))
 
     @staticmethod
     def _flat(points):
