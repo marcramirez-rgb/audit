@@ -31,3 +31,5 @@ debug_overlay_tests/
 # analytics config). Generated locally by probe_aoa.py / analytics_writer_gui.py, never commit.
 aoa_probes/
 aoa_backups/
+hik_probes/
+hik_backups/
