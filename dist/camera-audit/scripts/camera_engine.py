@@ -9,6 +9,7 @@ import concurrent.futures
 import time
 import xml.etree.ElementTree as ET
 from datetime import datetime
+import os
 from io import BytesIO
 from pathlib import Path
 
@@ -29,8 +30,8 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 STRICT_TIMEOUT = (3.05, 5.0)
 MAX_WORKER_THREADS = 15
 
-THUMB_H = 250
-ROW_H = 190
+THUMB_H = 450
+ROW_H = 340
 
 CAMERA_CONFIGS = [
     {"port": "5010", "position": "CENTER", "color": "E5F5F5"},  # LVT Light
@@ -102,6 +103,21 @@ def dedupe_camera_rows(rows):
     return deduped + passthrough
 
 
+def _extract_hik_channel_id(behavior_rule_url):
+    """Pulls the channel id back out of a successful Hikvision behaviorRule URL,
+    e.g. '.../channels/2/behaviorRule/1' -> '2'. Returns None for anything that
+    doesn't match that shape (an Axis URL, or the bracketed placeholder URL used
+    on a failed fetch)."""
+    marker = "/channels/"
+    if marker not in behavior_rule_url or "/behaviorRule/" not in behavior_rule_url:
+        return None
+    try:
+        candidate = behavior_rule_url.split(marker, 1)[1].split("/", 1)[0]
+    except IndexError:
+        return None
+    return candidate if candidate.isdigit() else None
+
+
 # --- OBJECT-ORIENTED ARCHITECTURE (OOP) ---
 
 class CameraHandler:
@@ -116,6 +132,13 @@ class CameraHandler:
     def fetch_analytics(self, session, port):
         raise NotImplementedError
 
+    def reposition_for_scene(self, session, port, channel_id, rule_index):
+        """Optional hook for camera types that need physical repositioning before a
+        snapshot will match an analytics rule's coordinate space (e.g. a PTZ camera
+        that binds a rule to a saved pan/tilt/zoom preset). No-op by default --
+        fixed cameras (and Axis, until proven otherwise) don't need this."""
+        return False
+
     def parse_analytics(self, data, img_w, img_h):
         raise NotImplementedError
 
@@ -124,64 +147,70 @@ class HikvisionHandler(CameraHandler):
     def __init__(self, ip, user, password):
         super().__init__(ip, user, password)
         self.fallback_dim = (1920, 1080)
+        self.is_thermal_device = False
+
+    # PTZ-capable Hikvision units bind an analytics rule's zone coordinates to a
+    # saved pan/tilt/zoom position (a "scenePtz"): the camera's own web UI issues a
+    # PUT to scenePtz/<id>/goto and waits before showing/editing a rule, because the
+    # rule's coordinates are only meaningful once the camera is actually parked at
+    # that position -- otherwise a live snapshot and the rule's coordinate space are
+    # simply looking at two different framings. This was reproduced and confirmed via
+    # a real HAR capture of the web UI against 10.23.27.20. The 6.5s wait mirrors the
+    # ~6.3s the web UI itself waited (polling lockPTZ) between issuing goto and using
+    # the rule/live view again -- an observed real value, not a guess.
+    PTZ_SETTLE_WAIT_SECONDS = 6.5
+
+    def reposition_for_scene(self, session, port, channel_id, rule_index):
+        goto_url = f"http://{self.ip}:{port}/ISAPI/Intelligent/channels/{channel_id}/scenePtz/{rule_index}/goto"
+        for auth in self.auth_strategies:
+            try:
+                response = session.put(goto_url, auth=auth, timeout=STRICT_TIMEOUT, verify=False)
+                if response.status_code == 200:
+                    time.sleep(self.PTZ_SETTLE_WAIT_SECONDS)
+                    return True
+            except requests.exceptions.RequestException:
+                continue
+        return False
 
     def fetch_snapshot(self, session, port):
-        img_url = f"http://{self.ip}:{port}/ISAPI/Streaming/channels/101/picture"
+        # ALWAYS attempt to pull the Thermal channel (201) first.
+        # If the camera does not physically possess a thermal layout, 
+        # it will fail and fall back to the Optical channel (101).
+        channels_to_try = ["201", "101"]
+        
         last_err = "All authentication attempts failed"
         saw_401 = False
         saw_other = False
-        for auth in self.auth_strategies:
-            try:
-                with session.get(img_url, auth=auth, timeout=STRICT_TIMEOUT, stream=True, verify=False) as response:
-                    if response.status_code == 200:
-                        return PILImage.open(BytesIO(response.content)), img_url, None, False
-                    if response.status_code == 401:
-                        saw_401 = True
-                    else:
-                        saw_other = True
-                    last_err = f"HTTP {response.status_code}: {response.text[:150]}"
-            except requests.exceptions.RequestException as e:
-                saw_other = True
-                last_err = f"{type(e).__name__}: {e}"
-                continue
-        # auth_rejected is only True when every attempt cleanly got HTTP 401 -- a
-        # timeout/connection error/other status means we can't be confident it's a
-        # credential problem, so remaining ports on this device still get tried.
+
+        for channel in channels_to_try:
+            img_url = f"http://{self.ip}:{port}/ISAPI/Streaming/channels/{channel}/picture"
+            for auth in self.auth_strategies:
+                try:
+                    with session.get(img_url, auth=auth, timeout=STRICT_TIMEOUT, stream=True, verify=False) as response:
+                        if response.status_code == 200:
+                            if channel == "201":
+                                self.is_thermal_device = True
+                            return PILImage.open(BytesIO(response.content)).copy(), img_url, None, False
+                        if response.status_code == 401:
+                            saw_401 = True
+                        else:
+                            saw_other = True
+                        last_err = f"Channel {channel} HTTP {response.status_code}"
+                except requests.exceptions.RequestException as e:
+                    saw_other = True
+                    last_err = f"Channel {channel} Network Error: {type(e).__name__}"
+                    continue
+
         auth_rejected = saw_401 and not saw_other
-        return None, img_url, last_err, auth_rejected
-
-    # Known Hikvision thermal/bi-spectrum model prefix. Deliberately NOT matching on a
-    # bare "-T" -- Hikvision's regular optical turret cameras use "T" in their model
-    # codes too (e.g. DS-2CD2T...), which would false-positive on a normal fleet.
-    THERMAL_MODEL_MARKERS = ["2TD"]
-
-    def _detect_device_model(self, session, port):
-        """Best-effort only: not verified against a real failing device (unlike the
-        Axis Perimeter Defender detection, which was confirmed via packet capture).
-        Uses Hikvision's standard deviceInfo endpoint to flag likely thermal/specialty
-        hardware when the normal behaviorRule analytics endpoint doesn't work."""
-        info_url = f"http://{self.ip}:{port}/ISAPI/System/deviceInfo"
-        for auth in self.auth_strategies:
-            try:
-                response = session.get(info_url, auth=auth, timeout=STRICT_TIMEOUT, verify=False)
-                if response.status_code == 200:
-                    try:
-                        root = ET.fromstring(response.text)
-                    except ET.ParseError:
-                        return None
-                    for elem in root.iter():
-                        if elem.tag.split('}')[-1] == 'model' and elem.text:
-                            return elem.text.strip()
-                    return None
-            except requests.exceptions.RequestException:
-                continue
-        return None
+        fallback_url = f"http://{self.ip}:{port}/ISAPI/Streaming/channels/101/picture"
+        return None, fallback_url, last_err, auth_rejected
 
     def fetch_analytics(self, session, port):
         last_status = None
         last_snippet = None
         saw_401 = False
         saw_other = False
+        saw_ok = False
         for channel_id in [1, 2]:
             rule_url = f"http://{self.ip}:{port}/ISAPI/Intelligent/channels/{channel_id}/behaviorRule/1"
             for auth in self.auth_strategies:
@@ -192,8 +221,10 @@ class HikvisionHandler(CameraHandler):
                         temp_xml = response.text
                         if temp_xml and ("positionX" in temp_xml or "RegionCoordinates" in temp_xml):
                             return temp_xml, rule_url, None, False
+                        # A clean 200 with no coordinate tags means the camera answered
+                        # fine, it just has no analytic zones configured on this channel.
+                        saw_ok = True
                         last_snippet = (temp_xml[:200] + "...") if temp_xml and len(temp_xml) > 200 else (temp_xml or "(empty body)")
-                        saw_other = True
                     elif response.status_code == 401:
                         saw_401 = True
                     else:
@@ -202,18 +233,28 @@ class HikvisionHandler(CameraHandler):
                     saw_other = True
                     last_snippet = f"{type(e).__name__}: {e}"
                     continue
-        auth_rejected = saw_401 and not saw_other
+        auth_rejected = saw_401 and not saw_other and not saw_ok
         if last_status is None:
             diag = f"No response from any channel/auth combo (last error: {last_snippet})"
         else:
             diag = f"Last HTTP {last_status} response did not contain expected rule tags. Body snippet: {last_snippet}"
 
-        model = self._detect_device_model(session, port)
-        if model and any(marker in model.upper() for marker in self.THERMAL_MODEL_MARKERS):
-            return None, f"http://{self.ip}:{port}/ISAPI/Intelligent/channels/[1,2]/behaviorRule/1", \
-                (f"SPECIAL CASE: Device model '{model}' looks like a thermal/specialty unit -- standard behaviorRule "
-                 f"analytics API may not apply. Requires manual review, not confirmed against real device traffic. | {diag}"), auth_rejected
-        return None, f"http://{self.ip}:{port}/ISAPI/Intelligent/channels/[1,2]/behaviorRule/1", f"No active analytic perimeters found | {diag}", auth_rejected
+        url = f"http://{self.ip}:{port}/ISAPI/Intelligent/channels/[1,2]/behaviorRule/1"
+
+        # Thermal/bi-spectrum units (e.g. DS-2TD4237-7/V2) are intentionally NOT
+        # special-cased here. Verified against real device traffic (see
+        # test_thermal_channels.py): these cameras serve their VCA rules through the
+        # same behaviorRule endpoint on channels 1/2 and a snapshot on channel 201, so
+        # they flow through the identical path as any other Hikvision unit above.
+        #
+        # NO_RULES signals that the camera responded cleanly (HTTP 200) but has no
+        # analytic zones configured -- optical or thermal alike. The caller treats this
+        # as a normal empty result: it still renders the snapshot and does NOT log the
+        # unit to the Missed tab. Only genuine failures (auth/network/error status)
+        # below produce a Missed entry.
+        if saw_ok:
+            return None, url, f"NO_RULES: No active analytic perimeters configured on this device | {diag}", auth_rejected
+        return None, url, f"No active analytic perimeters found | {diag}", auth_rejected
 
     def parse_analytics(self, xml_data, img_w, img_h):
         namespaces = {'ns': 'http://www.std-cgi.com/ver20/XMLSchema'}
@@ -257,11 +298,15 @@ class HikvisionHandler(CameraHandler):
                     raw_x = float(coord.find('ns:positionX', namespaces).text)
                     raw_y = float(coord.find('ns:positionY', namespaces).text)
 
-                    # Hikvision positionX/positionY use a 0..1000 space with (0,0)
-                    # at the top-left. Map directly and clamp to bounds. Previous
-                    # behavior inverted axes which caused mirrored overlays.
+                    # Hikvision positionX/positionY are in a 0..1000 coordinate
+                    # space where (0,0) is the top-left. Map directly to pixel
+                    # coordinates and clamp to image bounds. Previous behavior
+                    # inverted both axes which produced mirrored overlays vs the
+                    # camera web UI.
                     pixel_x = int((raw_x / 1000.0) * img_w)
                     pixel_y = int((raw_y / 1000.0) * img_h)
+                    # This camera's rule coordinates require a vertical flip to match
+                    # the live snapshot orientation observed in test_variant_flip_y.
                     pixel_y = img_h - 1 - pixel_y
                     pixel_x = max(0, min(img_w - 1, pixel_x))
                     pixel_y = max(0, min(img_h - 1, pixel_y))
@@ -274,15 +319,17 @@ class HikvisionHandler(CameraHandler):
                 continue
 
             for zone_index, polygon in enumerate(polygons, start=1):
+                zone_name = rule_name if len(polygons) == 1 else f"{rule_name} [Zone {zone_index}]"
                 parsed_rules.append({
                     "is_placeholder": False,
-                    "name": rule_name if len(polygons) == 1 else f"{rule_name} [Zone {zone_index}]",
+                    "name": zone_name,
                     "type": event_type,
                     "duration": duration_val,
                     "target": target_detection,
                     "vertices": polygon
                 })
 
+        # Deduplicate parsed rules that are exactly identical (same name/type/target/duration/vertices)
         def normalize_vertices_key(verts):
             if not verts:
                 return ()
@@ -294,19 +341,6 @@ class HikvisionHandler(CameraHandler):
         deduped = []
         for r in parsed_rules:
             verts_key = normalize_vertices_key(r.get("vertices", []))
-            key = (r.get("name"), r.get("type"), r.get("target"), r.get("duration"), verts_key)
-            if key in seen:
-                continue
-            seen.add(key)
-            deduped.append(r)
-
-        if deduped:
-            return deduped
-        return [{"is_placeholder": True, "name": "No Scenarios Configured", "type": "N/A", "target": "No Analytics Configured", "duration": "N/A", "vertices": []}]
-        seen = set()
-        deduped = []
-        for r in parsed_rules:
-            verts_key = tuple((int(x), int(y)) for x, y in r.get("vertices", []))
             key = (r.get("name"), r.get("type"), r.get("target"), r.get("duration"), verts_key)
             if key in seen:
                 continue
@@ -329,19 +363,34 @@ class AxisHandler(CameraHandler):
         saw_401 = False
         saw_other = False
         for auth in self.auth_strategies:
+            # --- DUAL METHOD FALLBACK: TRY GET FIRST ---
             try:
-                with session.get(img_url, auth=auth, timeout=STRICT_TIMEOUT, stream=True, verify=False) as response:
+                with session.get(img_url, auth=auth, timeout=STRICT_TIMEOUT, verify=False) as response:
                     if response.status_code == 200:
-                        return PILImage.open(BytesIO(response.content)), img_url, None, False
+                        return PILImage.open(BytesIO(response.content)).copy(), img_url, None, False
                     if response.status_code == 401:
                         saw_401 = True
                     else:
                         saw_other = True
-                    last_err = f"HTTP {response.status_code}: {response.text[:150]}"
+                    last_err = f"GET HTTP {response.status_code}"
             except requests.exceptions.RequestException as e:
                 saw_other = True
-                last_err = f"{type(e).__name__}: {e}"
-                continue
+                last_err = f"GET Error: {type(e).__name__}"
+
+            # --- DUAL METHOD FALLBACK: RETRY VIA POST IF GET REJECTED/NON-200 ---
+            try:
+                with session.post(img_url, auth=auth, timeout=STRICT_TIMEOUT, verify=False) as response:
+                    if response.status_code == 200:
+                        return PILImage.open(BytesIO(response.content)).copy(), img_url, None, False
+                    if response.status_code == 401:
+                        saw_401 = True
+                    else:
+                        saw_other = True
+                    last_err = f"POST HTTP {response.status_code}"
+            except requests.exceptions.RequestException as e:
+                saw_other = True
+                last_err = f"POST Error: {type(e).__name__}"
+
         auth_rejected = saw_401 and not saw_other
         return None, img_url, last_err, auth_rejected
 
@@ -365,6 +414,89 @@ class AxisHandler(CameraHandler):
             except requests.exceptions.RequestException:
                 continue
         return None
+
+    # AXIS Perimeter Defender (common on fixed THERMAL units, e.g. Q1971-E) is a
+    # separate ACAP with its own v2 REST API -- NOT the Object Analytics control.cgi
+    # endpoint. Confirmed against a real packet capture of the camera web UI: the
+    # configured alarm zones are published on this multipart metadata stream as
+    # <ALERT_ZONE_LIST> with pixel-space POINT coordinates in the OSD_SIZE frame.
+    PD_METADATA_PATH = "/local/AXISPerimeterDefender/v2/metadata/liveStream"
+
+    def _fetch_perimeter_defender(self, session, port):
+        """Read a single metadata frame from the Perimeter Defender live stream.
+
+        The endpoint is a multipart/x-mixed-replace stream that emits an XML <NODE>
+        frame ~9x/second; we read only until the first complete frame arrives, then
+        drop the connection. Returns (xml_frame, url, err)."""
+        url = f"http://{self.ip}:{port}{self.PD_METADATA_PATH}"
+        for auth in self.auth_strategies:
+            try:
+                with session.get(url, auth=auth, timeout=STRICT_TIMEOUT, stream=True, verify=False) as resp:
+                    if resp.status_code != 200:
+                        continue
+                    buf = ""
+                    for chunk in resp.iter_content(chunk_size=2048):
+                        if not chunk:
+                            continue
+                        buf += chunk.decode("utf-8", errors="replace")
+                        end = buf.find("</NODE>")
+                        if end != -1:
+                            start = buf.find("<NODE")
+                            if start != -1:
+                                return buf[start:end + len("</NODE>")], url, None
+                        if len(buf) > 131072:  # safety cap -- never read the stream forever
+                            break
+            except requests.exceptions.RequestException:
+                continue
+        return None, url, "Perimeter Defender metadata stream returned no zone frame"
+
+    def _parse_perimeter_defender(self, xml_frame, img_w, img_h):
+        """Turn one Perimeter Defender metadata frame into rule dicts. POINT
+        coordinates are already pixels in the OSD_SIZE space, so we scale by
+        snapshot_size / OSD_SIZE rather than doing a normalized-coordinate map."""
+        try:
+            root = ET.fromstring(xml_frame)
+        except ET.ParseError:
+            return [{"is_placeholder": True, "name": "Perimeter Defender (unparseable metadata)", "type": "N/A", "target": "No Analytics Configured", "duration": "N/A", "vertices": []}]
+
+        try:
+            ref_w, ref_h = (int(v) for v in root.get("OSD_SIZE", "384x288").lower().split("x"))
+        except (ValueError, AttributeError):
+            ref_w, ref_h = 384, 288
+        if ref_w <= 0 or ref_h <= 0:
+            ref_w, ref_h = 384, 288
+
+        rules = []
+        for zone in root.findall(".//ALERT_ZONE_LIST/ZONE"):
+            points = sorted(zone.findall("POINT"), key=lambda p: int(p.get("NUMBER", "0") or "0"))
+            vertices = []
+            for p in points:
+                try:
+                    raw_x = float(p.get("X2D", "0"))
+                    raw_y = float(p.get("Y2D", "0"))
+                except ValueError:
+                    continue
+                px = max(0, min(img_w - 1, int(raw_x / ref_w * img_w)))
+                py = max(0, min(img_h - 1, int(raw_y / ref_h * img_h)))
+                vertices.append((px, py))
+            if not vertices:
+                continue
+            zone_name = zone.get("NAME", "zone")
+            rules.append({
+                "is_placeholder": False,
+                "name": f"Perimeter Defender: {zone_name}",
+                # This frame carries zone geometry but not the scenario's configured
+                # type/target/duration (those live in the binary context.knp). Label
+                # generically rather than inventing specifics we didn't observe.
+                "type": "Perimeter Defender",
+                "target": "Human / Vehicle",
+                "duration": "N/A",
+                "vertices": vertices,
+            })
+
+        if not rules:
+            return [{"is_placeholder": True, "name": "Perimeter Defender: No Zones Configured", "type": "N/A", "target": "No Analytics Configured", "duration": "N/A", "vertices": []}]
+        return rules
 
     def fetch_analytics(self, session, port):
         control_url = f"http://{self.ip}:{port}/local/objectanalytics/control.cgi"
@@ -408,6 +540,12 @@ class AxisHandler(CameraHandler):
         auth_rejected = saw_401 and not saw_other and not saw_404
         if saw_404:
             running_apps = self._detect_active_analytics_app(session, port)
+            if running_apps and any("perimeter" in app.lower() for app in running_apps):
+                # Fixed thermal units typically run Perimeter Defender instead of
+                # Object Analytics -- pull the zones from its metadata stream.
+                pd_xml, pd_url, _pd_err = self._fetch_perimeter_defender(session, port)
+                if pd_xml is not None:
+                    return {"__perimeter_defender__": pd_xml}, pd_url, None, False
             if running_apps:
                 last_err = (f"SPECIAL CASE: This device has no AXIS Object Analytics app -- "
                             f"active analytics app instead: {', '.join(running_apps)}. "
@@ -415,6 +553,11 @@ class AxisHandler(CameraHandler):
         return None, control_url, last_err, auth_rejected
 
     def parse_analytics(self, json_data, img_w, img_h):
+        # Perimeter Defender payloads come through as a tagged dict carrying one
+        # metadata XML frame instead of the Object Analytics JSON shape.
+        if isinstance(json_data, dict) and "__perimeter_defender__" in json_data:
+            return self._parse_perimeter_defender(json_data["__perimeter_defender__"], img_w, img_h)
+
         scenarios = json_data.get("data", {}).get("scenarios", [])
         if not scenarios:
             return [{"is_placeholder": True, "name": "No Scenarios Configured", "type": "N/A", "target": "No Analytics Configured", "duration": "N/A", "vertices": []}]
@@ -461,15 +604,7 @@ class AxisHandler(CameraHandler):
                     pixel_y = int(((1.0 - raw_y) / 2.0) * img_h)
                     vertices.append((pixel_x, pixel_y))
 
-            parsed_rules.append({
-                "is_placeholder": False,
-                "name": rule_name,
-                "type": rule_type,
-                "duration": duration_val,
-                "target": target_detection,
-                "vertices": vertices
-            })
-
+            parsed_rules.append({"is_placeholder": False, "name": rule_name, "type": rule_type, "duration": duration_val, "target": target_detection, "vertices": vertices})
         return parsed_rules
 
 
@@ -495,22 +630,95 @@ def render_overlay_image(camera_image, vertices, index, img_w, img_h, rule_type=
             return verts
         return [verts]
 
+    def _segments_intersect(a1, a2, b1, b2):
+        def _orientation(p, q, r):
+            return (q[1] - p[1]) * (r[0] - q[0]) - (q[0] - p[0]) * (r[1] - q[1])
+
+        def _on_segment(p, q, r):
+            return (min(p[0], r[0]) <= q[0] <= max(p[0], r[0]) and
+                    min(p[1], r[1]) <= q[1] <= max(p[1], r[1]))
+
+        o1 = _orientation(a1, a2, b1)
+        o2 = _orientation(a1, a2, b2)
+        o3 = _orientation(b1, b2, a1)
+        o4 = _orientation(b1, b2, a2)
+
+        if o1 != o2 and o3 != o4:
+            return True
+        if o1 == 0 and _on_segment(a1, b1, a2):
+            return True
+        if o2 == 0 and _on_segment(a1, b2, a2):
+            return True
+        if o3 == 0 and _on_segment(b1, a1, b2):
+            return True
+        if o4 == 0 and _on_segment(b1, a2, b2):
+            return True
+        return False
+
+    def _polygon_is_self_intersecting(polygon):
+        if len(polygon) < 4:
+            return False
+        n = len(polygon)
+        for i in range(n):
+            a1 = polygon[i]
+            a2 = polygon[(i + 1) % n]
+            for j in range(i + 2, n):
+                if j == i or j == (i + 1) % n or (i == 0 and j == n - 1):
+                    continue
+                b1 = polygon[j]
+                b2 = polygon[(j + 1) % n]
+                if _segments_intersect(a1, a2, b1, b2):
+                    return True
+        return False
+
+    def _dump_reorder_debug(original, reordered, rule_type, index, img_w, img_h):
+        if os.getenv("DEBUG_OVERLAY_POLYGON", "0") != "1":
+            return
+        try:
+            root = Path(__file__).resolve().parent
+            dbg_dir = root / "debug_overlay_tests"
+            dbg_dir.mkdir(parents=True, exist_ok=True)
+            ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+            fname = dbg_dir / f"reorder_debug_{ts}_{index}.json"
+            import json
+            with open(fname, "w", encoding="utf-8") as f:
+                json.dump({
+                    "rule_type": rule_type,
+                    "index": index,
+                    "img_w": img_w,
+                    "img_h": img_h,
+                    "original": original,
+                    "reordered": reordered,
+                }, f, indent=2)
+        except Exception:
+            pass
+
     for polygon in _get_polygons(vertices):
         is_line_rule = any(keyword in rule_type.lower() for keyword in ["line", "cross", "fence"])
         polygon_to_draw = polygon
-        try:
-            if not is_line_rule and len(polygon) > 2:
+        attempted_reorder = None
+        if not is_line_rule and len(polygon) > 2 and _polygon_is_self_intersecting(polygon):
+            try:
                 import math
                 cx = sum([p[0] for p in polygon]) / len(polygon)
                 cy = sum([p[1] for p in polygon]) / len(polygon)
-                polygon_to_draw = sorted(polygon, key=lambda p: math.atan2(p[1] - cy, p[0] - cx))
-        except Exception:
-            polygon_to_draw = polygon
+                reordered = sorted(polygon, key=lambda p: math.atan2(p[1] - cy, p[0] - cx))
+                attempted_reorder = reordered
+                if not _polygon_is_self_intersecting(reordered):
+                    polygon_to_draw = reordered
+            except Exception:
+                polygon_to_draw = polygon
+
+        if attempted_reorder is not None:
+            _dump_reorder_debug(polygon, attempted_reorder, rule_type, index, img_w, img_h)
 
         if is_line_rule or len(polygon_to_draw) <= 2:
-            draw.line(polygon_to_draw, fill=rgb_color + (255,), width=4)
+            # Teal outline for lines
+            draw.line(polygon_to_draw, fill=(0, 161, 154, 255), width=4)
         else:
-            draw.polygon(polygon_to_draw, fill=rgb_color + (76,))
+            # Light red fill for polygons
+            light_red_fill = (255, 102, 102, 76)
+            draw.polygon(polygon_to_draw, fill=light_red_fill)
             draw.polygon(polygon_to_draw, outline=rgb_color + (255,), width=3)
         for (x, y) in polygon_to_draw:
             draw.ellipse((x - 6, y - 6, x + 6, y + 6), fill=(255, 255, 0, 255), outline=(0, 0, 0, 255), width=1)
@@ -537,6 +745,66 @@ def render_overlay_image(camera_image, vertices, index, img_w, img_h, rule_type=
             draw.text((10, 10), "SNAPSHOT UNAVAILABLE", fill=(255, 255, 255, 255))
 
     final_img = PILImage.alpha_composite(base_img, overlay).convert("RGB")
+
+    # Optional debug: save full-size overlay images and vertex lists when requested
+    try:
+        dbg_mode = os.getenv("DEBUG_OVERLAY", "0")
+        if dbg_mode in ("1", "2"):
+            root = Path(__file__).resolve().parent
+            dbg_dir = root / "debug_overlay_tests"
+            dbg_dir.mkdir(parents=True, exist_ok=True)
+            ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+            fname = dbg_dir / f"overlay_{ts}_{index}.png"
+            final_img.save(fname, format="PNG")
+            # also write vertices JSON for easier inspection
+            vfname = dbg_dir / f"overlay_{ts}_{index}_vertices.json"
+            try:
+                import json
+                with open(vfname, "w", encoding="utf-8") as vf:
+                    json.dump({"vertices": vertices, "rule_type": rule_type, "img_w": img_w, "img_h": img_h}, vf, indent=2)
+            except Exception:
+                pass
+
+            if dbg_mode == "2":
+                # Outline-only overlay for clearer edge inspection
+                try:
+                    overlay_outline = PILImage.new("RGBA", base_img.size, (0, 0, 0, 0))
+                    draw_outline = ImageDraw.Draw(overlay_outline)
+                    if vertices:
+                        draw_outline.polygon(vertices, outline=rgb_color + (255,), width=6)
+                        for (x, y) in vertices:
+                            draw_outline.ellipse((x - 6, y - 6, x + 6, y + 6), fill=(255, 255, 0, 255), outline=(0, 0, 0, 255), width=1)
+                    img_outline = PILImage.alpha_composite(base_img, overlay_outline).convert("RGB")
+                    fname_o = dbg_dir / f"overlay_{ts}_{index}_outline.png"
+                    img_outline.save(fname_o, format="PNG")
+                except Exception:
+                    pass
+
+                # Reordered vertices (centroid-angle sort) to see if ordering fixes shape
+                try:
+                    if vertices:
+                        import math, json as _json
+                        cx = sum([p[0] for p in vertices]) / len(vertices)
+                        cy = sum([p[1] for p in vertices]) / len(vertices)
+                        verts_sorted = sorted(vertices, key=lambda p: math.atan2(p[1] - cy, p[0] - cx))
+                        # save reordered overlay
+                        overlay_re = PILImage.new("RGBA", base_img.size, (0, 0, 0, 0))
+                        draw_re = ImageDraw.Draw(overlay_re)
+                        draw_re.polygon(verts_sorted, fill=rgb_color + (76,))
+                        draw_re.polygon(verts_sorted, outline=rgb_color + (255,), width=3)
+                        for (x, y) in verts_sorted:
+                            draw_re.ellipse((x - 6, y - 6, x + 6, y + 6), fill=(255, 255, 0, 255), outline=(0, 0, 0, 255), width=1)
+                        img_re = PILImage.alpha_composite(base_img, overlay_re).convert("RGB")
+                        fname_r = dbg_dir / f"overlay_{ts}_{index}_reordered.png"
+                        img_re.save(fname_r, format="PNG")
+                        # write reordered vertices json
+                        vfname_r = dbg_dir / f"overlay_{ts}_{index}_reordered_vertices.json"
+                        with open(vfname_r, "w", encoding="utf-8") as vf:
+                            _json.dump({"vertices": verts_sorted, "rule_type": rule_type, "img_w": img_w, "img_h": img_h}, vf, indent=2)
+                except Exception:
+                    pass
+    except Exception:
+        pass
 
     ratio = THUMB_H / final_img.height
     img_resized = final_img.resize((int(final_img.width * ratio), THUMB_H), PILImage.Resampling.LANCZOS)
@@ -583,7 +851,7 @@ def create_master_workbook():
         cell.border = Border(left=Side(style="thin", color="DDDDDD"), right=Side(style="thin", color="DDDDDD"), top=Side(style="thin", color="DDDDDD"), bottom=Side(style="thin", color="DDDDDD"))
     ws_main.row_dimensions[3].height = 22
 
-    main_widths = [22, 24, 22, 16, 20, 20, 20, 14, 110]
+    main_widths = [22, 24, 22, 16, 20, 20, 20, 14, 95]
     for i, w in enumerate(main_widths, 1):
         ws_main.column_dimensions[get_column_letter(i)].width = w
 
@@ -609,6 +877,19 @@ def create_master_workbook():
     return wb, ws_main, ws_missed
 
 
+def dedupe_main_rows(main_rows):
+    """Remove exact duplicate analytics rows while preserving order."""
+    seen = set()
+    deduped = []
+    for row in main_rows:
+        key = tuple(row["data"] + [row.get("err", "")])
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(row)
+    return deduped
+
+
 # --- MULTI-THREADED WORKER FUNCTION ---
 
 def process_camera_row(args):
@@ -630,6 +911,21 @@ def process_camera_row(args):
         "target": api_target_str, "logs": [], "main": [], "missed": []
     }
 
+    # Helper to append main rows while detecting duplicates during processing.
+    _main_seen = set()
+    def add_main_row(row):
+        key = tuple(row.get("data", []) + [row.get("err", "")])
+        if key in _main_seen:
+            results["logs"].append(f"[DUPLICATE] Detected duplicate main row: {row.get('data')}")
+        else:
+            _main_seen.add(key)
+        results["main"].append(row)
+
+    if mfg_class in ("MIXED", None):
+        results["logs"].append(
+            f"[!] Manufacturer raw value: '{raw_mfg}' classified as {mfg_class or 'UNRECOGNIZED'}"
+        )
+
     if not ip:
         return results
 
@@ -639,11 +935,6 @@ def process_camera_row(args):
                                    f"Unrecognized MANUFACTURER value: '{raw_mfg}' (must contain 'axis' or 'hik') -- "
                                    f"analytics skipped, snapshot attempted with both known API formats"])
 
-        # We don't know the vendor, so we don't know which snapshot URL format applies.
-        # Try both rather than giving up on getting at least a photo for this row.
-        # Guard on credentials being non-empty -- constructing a handler with a None
-        # user/password doesn't fail cleanly, it raises a TypeError mid-request when
-        # HTTPBasicAuth/HTTPDigestAuth try to encode it.
         probe_handlers = []
         if user_axis and pass_axis:
             probe_handlers.append(AxisHandler(ip, user_axis, pass_axis))
@@ -666,7 +957,7 @@ def process_camera_row(args):
                 results["logs"].append(f"    [!] Warning: Could not fetch snapshot with any known API format. Defaulting to {img_w}x{img_h} canvas.")
 
             img_buf = render_overlay_image(camera_image, [], 0, img_w, img_h, "")
-            results["main"].append({
+            add_main_row({
                 "data": [client_name, location, serial, pos, "Unrecognized Manufacturer", "N/A", "Analytics Skipped", "N/A"],
                 "bg": bg_color, "img": img_buf, "err": ""
             })
@@ -676,24 +967,9 @@ def process_camera_row(args):
         return results
 
     if mfg_class == "MIXED":
-        # A single IP whose three physical camera positions aren't all the same
-        # vendor (e.g. two Hikvision, one Axis). Unlike the unrecognized-manufacturer
-        # branch above, we want real per-port analytics here, not just a snapshot --
-        # so each port gets a cheap snapshot probe per vendor first (one request per
-        # auth strategy) to see which vendor actually answers, then only that vendor's
-        # full analytics fetch runs for that port. NOTE: this branch expects the caller
-        # to have already collected BOTH AXIS_USER/PASS and HIK_USER/PASS -- run_audit.py
-        # does this for a "mixed" row, but combined.py/gui_app.py compute their own
-        # needs_axis/needs_hik pre-flight check independently and don't know about
-        # "MIXED" yet, so a MIXED row run through those front ends may not get prompted
-        # for both credential sets.
         axis_handler = AxisHandler(ip, user_axis, pass_axis) if (user_axis and pass_axis) else None
         hik_handler = HikvisionHandler(ip, user_hik, pass_hik) if (user_hik and pass_hik) else None
 
-        # Once a vendor's credentials get a clean 401 on this device, stop trying
-        # them on the device's other ports -- same account-lockout-avoidance
-        # reasoning as the single-vendor path below, just tracked per vendor
-        # since a MIXED device involves two independent logins, not one.
         axis_dead = axis_handler is None
         hik_dead = hik_handler is None
         center_axis_only = None
@@ -704,7 +980,6 @@ def process_camera_row(args):
             bg_color = cam["color"]
             results["logs"].append(f" -> Testing {pos} Interface Port: {port} (mixed-vendor unit, probing)...")
 
-            # If the center camera proves to be Axis-only, skip Axis probes on side ports.
             if pos == "CENTER" and axis_handler and hik_handler and center_axis_only is None:
                 axis_probe_ok = False
                 hik_probe_ok = False
@@ -762,10 +1037,10 @@ def process_camera_row(args):
                 results["missed"].append([timestamp, client_name, location, serial, f"{pos} ({port}) [MIXED]", "N/A",
                                            f"Neither vendor produced a snapshot on this port -- {reason}"])
                 img_buf = render_overlay_image(None, [], 0, 1280, 720, "")
-                results["main"].append({
-                    "data": [client_name, location, serial, pos, "Unresolved Vendor", "N/A", "Neither Vendor Responded", "N/A"],
-                    "bg": bg_color, "img": img_buf, "err": ""
-                })
+                add_main_row({
+                        "data": [client_name, location, serial, pos, "Unresolved Vendor", "N/A", "Neither Vendor Responded", "N/A"],
+                        "bg": bg_color, "img": img_buf, "err": ""
+                    })
                 continue
 
             img_w, img_h = camera_image.size
@@ -776,15 +1051,32 @@ def process_camera_row(args):
                 else:
                     hik_dead = True
 
+            if vendor_label == "Hikvision" and payload_data is not None:
+                channel_id = _extract_hik_channel_id(req_url)
+                if channel_id and handler.reposition_for_scene(sess, port, channel_id, "1"):
+                    results["logs"].append(f"    [+] Repositioned PTZ to analytics scene, re-fetching snapshot (Port {port}, Channel {channel_id}).")
+                    fresh_img, _, _, _ = handler.fetch_snapshot(sess, port)
+                    if fresh_img is not None:
+                        camera_image.close()
+                        camera_image = fresh_img
+                        img_w, img_h = camera_image.size
+
             pos_label = f"{pos} [{vendor_label}]"
 
             if payload_data is None:
                 err_msg = err_msg or "Unauthorized Connection (All auth variations failed)"
                 is_special_case = err_msg.startswith("SPECIAL CASE:")
-                timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                tag = "[SPECIAL CASE]" if is_special_case else ""
-                results["missed"].append([timestamp, client_name, location, serial, f"{pos_label} ({port}) {tag}".strip(), req_url, err_msg])
-                placeholder_name = "Non-Standard Analytics App (See Missed Tab)" if is_special_case else "Analytics Fetch Failed (Check Missed Tab)"
+                is_no_rules = err_msg.startswith("NO_RULES:")
+                if is_no_rules:
+                    # Camera answered fine but has no analytic zones configured. Not a
+                    # miss -- render the snapshot with a "no scenarios" placeholder.
+                    placeholder_name = "No Scenarios Configured"
+                    results["logs"].append(f"    [>] Port {port} responded with no analytics configured -- logging snapshot only (not a miss).")
+                else:
+                    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    tag = "[SPECIAL CASE]" if is_special_case else ""
+                    results["missed"].append([timestamp, client_name, location, serial, f"{pos_label} ({port}) {tag}".strip(), req_url, err_msg])
+                    placeholder_name = "Non-Standard Analytics App (See Missed Tab)" if is_special_case else "Analytics Fetch Failed (Check Missed Tab)"
                 rules = [{"is_placeholder": True, "name": placeholder_name, "type": "N/A", "target": "No Analytics Configured", "duration": "N/A", "vertices": []}]
             else:
                 rules = handler.parse_analytics(payload_data, img_w, img_h)
@@ -795,7 +1087,7 @@ def process_camera_row(args):
                     display_name = rule["name"]
                     if camera_image is None:
                         display_name = f"Snapshot Failed: {display_name}"
-                    results["main"].append({
+                    add_main_row({
                         "data": [client_name, location, serial, pos_label, display_name, rule["type"], rule["target"], rule["duration"]],
                         "bg": bg_color, "img": img_buf, "err": ""
                     })
@@ -804,7 +1096,7 @@ def process_camera_row(args):
                     else:
                         results["logs"].append(f"    [+] Logged metrics for Port {port} Scenario: {rule['name']} ({rule['duration']}s) -- resolved as {vendor_label}")
                 except Exception as e:
-                    results["main"].append({
+                    add_main_row({
                         "data": [client_name, location, serial, pos_label, rule["name"], rule["type"], rule["target"], rule["duration"]],
                         "bg": bg_color, "img": None, "err": f"(Image failed: {e})"
                     })
@@ -823,26 +1115,58 @@ def process_camera_row(args):
         bg_color = cam["color"]
         results["logs"].append(f" -> Testing {pos} Interface Port: {port}...")
 
-        camera_image, snap_url, snap_err, snap_auth_rejected = handler.fetch_snapshot(sess, port)
-        if camera_image is None:
-            img_w, img_h = handler.fallback_dim
-            results["logs"].append(f"    [!] Warning: Failed to fetch stream snapshot ({snap_err}). Defaulting to {img_w}x{img_h} canvas.")
-            timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            results["missed"].append([timestamp, client_name, location, serial, f"{pos} ({port}) [SNAPSHOT]", snap_url, snap_err])
-        else:
-            img_w, img_h = camera_image.size
+        if is_axis:
+            # --- AXIS SPECIFIC: SNAPSHOT FIRST ---
+            # Capture background snapshot immediately so auth-restricted analytics cannot block it
+            camera_image, snap_url, snap_err, snap_auth_rejected = handler.fetch_snapshot(sess, port)
+            if camera_image is None:
+                img_w, img_h = handler.fallback_dim
+                results["logs"].append(f"    [!] Warning: Failed to fetch stream snapshot ({snap_err}). Defaulting to {img_w}x{img_h} canvas.")
+                timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                results["missed"].append([timestamp, client_name, location, serial, f"{pos} ({port}) [SNAPSHOT]", snap_url, snap_err])
+            else:
+                img_w, img_h = camera_image.size
 
-        payload_data, req_url, err_msg, analytics_auth_rejected = handler.fetch_analytics(sess, port)
-        if payload_data is not None and camera_image is None:
-            results["logs"].append("    [!] Analytics retrieved but snapshot unavailable; rendering overlay on placeholder canvas.")
+            payload_data, req_url, err_msg, analytics_auth_rejected = handler.fetch_analytics(sess, port)
+            if payload_data is not None and camera_image is None:
+                results["logs"].append("    [!] Analytics retrieved but snapshot unavailable; rendering overlay on placeholder canvas.")
+        else:
+            # --- HIKVISION SPECIFIC: ANALYTICS FIRST ---
+            payload_data, req_url, err_msg, analytics_auth_rejected = handler.fetch_analytics(sess, port)
+            
+            if payload_data is not None:
+                channel_id = _extract_hik_channel_id(req_url)
+                if channel_id:
+                    if handler.reposition_for_scene(sess, port, channel_id, "1"):
+                        results["logs"].append(f"    [+] Repositioned PTZ to analytics scene before snapshot (Port {port}, Channel {channel_id}).")
+
+            # Fetch snapshot: fetch_snapshot will try Channel 201 first and fallback to 101 automatically
+            camera_image, snap_url, snap_err, snap_auth_rejected = handler.fetch_snapshot(sess, port)
+            if camera_image is None:
+                img_w, img_h = handler.fallback_dim
+                results["logs"].append(f"    [!] Warning: Failed to fetch stream snapshot ({snap_err}). Defaulting to {img_w}x{img_h} canvas.")
+                timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                results["missed"].append([timestamp, client_name, location, serial, f"{pos} ({port}) [SNAPSHOT]", snap_url, snap_err])
+            else:
+                img_w, img_h = camera_image.size
+
+            if payload_data is not None and camera_image is None:
+                results["logs"].append("    [!] Analytics retrieved but snapshot unavailable; rendering overlay on placeholder canvas.")
 
         if payload_data is None:
             err_msg = err_msg or "Unauthorized Connection (All auth variations failed)"
             is_special_case = err_msg.startswith("SPECIAL CASE:")
-            timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            tag = "[SPECIAL CASE]" if is_special_case else ""
-            results["missed"].append([timestamp, client_name, location, serial, f"{pos} ({port}) {tag}".strip(), req_url, err_msg])
-            placeholder_name = "Non-Standard Analytics App (See Missed Tab)" if is_special_case else "Analytics Fetch Failed (Check Missed Tab)"
+            is_no_rules = err_msg.startswith("NO_RULES:")
+            if is_no_rules:
+                # Camera answered fine but has no analytic zones configured. Not a
+                # miss -- render the snapshot with a "no scenarios" placeholder.
+                placeholder_name = "No Scenarios Configured"
+                results["logs"].append(f"    [>] Port {port} responded with no analytics configured -- logging snapshot only (not a miss).")
+            else:
+                timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                tag = "[SPECIAL CASE]" if is_special_case else ""
+                results["missed"].append([timestamp, client_name, location, serial, f"{pos} ({port}) {tag}".strip(), req_url, err_msg])
+                placeholder_name = "Non-Standard Analytics App (See Missed Tab)" if is_special_case else "Analytics Fetch Failed (Check Missed Tab)"
             rules = [{"is_placeholder": True, "name": placeholder_name, "type": "N/A", "target": "No Analytics Configured", "duration": "N/A", "vertices": []}]
         else:
             rules = handler.parse_analytics(payload_data, img_w, img_h)
@@ -850,7 +1174,7 @@ def process_camera_row(args):
         for index, rule in enumerate(rules):
             try:
                 img_buf = render_overlay_image(camera_image, rule["vertices"], index, img_w, img_h, rule["type"])
-                results["main"].append({
+                add_main_row({
                     "data": [client_name, location, serial, pos, rule["name"], rule["type"], rule["target"], rule["duration"]],
                     "bg": bg_color, "img": img_buf, "err": ""
                 })
@@ -859,7 +1183,7 @@ def process_camera_row(args):
                 else:
                     results["logs"].append(f"    [+] Logged metrics for Port {port} Scenario: {rule['name']} ({rule['duration']}s)")
             except Exception as e:
-                results["main"].append({
+                add_main_row({
                     "data": [client_name, location, serial, pos, rule["name"], rule["type"], rule["target"], rule["duration"]],
                     "bg": bg_color, "img": None, "err": f"(Image failed: {e})"
                 })
@@ -867,11 +1191,11 @@ def process_camera_row(args):
         if camera_image is not None:
             camera_image.close()
 
-        # If credentials were flatly rejected (clean 401s, not timeouts/other errors) on
-        # this port, the same login will fail identically on this device's other ports --
-        # retrying them just multiplies failed-auth attempts and risks tripping the
-        # device's account lockout. Skip the rest of this camera and note why.
-        if snap_auth_rejected or analytics_auth_rejected:
+        # --- DECOUPLED ACCOUNT LOCKOUT safeguard EVALUATION ---
+        # For Axis, only trigger loop break on direct snapshot 401 refusal.
+        # For Hikvision, preserve both checks intact to prevent lockout windows.
+        should_break = snap_auth_rejected if is_axis else (snap_auth_rejected or analytics_auth_rejected)
+        if should_break:
             timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             results["logs"].append(f"    [!] Authentication flatly rejected on Port {port} -- skipping remaining ports on this device to avoid triggering an account lockout.")
             results["missed"].append([timestamp, client_name, location, serial, "REMAINING PORTS SKIPPED", "N/A",
@@ -918,8 +1242,6 @@ def run_batch(camera_rows, credentials, output_dir, base_filename, log_cb=None, 
     total_cameras = len(camera_rows)
     log("[+] Spinning up multi-threaded batch engine...")
 
-    # Never spin up more threads than there are rows to process (e.g. single-test mode
-    # doesn't need a 15-thread pool for 1 camera).
     active_worker_count = max(1, min(MAX_WORKER_THREADS, total_cameras))
 
     done_count = 0
@@ -945,7 +1267,10 @@ def run_batch(camera_rows, credentials, output_dir, base_filename, log_cb=None, 
                     ws_missed.cell(row=current_missed_row, column=col).font = normal_font
                 current_missed_row += 1
 
-            for main_row in res["main"]:
+            main_rows = dedupe_main_rows(res["main"])
+            if len(main_rows) < len(res["main"]):
+                log(f"[!] Removed {len(res['main']) - len(main_rows)} duplicate analytics row(s) for IP {res['ip']}")
+            for main_row in main_rows:
                 bg = main_row["bg"]
                 row_fill = PatternFill("solid", start_color=bg)
                 active_normal_font = white_normal_font if bg == "00726E" else normal_font
