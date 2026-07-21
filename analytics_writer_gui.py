@@ -97,7 +97,9 @@ class WriterApp(ctk.CTk):
         self.editing = None            # native_id being edited, or None = new
         self.adapter = None            # current vendor adapter
         self.edit_size = []            # [(rect, label)] min/max size of the scenario being edited
-        self.edit_perspective = []     # [{"height","points"}] calibration bars of the edited scenario
+        self.perspective_bars = []     # editable calibration bars: [{"height":cm, "points":[canvas pts]}]
+        self.current_bar = []          # in-progress bar (canvas pts; 2 clicks = 1 bar)
+        self.bar_mode = False          # canvas clicks place calibration bars instead of zones
 
         self._build_header()
         self._build_body()
@@ -140,6 +142,12 @@ class WriterApp(ctk.CTk):
             self.mode_var.set("Include")
         # Restore only where the API can truly roll back (delete-capable vendors).
         self.restore_button.configure(state="normal" if caps.can_delete else "disabled")
+        # Perspective calibration section (Axis only).
+        if caps.perspective:
+            self.persp_frame.pack(fill="x", padx=12, pady=4, before=self.push_button)
+        else:
+            self.persp_frame.pack_forget()
+            self.bar_mode = False
         self._on_rule_change()  # refresh loiter/fence frame visibility under new type list
 
     # -------------------------------------------------------------- layout
@@ -278,6 +286,26 @@ class WriterApp(ctk.CTk):
         ctk.CTkButton(row, text="Clear All", width=120, command=self._clear_points,
                       fg_color=LVT_TEAL, hover_color=LVT_TEAL_HOVER).pack(side="left")
 
+        # Perspective calibration (Axis only). Draw 2-3 vertical bars of known real-world
+        # height so the camera can size objects in the scene.
+        self.persp_frame = ctk.CTkFrame(side, fg_color="transparent")
+        ctk.CTkLabel(self.persp_frame, text="Perspective calibration (green bars)",
+                     text_color=LVT_TEXT_DARK, font=ctk.CTkFont(size=12, weight="bold")).pack(anchor="w", pady=(10, 2))
+        hrow = ctk.CTkFrame(self.persp_frame, fg_color="transparent")
+        hrow.pack(fill="x")
+        ctk.CTkLabel(hrow, text="Bar height (cm)", text_color=LVT_TEXT_MUTED,
+                     font=ctk.CTkFont(size=10)).pack(side="left")
+        self.bar_height_var = tk.StringVar(value="180")
+        ctk.CTkEntry(hrow, textvariable=self.bar_height_var, width=70).pack(side="right")
+        self.bar_button = ctk.CTkButton(self.persp_frame, text="Draw Bar: OFF", command=self._toggle_bar_mode,
+                                        fg_color=LVT_TEAL, hover_color=LVT_TEAL_HOVER)
+        self.bar_button.pack(fill="x", pady=4)
+        ctk.CTkButton(self.persp_frame, text="Clear Bars", command=self._clear_bars,
+                      fg_color=LVT_TEAL, hover_color=LVT_TEAL_HOVER).pack(fill="x")
+        ctk.CTkLabel(self.persp_frame, text="Set height, click 2 points per bar (2-3 bars).",
+                     text_color=LVT_TEXT_MUTED, font=ctk.CTkFont(size=10), justify="left").pack(anchor="w")
+        # packed/unpacked by _apply_capabilities
+
         self.push_button = ctk.CTkButton(side, text="Push to Camera", command=self._push,
                                           fg_color=LVT_DARK_TEAL, hover_color=LVT_DARK_TEAL_HOVER,
                                           font=ctk.CTkFont(size=13, weight="bold"), height=40)
@@ -355,7 +383,7 @@ class WriterApp(ctk.CTk):
             self.name_var.set("")
             self.points, self.exclude_zones, self.current_exclude = [], [], []
             self.edit_size = []
-            self.edit_perspective = []
+            self.perspective_bars, self.current_bar = [], []
             self._redraw()
             self._log("[.] New scenario mode.")
             return
@@ -389,14 +417,18 @@ class WriterApp(ctk.CTk):
         self.exclude_zones = [[self._frac_to_canvas(fx, fy) for (fx, fy) in z] for z in sc.exclusions]
         self.current_exclude = []
         self.edit_size = [(r, lbl) for r, lbl in ((sc.min_size, "min"), (sc.max_size, "max")) if r]
-        self.edit_perspective = sc.perspective or []
+        self.perspective_bars = [{"height": b.get("height"),
+                                  "points": [self._frac_to_canvas(fx, fy) for (fx, fy) in b.get("points", [])]}
+                                 for b in (sc.perspective or [])]
+        self.current_bar = []
+        self.bar_mode = False
         self.mode_var.set("Include")
         self._redraw()
         extras = []
         if self.edit_size:
             extras.append("min/max size")
-        if self.edit_perspective:
-            extras.append(f"{len(self.edit_perspective)} perspective bar(s)")
+        if self.perspective_bars:
+            extras.append(f"{len(self.perspective_bars)} perspective bar(s)")
         msg = (" Showing " + ", ".join(extras) + ".") if extras else ""
         self._log(f"[.] Editing '{choice}'. Adjust and Push to update it in place.{msg}")
 
@@ -488,7 +520,7 @@ class WriterApp(ctk.CTk):
         self.current_exclude = []
         self.existing_overlays = []
         self.edit_size = []
-        self.edit_perspective = []
+        self.perspective_bars, self.current_bar = [], []
         self.editing = None
         if hasattr(self, "edit_var"):
             self.edit_var.set(NEW_SCENARIO)
@@ -597,14 +629,19 @@ class WriterApp(ctk.CTk):
             self.canvas.create_text(x0 + 2, y0 - 7, text=lbl, fill=SIZE_OUTLINE,
                                     anchor="sw", font=("Consolas", 8, "bold"))
 
-        # Perspective calibration bars for the scenario being edited (green).
-        for bar in self.edit_perspective:
-            self._draw_bar(bar.get("points", []), f"{bar.get('height')}cm")
+        # Editable perspective calibration bars (green) + any in-progress bar.
+        for bar in self.perspective_bars:
+            self._draw_bar_canvas(bar["points"], f"{bar['height']}cm")
+        if len(self.current_bar) == 1:
+            x, y = self.current_bar[0]
+            self.canvas.create_oval(x - 4, y - 4, x + 4, y + 4, fill=PERSP_OUTLINE, outline=LVT_WHITE)
 
     def _draw_bar(self, verts_frac, label):
-        """Draw a perspective calibration bar: a line between two fraction points with
-        end ticks and a real-world-height label."""
-        pts = [self._frac_to_canvas(fx, fy) for (fx, fy) in verts_frac]
+        """Draw a calibration bar from fraction points (used by read-overlays)."""
+        self._draw_bar_canvas([self._frac_to_canvas(fx, fy) for (fx, fy) in verts_frac], label)
+
+    def _draw_bar_canvas(self, pts, label):
+        """Draw a calibration bar from canvas points: a line with end ticks + height label."""
         if len(pts) < 2:
             return
         self.canvas.create_line(*self._flat(pts[:2]), fill=PERSP_OUTLINE, width=3)
@@ -629,6 +666,22 @@ class WriterApp(ctk.CTk):
         # ignore clicks outside the image area
         ix, iy = self._canvas_to_image_px(event.x, event.y)
         if not (0 <= ix <= self.img_w and 0 <= iy <= self.img_h):
+            return
+        if self.bar_mode:
+            self.current_bar.append((event.x, event.y))
+            if len(self.current_bar) == 2:
+                try:
+                    h = int(self.bar_height_var.get().strip())
+                except ValueError:
+                    h = 180
+                if len(self.perspective_bars) >= aoa_config.PERSP_MAX_BARS:
+                    self._log(f"[!] Max {aoa_config.PERSP_MAX_BARS} calibration bars.")
+                    self.current_bar = []
+                else:
+                    self.perspective_bars.append({"height": h, "points": list(self.current_bar)})
+                    self.current_bar = []
+                    self._log(f"[.] Bar {len(self.perspective_bars)} added ({h}cm).")
+            self._redraw()
             return
         if self.mode_var.get() == "Exclude":
             if len(self.exclude_zones) >= aoa_config.MAX_EXCLUDE_ZONES:
@@ -664,6 +717,20 @@ class WriterApp(ctk.CTk):
         if self.rule_var.get() == "Line Crossing" and self.mode_var.get() == "Exclude":
             self._log("[!] Exclusion zones aren't used with Line Crossing. Staying in Include mode.")
             self.mode_var.set("Include")
+
+    def _toggle_bar_mode(self):
+        self.bar_mode = not self.bar_mode
+        self.bar_button.configure(text=f"Draw Bar: {'ON' if self.bar_mode else 'OFF'}",
+                                  fg_color=PERSP_OUTLINE if self.bar_mode else LVT_TEAL)
+        self.current_bar = []
+        if self.bar_mode:
+            self._log("[.] Bar mode ON: set the height, then click 2 points for each bar (2-3 bars).")
+
+    def _clear_bars(self):
+        self.perspective_bars = []
+        self.current_bar = []
+        self._redraw()
+        self._log("[.] Calibration bars cleared.")
 
     def _finish_exclude(self):
         if len(self.current_exclude) < 3:
@@ -736,10 +803,24 @@ class WriterApp(ctk.CTk):
             except ValueError:
                 return None, "Enter loiter seconds as a whole number."
 
+        # Perspective calibration bars (Axis only). Include an in-progress complete bar.
+        bars = list(self.perspective_bars)
+        if len(self.current_bar) == 2:
+            try:
+                bars.append({"height": int(self.bar_height_var.get().strip()), "points": list(self.current_bar)})
+            except ValueError:
+                pass
+        perspective = None
+        if bars:
+            if not (aoa_config.PERSP_MIN_BARS <= len(bars) <= aoa_config.PERSP_MAX_BARS):
+                return None, f"Perspective needs {aoa_config.PERSP_MIN_BARS}-{aoa_config.PERSP_MAX_BARS} bars, got {len(bars)}."
+            perspective = [{"height": b["height"],
+                            "points": [self._canvas_to_frac(x, y) for (x, y) in b["points"]]} for b in bars]
+
         sc = vendor_adapter.Scenario(
             name=name, kind=kind, points=points, classes=classes, duration=duration,
             direction=self._alarm_direction() if kind == "line" else None,
-            exclusions=exclusions, native_id=self.editing)
+            exclusions=exclusions, native_id=self.editing, perspective=perspective)
         return sc, None
 
     def _push(self):

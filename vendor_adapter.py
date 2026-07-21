@@ -116,23 +116,25 @@ class AxisAdapter:
 
     def apply_scenario(self, sc, backup_dir):
         """Create or edit-in-place. If sc.native_id matches an existing scenario, patch
-        it (preserving perspective/presets/filters); otherwise build a new one."""
+        it (preserving perspective/presets/filters); otherwise build a new one. If
+        sc.perspective is set, its calibration bars are written to the top-level
+        perspectives and linked to the scenario (updating the existing one when editing)."""
         _require(self.capabilities, sc)
         verts = self._to_aoa(sc.points)
         excl = [self._to_aoa(z) for z in sc.exclusions] or None
 
+        orig = None
         if sc.native_id is not None:
             current = self.client.get_config()
             orig = next((s for s in current.get("data", {}).get("scenarios", [])
                          if s.get("id") == sc.native_id), None)
-            if orig is not None:
-                loiter = sc.duration if sc.kind == "loiter" else None
-                direction = sc.direction if sc.kind == "line" else None
-                scenario = aoa_config.update_scenario_geometry(orig, verts, sc.classes, excl, loiter, direction)
-                scenario["name"] = sc.name
-                return self.client.apply_scenario(scenario, backup_dir)
 
-        if sc.kind == "line":
+        if orig is not None:
+            loiter = sc.duration if sc.kind == "loiter" else None
+            direction = sc.direction if sc.kind == "line" else None
+            scenario = aoa_config.update_scenario_geometry(orig, verts, sc.classes, excl, loiter, direction)
+            scenario["name"] = sc.name
+        elif sc.kind == "line":
             scenario = aoa_config.build_line_crossing(sc.name, verts, classes=sc.classes,
                                                       alarm_direction=sc.direction or "leftToRight")
         elif sc.kind == "loiter":
@@ -141,7 +143,22 @@ class AxisAdapter:
             scenario = aoa_config.build_intrusion(sc.name, verts, classes=sc.classes)
         if excl and sc.kind != "line":
             aoa_config.add_exclude_zones(scenario, excl)
-        return self.client.apply_scenario(scenario, backup_dir)
+
+        if not sc.perspective:
+            return self.client.apply_scenario(scenario, backup_dir)
+
+        # Perspective bars: write to top-level data.perspectives + link the scenario.
+        # Reuse the scenario's existing perspective id on edit so we don't pile up dupes.
+        bars_norm = [{"height": b["height"], "points": self._to_aoa(b["points"])}
+                     for b in sc.perspective]
+        pid = (orig.get("perspectives") or [None])[0] if orig else None
+        persp = aoa_config.build_perspective(bars_norm, perspective_id=pid)
+        backup_path, current = self.client.backup_config(backup_dir)
+        cfg, pid = aoa_config.insert_or_replace_perspective(current, persp)
+        scenario["perspectives"] = [pid]
+        cfg = aoa_config.insert_or_replace_scenario(cfg, scenario)
+        self.client.set_config(cfg)
+        return backup_path, self.client.get_config()
 
 
 # ---------------------------------------------------------------- Hik
