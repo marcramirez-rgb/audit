@@ -26,6 +26,7 @@ import customtkinter as ctk
 from PIL import Image, ImageTk
 
 import aoa_config
+import vendor_adapter
 
 try:
     from dotenv import load_dotenv
@@ -62,13 +63,17 @@ DIR_R2L = "Right → Left"
 DIR_TO_API = {DIR_L2R: "leftToRight", DIR_R2L: "rightToLeft"}
 API_TO_DIR = {v: k for k, v in DIR_TO_API.items()}
 
+# UI label <-> neutral Scenario.kind
+LABEL_TO_KIND = {"Intrusion": "intrusion", "Line Crossing": "line", "Loitering": "loiter"}
+KIND_TO_LABEL = {v: k for k, v in LABEL_TO_KIND.items()}
+
 ctk.set_appearance_mode("light")
 
 
 class WriterApp(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title("LiveView Technologies -- Axis Analytics Writer")
+        self.title("LiveView Technologies -- Analytics Writer")
         self.geometry("1180x860")
         self.minsize(1040, 760)
         self.configure(fg_color=LVT_WHITE)
@@ -85,23 +90,62 @@ class WriterApp(ctk.CTk):
         self.points = []               # canvas-pixel points for the INCLUDE zone/line
         self.exclude_zones = []        # list of finished exclusion polygons (canvas px)
         self.current_exclude = []      # exclusion polygon currently being drawn
-        self.existing_overlays = []    # scenarios already on the camera (normalized verts)
-        self.existing_scenarios = []   # full scenario dicts from the last Read Current Config
-        self.editing = None            # original scenario dict being edited, or None = new
+        self.existing_overlays = []    # {name, kind, verts(frac), exclusions} for the canvas
+        self.existing_scenarios = []   # neutral vendor_adapter.Scenario list from last read
+        self.editing = None            # native_id being edited, or None = new
+        self.adapter = None            # current vendor adapter
 
         self._build_header()
         self._build_body()
         self._prefill_credentials()
+        self._on_mfg_change()          # set initial capability gating + channel visibility
         self.after(100, self._poll_queue)
+
+    # -------------------------------------------------------------- vendor
+    def _caps(self):
+        return vendor_adapter.capabilities_for(self.mfg_var.get())
+
+    def _on_mfg_change(self, _value=None):
+        mfg = self.mfg_var.get()
+        # Hik needs a channel; Axis doesn't.
+        if vendor_adapter.camera_engine.classify_manufacturer(mfg) == "HIKVISION":
+            self.channel_frame.pack(fill="x", padx=12, pady=4, after=self.ip_entry)
+        else:
+            self.channel_frame.pack_forget()
+        self.adapter = None  # force rebuild on next action
+        self._prefill_credentials()
+        self._apply_capabilities()
+
+    def _apply_capabilities(self):
+        """Enable/disable UI to match what the selected vendor can actually do."""
+        caps = self._caps()
+        if caps is None:
+            return
+        # Scenario types restricted to what the vendor supports.
+        labels = [KIND_TO_LABEL[k] for k in caps.kinds if k in KIND_TO_LABEL]
+        self.rule_menu.configure(values=labels)
+        if self.rule_var.get() not in labels and labels:
+            self.rule_var.set(labels[0])
+        # Vehicle class: only if the vendor supports it.
+        self.class_vehicle.configure(state="normal" if "vehicle" in caps.classes else "disabled")
+        # Exclusion controls.
+        excl_state = "normal" if caps.exclusions else "disabled"
+        self.mode_toggle.configure(state=excl_state)
+        self.finish_excl_button.configure(state=excl_state)
+        if not caps.exclusions:
+            self.mode_var.set("Include")
+        # Restore only where the API can truly roll back (delete-capable vendors).
+        self.restore_button.configure(state="normal" if caps.can_delete else "disabled")
+        self._on_rule_change()  # refresh loiter/fence frame visibility under new type list
 
     # -------------------------------------------------------------- layout
     def _build_header(self):
         header = ctk.CTkFrame(self, fg_color=LVT_DARK_TEAL, corner_radius=0, height=72)
         header.pack(fill="x", side="top")
         header.pack_propagate(False)
-        ctk.CTkLabel(header, text="Axis Analytics Writer", font=ctk.CTkFont(size=22, weight="bold"),
+        ctk.CTkLabel(header, text="Analytics Writer", font=ctk.CTkFont(size=22, weight="bold"),
                      text_color=LVT_WHITE).pack(side="left", padx=24, pady=10)
-        ctk.CTkLabel(header, text="Draw analytics scenarios and push them to the camera -- no web UI",
+        ctk.CTkLabel(header, text="Configure Axis and Hikvision analytics -- one place, no web UI",
                      font=ctk.CTkFont(size=12), text_color=LVT_LIGHT).pack(side="left", padx=(0, 24), pady=(20, 10))
 
     def _build_body(self):
@@ -123,8 +167,23 @@ class WriterApp(ctk.CTk):
                          font=ctk.CTkFont(size=12, weight="bold")).pack(anchor="w", padx=12, pady=pad)
 
         label("Camera", (12, 2))
+        self.mfg_var = tk.StringVar(value="Axis")
+        ctk.CTkOptionMenu(side, values=["Axis", "Hikvision"], variable=self.mfg_var,
+                          command=self._on_mfg_change, fg_color=LVT_TEAL, button_color=LVT_DARK_TEAL,
+                          button_hover_color=LVT_DARK_TEAL_HOVER).pack(fill="x", padx=12, pady=4)
+
         self.ip_entry = ctk.CTkEntry(side, placeholder_text="Camera IP e.g. 10.23.66.205")
         self.ip_entry.pack(fill="x", padx=12, pady=4)
+
+        # Hik-only: which channel the VCA lives on (optical=1, thermal=2).
+        self.channel_frame = ctk.CTkFrame(side, fg_color="transparent")
+        ctk.CTkLabel(self.channel_frame, text="Channel (Hik: 1=optical, 2=thermal)",
+                     text_color=LVT_TEXT_MUTED, font=ctk.CTkFont(size=10)).pack(anchor="w")
+        self.channel_var = tk.StringVar(value="2")
+        ctk.CTkOptionMenu(self.channel_frame, values=["1", "2"], variable=self.channel_var,
+                          fg_color=LVT_TEAL, button_color=LVT_DARK_TEAL,
+                          button_hover_color=LVT_DARK_TEAL_HOVER).pack(fill="x")
+        # packed/unpacked by _on_mfg_change
 
         self.port_var = tk.StringVar(value="5015")
         ctk.CTkLabel(side, text="Port (LVT: 5010=Center, 5015=Left, 5020=Right)",
@@ -153,9 +212,10 @@ class WriterApp(ctk.CTk):
 
         label("Scenario type")
         self.rule_var = tk.StringVar(value="Intrusion")
-        ctk.CTkOptionMenu(side, values=["Intrusion", "Line Crossing", "Loitering"], variable=self.rule_var,
+        self.rule_menu = ctk.CTkOptionMenu(side, values=["Intrusion", "Line Crossing", "Loitering"], variable=self.rule_var,
                           command=self._on_rule_change, fg_color=LVT_TEAL, button_color=LVT_DARK_TEAL,
-                          button_hover_color=LVT_DARK_TEAL_HOVER).pack(fill="x", padx=12, pady=4)
+                          button_hover_color=LVT_DARK_TEAL_HOVER)
+        self.rule_menu.pack(fill="x", padx=12, pady=4)
 
         # AOA caps scenario names at 15 chars (maxLengthName from capabilities) -- enforce
         # visibly here instead of letting the write fail or silently truncate.
@@ -293,65 +353,54 @@ class WriterApp(ctk.CTk):
             self._redraw()
             self._log("[.] New scenario mode.")
             return
-        scenario = next((s for s in self.existing_scenarios if s.get("name") == choice), None)
-        if scenario is None:
+        sc = next((s for s in self.existing_scenarios if s.name == choice), None)
+        if sc is None:
             return
         if not self.tk_image:
             self._log("[!] Read Current Config first so the snapshot is loaded.")
             return
 
-        self.editing = scenario
-        self.name_var.set(scenario.get("name", ""))
-        self._set_classes([c.get("type") for c in scenario.get("objectClassifications", [])])
-
-        trig = (scenario.get("triggers") or [{}])[0]
-        ttype = trig.get("type")
-        conds = trig.get("conditions") or []
-        is_loiter = any(c.get("type") == "individualTimeInArea" for c in conds)
-        if ttype in ("fence", "countingLine"):
-            self.rule_var.set("Line Crossing")
-        elif is_loiter:
-            self.rule_var.set("Loitering")
-        else:
-            self.rule_var.set("Intrusion")
+        self.editing = sc.native_id
+        self.name_var.set(sc.name)
+        self._set_classes(sc.classes)
+        self.rule_var.set(KIND_TO_LABEL.get(sc.kind, "Intrusion"))
 
         # Show/hide the type-specific fields WITHOUT _on_rule_change (which clears geometry).
-        if self.rule_var.get() == "Loitering":
+        if sc.kind == "loiter":
             self.loiter_frame.pack(fill="x", padx=12, pady=4)
-            secs = ""
-            for c in conds:
-                for d in c.get("data", []):
-                    if d.get("time"):
-                        secs = str(d["time"])
-                        break
             self.loiter_entry.delete(0, "end")
-            self.loiter_entry.insert(0, secs)
+            self.loiter_entry.insert(0, str(sc.duration or ""))
         else:
             self.loiter_frame.pack_forget()
 
-        if self.rule_var.get() == "Line Crossing":
-            self.dir_var.set(API_TO_DIR.get(trig.get("alarmDirection", "leftToRight"), DIR_L2R))
+        if sc.kind == "line":
+            self.dir_var.set(API_TO_DIR.get(sc.direction or "leftToRight", DIR_L2R))
             self.fence_frame.pack(fill="x", padx=12, pady=4)
         else:
             self.fence_frame.pack_forget()
 
-        self.points = [self._norm_to_canvas(float(x), float(y)) for x, y in trig.get("vertices", [])]
-        self.exclude_zones = [[self._norm_to_canvas(float(x), float(y)) for x, y in f.get("vertices", [])]
-                              for f in scenario.get("filters", []) if f.get("type") == "excludeArea"]
+        self.points = [self._frac_to_canvas(fx, fy) for (fx, fy) in sc.points]
+        self.exclude_zones = [[self._frac_to_canvas(fx, fy) for (fx, fy) in z] for z in sc.exclusions]
         self.current_exclude = []
         self.mode_var.set("Include")
         self._redraw()
-        self._log(f"[.] Editing '{choice}' (id {scenario.get('id')}). Non-editable settings "
-                  f"(perspective, size filters) are preserved. Adjust and Push to update.")
+        self._log(f"[.] Editing '{choice}'. Adjust and Push to update it in place.")
 
-    def _make_client(self):
+    def _make_adapter(self):
         ip = self.ip_entry.get().strip()
         user = self.user_entry.get().strip()
         password = self.pass_entry.get().strip()
         if not (ip and user and password):
             self._log("[!] Enter IP, username, and password first.")
             return None
-        return aoa_config.AOAClient(ip, user, password, self.port_var.get())
+        try:
+            self.adapter = vendor_adapter.make_adapter(
+                self.mfg_var.get(), ip, self.port_var.get(), user, password,
+                channel=self.channel_var.get())
+        except Exception as e:
+            self._log(f"[!] {e}")
+            return None
+        return self.adapter
 
     def _run_bg(self, fn):
         if self.worker and self.worker.is_alive():
@@ -361,65 +410,44 @@ class WriterApp(ctk.CTk):
         self.worker.start()
 
     def _fetch_snapshot(self):
-        client = self._make_client()
-        if not client:
+        adapter = self._make_adapter()
+        if not adapter:
             return
-        self._log(f"[*] Fetching snapshot from {client.control_url.rsplit('/local', 1)[0]} ...")
+        self._log(f"[*] Fetching snapshot from {adapter.vendor} {self.ip_entry.get().strip()} ...")
 
         def work():
             try:
-                img = client.fetch_snapshot()
-                self.msg_queue.put(("snapshot", img))
+                self.msg_queue.put(("snapshot", adapter.fetch_snapshot()))
             except Exception as e:
                 self.msg_queue.put(("log", f"[!] Snapshot failed: {e}"))
         self._run_bg(work)
 
     def _read_config(self):
-        client = self._make_client()
-        if not client:
+        adapter = self._make_adapter()
+        if not adapter:
             return
         need_snap = self.tk_image is None
-        self._log("[*] Reading current AOA configuration ...")
+        self._log(f"[*] Reading current {adapter.vendor} scenarios ...")
 
         def work():
             try:
                 if need_snap:
-                    # Need the snapshot to place the overlays; fetch it first so this
-                    # is one click even before a snapshot is loaded.
-                    self.msg_queue.put(("snapshot", client.fetch_snapshot()))
-                cfg = client.get_config()
-                scenarios = cfg.get("data", {}).get("scenarios", [])
-                overlays = self._parse_overlays(scenarios)
+                    self.msg_queue.put(("snapshot", adapter.fetch_snapshot()))
+                scenarios = adapter.read_scenarios()
+                overlays = []
                 lines = [f"[+] {len(scenarios)} scenario(s) configured:"]
                 for s in scenarios:
-                    classes = ", ".join(c.get("type", "?") for c in s.get("objectClassifications", [])) or "any"
-                    n_excl = len([f for f in s.get("filters", []) if f.get("type") == "excludeArea"])
-                    excl = f", {n_excl} exclusion(s)" if n_excl else ""
-                    lines.append(f"    #{s.get('id')} '{s.get('name')}' type={s.get('type')} classes={classes}{excl}")
+                    ov_kind = "fence" if s.kind == "line" else "area"
+                    overlays.append({"name": s.name, "kind": ov_kind, "verts": s.points})
+                    for ex in s.exclusions:
+                        overlays.append({"name": f"{s.name} (exclude)", "kind": "exclude", "verts": ex})
+                    lines.append(f"    '{s.name}' {s.kind} classes={s.classes}"
+                                 + (f" dur={s.duration}" if s.duration else "")
+                                 + (f" excl={len(s.exclusions)}" if s.exclusions else ""))
                 self.msg_queue.put(("overlays", overlays, lines, scenarios))
             except Exception as e:
                 self.msg_queue.put(("log", f"[!] Read failed: {e}"))
         self._run_bg(work)
-
-    @staticmethod
-    def _parse_overlays(scenarios):
-        """Flatten scenarios into drawable overlays (normalized verts + kind + label).
-        kind: 'area' (includeArea), 'fence' (fence/countingLine), 'exclude'."""
-        overlays = []
-        for s in scenarios:
-            name = s.get("name", f"#{s.get('id')}")
-            trig = (s.get("triggers") or [{}])[0]
-            ttype = trig.get("type")
-            verts = [(float(x), float(y)) for x, y in trig.get("vertices", [])]
-            if ttype in ("fence", "countingLine"):
-                overlays.append({"name": name, "kind": "fence", "verts": verts})
-            elif verts:
-                overlays.append({"name": name, "kind": "area", "verts": verts})
-            for f in s.get("filters", []):
-                if f.get("type") == "excludeArea":
-                    ev = [(float(x), float(y)) for x, y in f.get("vertices", [])]
-                    overlays.append({"name": f"{name} (exclude)", "kind": "exclude", "verts": ev})
-        return overlays
 
     # ---- canvas drawing
     def _display_image(self, pil_img):
@@ -440,29 +468,41 @@ class WriterApp(ctk.CTk):
             self.edit_var.set(NEW_SCENARIO)
         self._redraw()
 
-    def _norm_to_canvas(self, nx, ny):
-        ix, iy = aoa_config.norm_to_pixel(nx, ny, self.img_w, self.img_h)
+    def _frac_to_canvas(self, fx, fy):
+        """Neutral [0,1] top-left fraction -> canvas pixel."""
+        ix, iy = fx * self.img_w, fy * self.img_h
         return (ix * self.scale + self.offset_x, iy * self.scale + self.offset_y)
+
+    def _canvas_to_frac(self, cx, cy):
+        """Canvas pixel -> neutral [0,1] top-left fraction (clamped)."""
+        ix, iy = self._canvas_to_image_px(cx, cy)
+        return (max(0.0, min(1.0, ix / self.img_w)), max(0.0, min(1.0, iy / self.img_h)))
 
     def _draw_fence_arrow(self):
         """Perpendicular arrow at the line midpoint showing the crossing direction an
         object must travel to trigger. Computed in AOA normalized space (the authority
         for leftToRight/rightToLeft, which is relative to vertex[0]->vertex[1]), then
         mapped to the canvas so it stays correct through the Y-flip."""
-        n0 = aoa_config.pixel_to_norm(*self._canvas_to_image_px(*self.points[0]), self.img_w, self.img_h)
-        n1 = aoa_config.pixel_to_norm(*self._canvas_to_image_px(*self.points[1]), self.img_w, self.img_h)
+        # Compute in AOA y-up space (the authority for leftToRight/rightToLeft, verified
+        # against the Axis UI) then map back through fractions. Direction is Axis-only.
+        def frac_to_aoa(fx, fy):
+            return (2 * fx - 1, 1 - 2 * fy)
+
+        def aoa_to_canvas(ax, ay):
+            return self._frac_to_canvas((ax + 1) / 2.0, (1 - ay) / 2.0)
+
+        n0 = frac_to_aoa(*self._canvas_to_frac(*self.points[0]))
+        n1 = frac_to_aoa(*self._canvas_to_frac(*self.points[1]))
         dx, dy = n1[0] - n0[0], n1[1] - n0[1]
         length = (dx * dx + dy * dy) ** 0.5 or 1.0
-        # In y-up space, the right-hand normal of travel v0->v1 is (dy, -dx); that is the
-        # direction an object moves for "leftToRight". Flip it for "rightToLeft".
         if self._alarm_direction() == "leftToRight":
             px, py = dy / length, -dx / length
         else:
             px, py = -dy / length, dx / length
         mid = ((n0[0] + n1[0]) / 2.0, (n0[1] + n1[1]) / 2.0)
         tip = (mid[0] + px * 0.18, mid[1] + py * 0.18)
-        mcx, mcy = self._norm_to_canvas(*mid)
-        tcx, tcy = self._norm_to_canvas(*tip)
+        mcx, mcy = aoa_to_canvas(*mid)
+        tcx, tcy = aoa_to_canvas(*tip)
         self.canvas.create_line(mcx, mcy, tcx, tcy, fill=ZONE_OUTLINE, width=3,
                                 arrow="last", arrowshape=(14, 16, 6))
 
@@ -473,7 +513,7 @@ class WriterApp(ctk.CTk):
 
         # Existing camera scenarios (amber reference), drawn under the active drawing.
         for ov in self.existing_overlays:
-            pts = [self._norm_to_canvas(nx, ny) for (nx, ny) in ov["verts"]]
+            pts = [self._frac_to_canvas(fx, fy) for (fx, fy) in ov["verts"]]
             if ov["kind"] == "fence" and len(pts) >= 2:
                 self.canvas.create_line(*self._flat(pts), fill=EXISTING_OUTLINE, width=3, dash=(6, 3))
             elif ov["kind"] == "exclude" and len(pts) >= 3:
@@ -546,16 +586,15 @@ class WriterApp(ctk.CTk):
             return
         ix, iy = self._canvas_to_image_px(event.x, event.y)
         if 0 <= ix <= self.img_w and 0 <= iy <= self.img_h:
-            nx, ny = aoa_config.pixel_to_norm(ix, iy, self.img_w, self.img_h)
+            fx, fy = self._canvas_to_frac(event.x, event.y)
             self.coord_label.configure(
-                text=f"cursor: px({int(ix)},{int(iy)})  ->  AOA norm({nx:+.3f}, {ny:+.3f})   |   "
+                text=f"cursor: px({int(ix)},{int(iy)})  ->  frac({fx:.3f}, {fy:.3f})   |   "
                      f"points: {len(self.points)}")
 
     def _update_coord_label(self):
-        norms = [aoa_config.pixel_to_norm(*self._canvas_to_image_px(x, y), self.img_w, self.img_h)
-                 for (x, y) in self.points]
+        fracs = [self._canvas_to_frac(x, y) for (x, y) in self.points]
         self._log(f"[.] {len(self.points)} point(s): " +
-                  ", ".join(f"({nx:+.3f},{ny:+.3f})" for nx, ny in norms))
+                  ", ".join(f"({fx:.3f},{fy:.3f})" for fx, fy in fracs))
 
     def _on_mode_change(self, _value=None):
         # Exclusion applies to area scenarios; line crossing has no include area to
@@ -601,7 +640,7 @@ class WriterApp(ctk.CTk):
         return tuple(classes) or ("human",)
 
     def _build_scenario(self):
-        """Turn the current drawing + form into a validated AOA scenario, or return
+        """Turn the current drawing + form into a vendor-neutral Scenario, or return
         (None, reason) if the inputs aren't usable."""
         name = self.name_var.get().strip()
         if not name:
@@ -610,98 +649,81 @@ class WriterApp(ctk.CTk):
             return None, "Fetch a snapshot and draw a zone first."
         classes = self._selected_classes()
         rule = self.rule_var.get()
+        kind = LABEL_TO_KIND.get(rule, "intrusion")
 
-        norm = [aoa_config.pixel_to_norm(*self._canvas_to_image_px(x, y), self.img_w, self.img_h)
-                for (x, y) in self.points]
+        points = [self._canvas_to_frac(x, y) for (x, y) in self.points]
+
+        if kind == "line":
+            if len(points) != 2:
+                return None, "Line crossing needs exactly 2 points."
+        elif len(points) < 3:
+            return None, f"{rule} needs an area of at least 3 points."
 
         # Exclusion zones (area scenarios only). Auto-finish an in-progress one.
-        exclude_norm = None
-        if rule != "Line Crossing":
+        exclusions = []
+        if kind != "line":
             zones = list(self.exclude_zones)
             if len(self.current_exclude) >= 3:
                 zones.append(list(self.current_exclude))
-            exclude_norm = [[aoa_config.pixel_to_norm(*self._canvas_to_image_px(x, y), self.img_w, self.img_h)
-                             for (x, y) in zone] for zone in zones] or None
+            exclusions = [[self._canvas_to_frac(x, y) for (x, y) in z] for z in zones]
 
-        if self.editing is not None:
-            # Modify-in-place: patch only geometry/classes/exclusions/loiter time,
-            # preserving all other settings on the original scenario.
-            loiter_seconds = None
-            if rule == "Loitering":
-                try:
-                    loiter_seconds = int(self.loiter_entry.get().strip())
-                except ValueError:
-                    return None, "Enter loiter seconds as a whole number."
-            alarm_dir = self._alarm_direction() if rule == "Line Crossing" else None
-            scenario = aoa_config.update_scenario_geometry(
-                self.editing, norm, classes, exclude_norm, loiter_seconds, alarm_dir)
-            scenario["name"] = name  # allow rename (replace-by-id keeps the right target)
-        elif rule == "Line Crossing":
-            if len(norm) != 2:
-                return None, "Line crossing needs exactly 2 points."
-            scenario = aoa_config.build_line_crossing(name, norm, classes=classes,
-                                                      alarm_direction=self._alarm_direction())
-        elif rule == "Loitering":
-            if len(norm) < 3:
-                return None, "Loitering needs an area of at least 3 points."
+        duration = 0
+        if kind == "loiter":
             try:
-                seconds = int(self.loiter_entry.get().strip())
+                duration = int(self.loiter_entry.get().strip())
             except ValueError:
                 return None, "Enter loiter seconds as a whole number."
-            scenario = aoa_config.build_loiter(name, norm, seconds, classes=classes)
-            if exclude_norm:
-                aoa_config.add_exclude_zones(scenario, exclude_norm)
-        else:  # Intrusion
-            if len(norm) < 3:
-                return None, "Intrusion needs an area of at least 3 points."
-            scenario = aoa_config.build_intrusion(name, norm, classes=classes)
-            if exclude_norm:
-                aoa_config.add_exclude_zones(scenario, exclude_norm)
 
-        try:
-            aoa_config.validate_scenario(scenario)
-        except ValueError as e:
-            return None, str(e)
-        return scenario, None
+        sc = vendor_adapter.Scenario(
+            name=name, kind=kind, points=points, classes=classes, duration=duration,
+            direction=self._alarm_direction() if kind == "line" else None,
+            exclusions=exclusions, native_id=self.editing)
+        return sc, None
 
     def _push(self):
-        client = self._make_client()
-        if not client:
+        adapter = self._make_adapter()
+        if not adapter:
             return
-        scenario, reason = self._build_scenario()
-        if scenario is None:
+        sc, reason = self._build_scenario()
+        if sc is None:
             self._log(f"[!] {reason}")
             messagebox.showwarning("Can't push yet", reason)
             return
 
-        n_excl = len([f for f in scenario.get("filters", []) if f.get("type") == "excludeArea"])
-        excl_txt = f"\n{n_excl} exclusion zone(s) included." if n_excl else ""
+        ip, port = self.ip_entry.get().strip(), self.port_var.get()
+        excl_txt = f"\n{len(sc.exclusions)} exclusion zone(s) included." if sc.exclusions else ""
         verb = "Update existing scenario" if self.editing is not None else "Push new scenario"
         if not messagebox.askyesno(
             "Confirm live write",
-            f"{verb} '{scenario['name']}' ({scenario['type']}) on\n"
-            f"{client.ip}:{client.port}?{excl_txt}\n\n"
-            f"The current config is backed up to aoa_backups\\ first, and every other "
-            f"scenario is preserved. This changes live camera analytics."):
+            f"{verb} '{sc.name}' ({sc.kind}) on {adapter.vendor}\n{ip}:{port}?{excl_txt}\n\n"
+            f"The current config is backed up first, and other scenarios are preserved. "
+            f"This changes live camera analytics."):
             self._log("[.] Push cancelled.")
             return
 
         self.push_button.configure(state="disabled", text="Pushing...")
-        self._log(f"[*] Backing up + pushing '{scenario['name']}' to {client.ip}:{client.port} ...")
+        self._log(f"[*] Backing up + pushing '{sc.name}' to {adapter.vendor} {ip}:{port} ...")
+        backup_dir = "hik_backups" if adapter.vendor == "Hikvision" else BACKUP_DIR
 
         def work():
             try:
-                backup_path, verify = client.apply_scenario(scenario, BACKUP_DIR)
-                names = [s.get("name") for s in verify.get("data", {}).get("scenarios", [])]
-                self.msg_queue.put(("push_done", backup_path.name, names))
+                backup_path, _verify = adapter.apply_scenario(sc, backup_dir)
+                names = [s.name for s in adapter.read_scenarios()]
+                self.msg_queue.put(("push_done", Path(backup_path).name, names))
             except Exception as e:
                 self.msg_queue.put(("push_err", str(e)))
         self._run_bg(work)
 
     def _restore_backup(self):
-        client = self._make_client()
-        if not client:
+        if not self._caps().can_delete:
+            messagebox.showinfo("Restore not available",
+                                f"{self.mfg_var.get()} on this camera can't roll back via API "
+                                f"(PUT is upsert-only). Remove/adjust rules in the camera web UI.")
             return
+        adapter = self._make_adapter()
+        if not adapter:
+            return
+        client = adapter.client  # Axis-only path (guarded above)
         import json
         selected = filedialog.askopenfilename(
             initialdir=BACKUP_DIR if BACKUP_DIR.exists() else Path.home(),
@@ -773,7 +795,7 @@ class WriterApp(ctk.CTk):
                     _, overlays, lines, scenarios = msg
                     self.existing_overlays = overlays
                     self.existing_scenarios = scenarios
-                    names = [NEW_SCENARIO] + [s.get("name", f"#{s.get('id')}") for s in scenarios]
+                    names = [NEW_SCENARIO] + [s.name for s in scenarios]
                     self.edit_menu.configure(values=names)
                     self._redraw()
                     self._log("\n".join(lines))
@@ -800,18 +822,21 @@ class WriterApp(ctk.CTk):
         self.after(100, self._poll_queue)
 
     def _prefill_credentials(self):
-        """Convenience: seed user/pass from env or access.env so testing doesn't
-        require retyping. Silent if nothing is found."""
-        user = os.environ.get("AXIS_USER")
-        password = os.environ.get("AXIS_PASS") or os.environ.get("AXIS_PASSWORD")
+        """Seed user/pass for the selected vendor from env or access.env. Silent if
+        nothing is found. Re-run on manufacturer change."""
+        prefix = "HIK" if vendor_adapter.camera_engine.classify_manufacturer(self.mfg_var.get()) == "HIKVISION" else "AXIS"
+        user = os.environ.get(f"{prefix}_USER")
+        password = os.environ.get(f"{prefix}_PASS") or os.environ.get(f"{prefix}_PASSWORD")
         env_file = Path(__file__).with_name("access.env")
         if (not user or not password) and env_file.exists():
             try:
                 env = dict(re.findall(r"^([A-Z_]+)=(.*)$", env_file.read_text(), re.M))
-                user = user or env.get("AXIS_USER")
-                password = password or env.get("AXIS_PASSWORD") or env.get("AXIS_PASS")
+                user = user or env.get(f"{prefix}_USER")
+                password = password or env.get(f"{prefix}_PASSWORD") or env.get(f"{prefix}_PASS")
             except OSError:
                 pass
+        self.user_entry.delete(0, "end")
+        self.pass_entry.delete(0, "end")
         if user:
             self.user_entry.insert(0, user)
         if password:

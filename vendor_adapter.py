@@ -17,6 +17,7 @@ supports neither).
 from dataclasses import dataclass, field
 
 import aoa_config
+import camera_engine
 import hik_config
 
 
@@ -197,3 +198,15 @@ def make_adapter(vendor, ip, port, user, password, channel=None):
     if v == "HIKVISION":
         return HikAdapter(ip, port, user, password, channel=int(channel) if channel else 2)
     raise ValueError(f"unsupported vendor: {vendor!r}")
+
+
+def capabilities_for(vendor):
+    """Capabilities for a vendor WITHOUT connecting -- lets the UI gate features as
+    soon as the user picks a manufacturer."""
+    import camera_engine
+    v = camera_engine.classify_manufacturer(vendor)
+    if v == "AXIS":
+        return AxisAdapter.capabilities
+    if v == "HIKVISION":
+        return HikAdapter.capabilities
+    return None
