@@ -81,10 +81,24 @@ class AxisAdapter:
                         dur = int(d["time"])
                         break
             direction = trig.get("alarmDirection") if s.get("type") == "fence" else None
+            min_size = self._axis_min_size(s.get("filters", []))
             out.append(Scenario(name=s.get("name", ""), kind=kind, points=verts,
                                 classes=classes or ("human",), duration=dur, direction=direction,
-                                exclusions=excl, native_id=s.get("id")))
+                                exclusions=excl, native_id=s.get("id"), min_size=min_size))
         return out
+
+    @staticmethod
+    def _axis_min_size(filters):
+        """AOA minimum object size as a reference box. sizePercentage is width%/height%
+        with NO position (unlike Hik's positioned boxes), so it's anchored bottom-left
+        purely as a size legend. sizePerspective (real-world cm) can't be scaled without
+        perspective calibration, so it's skipped here."""
+        for f in filters:
+            if f.get("type") == "sizePercentage":
+                w, h = f.get("width", 0) / 100.0, f.get("height", 0) / 100.0
+                if w > 0 and h > 0:
+                    return (0.02, max(0.0, 0.97 - h), w, h)
+        return None
 
     @staticmethod
     def _to_aoa(points):
