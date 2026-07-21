@@ -32,6 +32,8 @@ class Scenario:
     direction: str = None           # line only: "leftToRight" | "rightToLeft" (Axis)
     exclusions: list = field(default_factory=list)  # [[(fx,fy),...], ...] (Axis)
     native_id: object = None        # vendor id (AOA scenario id / Hik ruleName), for edit
+    min_size: tuple = None          # (fx, fy, fw, fh) fraction rect -- smallest object
+    max_size: tuple = None          # (fx, fy, fw, fh) fraction rect -- largest object
 
 
 @dataclass
@@ -156,22 +158,51 @@ class HikAdapter:
             dur = _text(ri, ".//ns:durationTime") or "0"
             out.append(Scenario(name=name, kind=kind, points=pts,
                                 classes=(target,) if target in ("human", "vehicle") else ("human",),
-                                duration=int(dur) if dur.isdigit() else 0, native_id=name))
+                                duration=int(dur) if dur.isdigit() else 0, native_id=name,
+                                min_size=_size_rect(ri, "MinObjectSize"),
+                                max_size=_size_rect(ri, "MaxObjectSize")))
         return out
 
     def apply_scenario(self, sc, backup_dir):
-        """Add or edit-in-place (upsert by ruleName). Cannot delete on this firmware."""
+        """Add or edit-in-place (upsert by ruleName). Cannot delete on this firmware.
+        Editing patches the existing rule in place so its SizeFilter (min/max object
+        size) and other settings are preserved, not rebuilt away."""
         _require(self.capabilities, sc)
         region_hik = [(round(fx * 1000), round((1 - fy) * 1000)) for (fx, fy) in sc.points]
         target = sc.classes[0] if sc.classes else "human"
+
+        backup_path, current = self.client.backup_behavior_rule(backup_dir)
+        patched = hik_config.patch_rule_geometry(current, sc.name, region_hik, target=target,
+                                                 duration=sc.duration or None)
+        if patched is not None:                       # edit-in-place: preserves SizeFilter etc.
+            self.client.put_behavior_rule(patched)
+            return backup_path, self.client.get_behavior_rule()
         rule = hik_config.build_intrusion_rule(sc.name, region_hik, target=target,
-                                               duration=sc.duration or 1)
-        return self.client.apply_rule(rule, backup_dir, replace_by_name=True)
+                                               duration=sc.duration or 1)   # new rule
+        new_xml = hik_config.insert_or_replace_rule(current, rule, replace_by_name=True)
+        self.client.put_behavior_rule(new_xml)
+        return backup_path, self.client.get_behavior_rule()
 
 
 def _text(el, path):
     node = el.find(path, hik_config.NS)
     return node.text if node is not None and node.text else ""
+
+
+def _size_rect(rule_el, box_tag):
+    """Parse a Hik SizeFilter box (MinObjectSize/MaxObjectSize) into a neutral
+    (fx, fy, fw, fh) fraction rect, or None. positionX/Y/width/height are in the
+    0..1000 space; top-left origin (placement is best-effort -- verify visually)."""
+    box = rule_el.find(f".//ns:SizeFilter/ns:{box_tag}", hik_config.NS)
+    if box is None:
+        return None
+    def g(tag):
+        n = box.find(f"ns:{tag}", hik_config.NS)
+        return int(n.text) if n is not None and (n.text or "").isdigit() else None
+    x, y, w, h = g("positionX"), g("positionY"), g("width"), g("height")
+    if None in (x, y, w, h):
+        return None
+    return (x / 1000.0, y / 1000.0, w / 1000.0, h / 1000.0)
 
 
 def _require(caps, sc):

@@ -50,6 +50,7 @@ ZONE_FILL = "#00A19A"
 EXCL_OUTLINE = "#FF6B6B"  # exclusion zones drawn in red to read as "ignore here"
 EXCL_FILL = "#E03131"
 EXISTING_OUTLINE = "#F7B500"  # scenarios already on the camera, shown as amber reference
+SIZE_OUTLINE = "#B197FC"      # min/max object-size boxes (purple)
 
 # Write path validated live against 10.23.164.21:5010 (AOA 1.6): admin write confirmed,
 # setConfiguration round-trip + add/verify/restore all proven. Gate is open.
@@ -441,9 +442,16 @@ class WriterApp(ctk.CTk):
                     overlays.append({"name": s.name, "kind": ov_kind, "verts": s.points})
                     for ex in s.exclusions:
                         overlays.append({"name": f"{s.name} (exclude)", "kind": "exclude", "verts": ex})
+                    if s.min_size:
+                        overlays.append({"name": f"{s.name} min", "kind": "size", "rect": s.min_size})
+                    if s.max_size:
+                        overlays.append({"name": f"{s.name} max", "kind": "size", "rect": s.max_size})
+                    size_txt = ""
+                    if s.min_size or s.max_size:
+                        size_txt = " size[min/max]"
                     lines.append(f"    '{s.name}' {s.kind} classes={s.classes}"
                                  + (f" dur={s.duration}" if s.duration else "")
-                                 + (f" excl={len(s.exclusions)}" if s.exclusions else ""))
+                                 + (f" excl={len(s.exclusions)}" if s.exclusions else "") + size_txt)
                 self.msg_queue.put(("overlays", overlays, lines, scenarios))
             except Exception as e:
                 self.msg_queue.put(("log", f"[!] Read failed: {e}"))
@@ -513,6 +521,14 @@ class WriterApp(ctk.CTk):
 
         # Existing camera scenarios (amber reference), drawn under the active drawing.
         for ov in self.existing_overlays:
+            if ov["kind"] == "size":
+                fx, fy, fw, fh = ov["rect"]
+                x0, y0 = self._frac_to_canvas(fx, fy)
+                x1, y1 = self._frac_to_canvas(fx + fw, fy + fh)
+                self.canvas.create_rectangle(x0, y0, x1, y1, outline=SIZE_OUTLINE, width=2)
+                self.canvas.create_text(x0 + 2, y0 - 7, text=ov["name"], fill=SIZE_OUTLINE,
+                                        anchor="sw", font=("Consolas", 8))
+                continue
             pts = [self._frac_to_canvas(fx, fy) for (fx, fy) in ov["verts"]]
             if ov["kind"] == "fence" and len(pts) >= 2:
                 self.canvas.create_line(*self._flat(pts), fill=EXISTING_OUTLINE, width=3, dash=(6, 3))
