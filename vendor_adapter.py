@@ -34,6 +34,7 @@ class Scenario:
     native_id: object = None        # vendor id (AOA scenario id / Hik ruleName), for edit
     min_size: tuple = None          # (fx, fy, fw, fh) fraction rect -- smallest object
     max_size: tuple = None          # (fx, fy, fw, fh) fraction rect -- largest object
+    perspective: list = None        # Axis calibration bars: [{"height": cm, "points": [(fx,fy),(fx,fy)]}]
 
 
 @dataclass
@@ -44,6 +45,7 @@ class Capabilities:
     exclusions: bool                # supports exclusion zones
     direction: bool                 # supports line-crossing direction
     can_delete: bool                # can remove a scenario via API
+    perspective: bool = False       # supports perspective calibration bars
     notes: str = ""
 
 
@@ -53,7 +55,7 @@ class AxisAdapter:
     vendor = "Axis"
     capabilities = Capabilities(
         kinds=("intrusion", "line", "loiter"), classes=("human", "vehicle"),
-        multi_class=True, exclusions=True, direction=True, can_delete=True,
+        multi_class=True, exclusions=True, direction=True, can_delete=True, perspective=True,
         notes="AOA: full config replace -- add/edit/delete all supported.")
 
     def __init__(self, ip, port, user, password, **_):
@@ -64,6 +66,7 @@ class AxisAdapter:
 
     def read_scenarios(self):
         cfg = self.client.get_config()
+        persp_defs = {p.get("id"): p for p in cfg.get("data", {}).get("perspectives", [])}
         out = []
         for s in cfg.get("data", {}).get("scenarios", []):
             trig = (s.get("triggers") or [{}])[0]
@@ -82,9 +85,16 @@ class AxisAdapter:
                         break
             direction = trig.get("alarmDirection") if s.get("type") == "fence" else None
             min_size = self._axis_min_size(s.get("filters", []))
+            persp = None
+            pids = s.get("perspectives") or []
+            if pids and pids[0] in persp_defs:
+                persp = [{"height": b.get("height"),
+                          "points": [((ax + 1) / 2.0, (1 - ay) / 2.0) for ax, ay in b.get("points", [])]}
+                         for b in persp_defs[pids[0]].get("bars", [])]
             out.append(Scenario(name=s.get("name", ""), kind=kind, points=verts,
                                 classes=classes or ("human",), duration=dur, direction=direction,
-                                exclusions=excl, native_id=s.get("id"), min_size=min_size))
+                                exclusions=excl, native_id=s.get("id"), min_size=min_size,
+                                perspective=persp))
         return out
 
     @staticmethod

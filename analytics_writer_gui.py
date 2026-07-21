@@ -51,6 +51,7 @@ EXCL_OUTLINE = "#FF6B6B"  # exclusion zones drawn in red to read as "ignore here
 EXCL_FILL = "#E03131"
 EXISTING_OUTLINE = "#F7B500"  # scenarios already on the camera, shown as amber reference
 SIZE_OUTLINE = "#B197FC"      # min/max object-size boxes (purple)
+PERSP_OUTLINE = "#51CF66"     # Axis perspective calibration bars (green)
 
 # Write path validated live against 10.23.164.21:5010 (AOA 1.6): admin write confirmed,
 # setConfiguration round-trip + add/verify/restore all proven. Gate is open.
@@ -96,6 +97,7 @@ class WriterApp(ctk.CTk):
         self.editing = None            # native_id being edited, or None = new
         self.adapter = None            # current vendor adapter
         self.edit_size = []            # [(rect, label)] min/max size of the scenario being edited
+        self.edit_perspective = []     # [{"height","points"}] calibration bars of the edited scenario
 
         self._build_header()
         self._build_body()
@@ -353,6 +355,7 @@ class WriterApp(ctk.CTk):
             self.name_var.set("")
             self.points, self.exclude_zones, self.current_exclude = [], [], []
             self.edit_size = []
+            self.edit_perspective = []
             self._redraw()
             self._log("[.] New scenario mode.")
             return
@@ -386,10 +389,16 @@ class WriterApp(ctk.CTk):
         self.exclude_zones = [[self._frac_to_canvas(fx, fy) for (fx, fy) in z] for z in sc.exclusions]
         self.current_exclude = []
         self.edit_size = [(r, lbl) for r, lbl in ((sc.min_size, "min"), (sc.max_size, "max")) if r]
+        self.edit_perspective = sc.perspective or []
         self.mode_var.set("Include")
         self._redraw()
-        size_msg = " Min/max size shown." if self.edit_size else ""
-        self._log(f"[.] Editing '{choice}'. Adjust and Push to update it in place.{size_msg}")
+        extras = []
+        if self.edit_size:
+            extras.append("min/max size")
+        if self.edit_perspective:
+            extras.append(f"{len(self.edit_perspective)} perspective bar(s)")
+        msg = (" Showing " + ", ".join(extras) + ".") if extras else ""
+        self._log(f"[.] Editing '{choice}'. Adjust and Push to update it in place.{msg}")
 
     def _make_adapter(self):
         ip = self.ip_entry.get().strip()
@@ -450,6 +459,9 @@ class WriterApp(ctk.CTk):
                         overlays.append({"name": f"{s.name} min", "kind": "size", "rect": s.min_size})
                     if s.max_size:
                         overlays.append({"name": f"{s.name} max", "kind": "size", "rect": s.max_size})
+                    for bar in (s.perspective or []):
+                        overlays.append({"name": f"{bar.get('height')}cm", "kind": "bar",
+                                         "verts": bar.get("points", [])})
                     size_txt = ""
                     if s.min_size or s.max_size:
                         size_txt = " size[min/max]"
@@ -476,6 +488,7 @@ class WriterApp(ctk.CTk):
         self.current_exclude = []
         self.existing_overlays = []
         self.edit_size = []
+        self.edit_perspective = []
         self.editing = None
         if hasattr(self, "edit_var"):
             self.edit_var.set(NEW_SCENARIO)
@@ -534,6 +547,9 @@ class WriterApp(ctk.CTk):
                 self.canvas.create_text(x0 + 2, y0 - 7, text=ov["name"], fill=SIZE_OUTLINE,
                                         anchor="sw", font=("Consolas", 8))
                 continue
+            if ov["kind"] == "bar":
+                self._draw_bar(ov["verts"], ov["name"])
+                continue
             pts = [self._frac_to_canvas(fx, fy) for (fx, fy) in ov["verts"]]
             if ov["kind"] == "fence" and len(pts) >= 2:
                 self.canvas.create_line(*self._flat(pts), fill=EXISTING_OUTLINE, width=3, dash=(6, 3))
@@ -580,6 +596,22 @@ class WriterApp(ctk.CTk):
             self.canvas.create_rectangle(x0, y0, x1, y1, outline=SIZE_OUTLINE, width=2)
             self.canvas.create_text(x0 + 2, y0 - 7, text=lbl, fill=SIZE_OUTLINE,
                                     anchor="sw", font=("Consolas", 8, "bold"))
+
+        # Perspective calibration bars for the scenario being edited (green).
+        for bar in self.edit_perspective:
+            self._draw_bar(bar.get("points", []), f"{bar.get('height')}cm")
+
+    def _draw_bar(self, verts_frac, label):
+        """Draw a perspective calibration bar: a line between two fraction points with
+        end ticks and a real-world-height label."""
+        pts = [self._frac_to_canvas(fx, fy) for (fx, fy) in verts_frac]
+        if len(pts) < 2:
+            return
+        self.canvas.create_line(*self._flat(pts[:2]), fill=PERSP_OUTLINE, width=3)
+        for (x, y) in pts[:2]:
+            self.canvas.create_line(x - 5, y, x + 5, y, fill=PERSP_OUTLINE, width=2)
+        self.canvas.create_text(pts[0][0] + 6, pts[0][1], text=label, fill=PERSP_OUTLINE,
+                                anchor="w", font=("Consolas", 8, "bold"))
 
     @staticmethod
     def _flat(points):
