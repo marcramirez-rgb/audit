@@ -228,6 +228,42 @@ def insert_or_replace_rule(xml_text, rule_el, replace_by_name=True):
     return _serialize(root)
 
 
+def patch_rule_geometry(xml_text, rule_name, region_hik, target=None, duration=None):
+    """Edit an EXISTING rule in place: replace its RuleRegion coords (and optionally
+    detectionTarget / durationTime) while PRESERVING SizeFilter, sensitivity,
+    backgroundSuppression and everything else. Returns new XML, or None if not found.
+    This is the Hik analogue of aoa_config.update_scenario_geometry -- so editing a
+    rule doesn't silently drop its min/max size filter."""
+    root = ET.fromstring(xml_text)
+    for ri in root.findall(".//ns:RuleInfo", NS):
+        nm = ri.find("ns:ruleName", NS)
+        if nm is None or nm.text != rule_name:
+            continue
+        # Replace the region coordinate list.
+        rr = ri.find("ns:RuleRegion", NS)
+        if rr is not None:
+            for rcl in rr.findall("ns:RegionCoordinatesList", NS):
+                rr.remove(rcl)
+            rcl = ET.SubElement(rr, f"{{{NS_URI}}}RegionCoordinatesList")
+            for (hx, hy) in region_hik:
+                rc = ET.SubElement(rcl, f"{{{NS_URI}}}RegionCoordinates")
+                ET.SubElement(rc, f"{{{NS_URI}}}positionX").text = str(int(hx))
+                ET.SubElement(rc, f"{{{NS_URI}}}positionY").text = str(int(hy))
+        # Optionally update target / duration inside the detection param block.
+        for param in list(ri):
+            if param.tag.endswith("DetectionParam") or param.tag.endswith("Param"):
+                if target is not None:
+                    t = param.find("ns:detectionTarget", NS)
+                    if t is not None:
+                        t.text = target
+                if duration is not None:
+                    d = param.find("ns:durationTime", NS)
+                    if d is not None:
+                        d.text = str(int(duration))
+        return _serialize(root)
+    return None
+
+
 def _set_rule_id(rule_el, rid):
     el = rule_el.find(f"{{{NS_URI}}}ruleId")
     if el is None:
