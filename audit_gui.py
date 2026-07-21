@@ -1,6 +1,6 @@
 """LiveView Technologies Camera Analytics -- desktop GUI.
 
-Run with: python gui_app.py
+Run with: python audit_gui.py
 """
 
 import csv
