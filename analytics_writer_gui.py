@@ -213,6 +213,8 @@ class WriterApp(ctk.CTk):
                       fg_color=LVT_DARK_TEAL, hover_color=LVT_DARK_TEAL_HOVER).pack(fill="x", padx=12, pady=(8, 4))
         ctk.CTkButton(side, text="Read Current Config", command=self._read_config,
                       fg_color=LVT_TEAL, hover_color=LVT_TEAL_HOVER).pack(fill="x", padx=12, pady=4)
+        ctk.CTkButton(side, text="Clear Overlays", command=self._clear_overlays,
+                      fg_color=LVT_TEAL, hover_color=LVT_TEAL_HOVER).pack(fill="x", padx=12, pady=(0, 4))
 
         ctk.CTkLabel(side, text="Edit existing (or create new)", text_color=LVT_TEXT_MUTED,
                      font=ctk.CTkFont(size=10)).pack(anchor="w", padx=12, pady=(6, 0))
@@ -731,6 +733,17 @@ class WriterApp(ctk.CTk):
         self.current_bar = []
         self._redraw()
         self._log("[.] Calibration bars cleared.")
+
+    def _clear_overlays(self):
+        """Remove the reference overlays drawn by Read Current Config (existing
+        scenarios, size boxes, perspective bars) for a blank snapshot to draw on.
+        Display-only -- does NOT change anything on the camera."""
+        if not self.existing_overlays:
+            self._log("[.] No config overlays to clear.")
+            return
+        self.existing_overlays = []
+        self._redraw()
+        self._log("[.] Config overlays cleared (camera unchanged). Blank slate to draw on.")
 
     def _finish_exclude(self):
         if len(self.current_exclude) < 3:
