@@ -402,6 +402,57 @@ def insert_or_replace_scenario(config, scenario, replace_by_name=True):
     return new_config
 
 
+PERSP_MIN_BARS, PERSP_MAX_BARS = 2, 3
+PERSP_MIN_HEIGHT, PERSP_MAX_HEIGHT = 10, 9999  # cm
+
+
+def build_perspective(bars_norm, perspective_id=None):
+    """A perspective calibration = 2..3 bars, each 2 points in AOA norm [-1,1] tagged
+    with a real-world height (cm). Shape confirmed from real config on 10.23.164.21:5015."""
+    if not (PERSP_MIN_BARS <= len(bars_norm) <= PERSP_MAX_BARS):
+        raise ValueError(f"perspective needs {PERSP_MIN_BARS}..{PERSP_MAX_BARS} bars, got {len(bars_norm)}")
+    bars = []
+    for b in bars_norm:
+        h = int(b["height"])
+        if not (PERSP_MIN_HEIGHT <= h <= PERSP_MAX_HEIGHT):
+            raise ValueError(f"bar height must be {PERSP_MIN_HEIGHT}..{PERSP_MAX_HEIGHT} cm, got {h}")
+        pts = [[x, y] for (x, y) in b["points"]]
+        if len(pts) != 2:
+            raise ValueError("each calibration bar needs exactly 2 points")
+        # AOA rejects an "upside down" bar (error 2004): the foot must come before the
+        # head. In AOA norm (y-up) the ground point has the smaller y, so order ascending
+        # by y -- matches the real config bars. Users can click either end first.
+        pts.sort(key=lambda p: p[1])
+        bars.append({"height": h, "points": pts})
+    p = {"bars": bars}
+    if perspective_id is not None:
+        p["id"] = perspective_id
+    return p
+
+
+def _next_perspective_id(config):
+    ps = config.get("data", {}).get("perspectives", []) if isinstance(config, dict) else []
+    used = [p.get("id") for p in ps if isinstance(p.get("id"), int)]
+    return (max(used) + 1) if used else 1
+
+
+def insert_or_replace_perspective(config, perspective):
+    """Add/update a perspective in top-level data.perspectives. Returns (new_config, id).
+    Does not mutate the input. Assigns the next free id if none given, else replaces by id."""
+    new_config = json.loads(json.dumps(config))
+    ps = new_config.setdefault("data", {}).setdefault("perspectives", [])
+    pid = perspective.get("id")
+    if pid is None:
+        pid = _next_perspective_id(new_config)
+        perspective = {**perspective, "id": pid}
+    for i, ex in enumerate(ps):
+        if ex.get("id") == pid:
+            ps[i] = perspective
+            return new_config, pid
+    ps.append(perspective)
+    return new_config, pid
+
+
 def update_scenario_geometry(scenario, include_verts_norm, classes,
                              exclude_zones_norm=None, loiter_seconds=None, alarm_direction=None):
     """Patch an EXISTING scenario in place (returns a copy) changing only the
