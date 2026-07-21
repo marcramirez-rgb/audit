@@ -57,6 +57,10 @@ WRITE_ENABLED = True
 CANVAS_W, CANVAS_H = 900, 506  # 16:9 drawing surface
 BACKUP_DIR = Path(__file__).with_name("aoa_backups")
 NEW_SCENARIO = "(new scenario)"
+DIR_L2R = "Left → Right"
+DIR_R2L = "Right → Left"
+DIR_TO_API = {DIR_L2R: "leftToRight", DIR_R2L: "rightToLeft"}
+API_TO_DIR = {v: k for k, v in DIR_TO_API.items()}
 
 ctk.set_appearance_mode("light")
 
@@ -176,6 +180,18 @@ class WriterApp(ctk.CTk):
         self.loiter_entry.pack(fill="x")
         # hidden unless Loitering selected
 
+        # Crossing direction (fence). Shown only for Line Crossing. The arrow on the
+        # canvas points the way an object must cross to trigger.
+        self.fence_frame = ctk.CTkFrame(side, fg_color="transparent")
+        ctk.CTkLabel(self.fence_frame, text="Crossing direction", text_color=LVT_TEXT_MUTED,
+                     font=ctk.CTkFont(size=10)).pack(anchor="w")
+        self.dir_var = tk.StringVar(value=DIR_L2R)
+        ctk.CTkSegmentedButton(self.fence_frame, values=[DIR_L2R, DIR_R2L], variable=self.dir_var,
+                               command=lambda _v: self._redraw(), selected_color=LVT_DARK_TEAL,
+                               selected_hover_color=LVT_DARK_TEAL_HOVER, unselected_color=LVT_TEAL,
+                               unselected_hover_color=LVT_TEAL_HOVER).pack(fill="x")
+        # hidden unless Line Crossing selected
+
         label("Drawing")
         self.mode_var = tk.StringVar(value="Include")
         self.mode_toggle = ctk.CTkSegmentedButton(
@@ -249,13 +265,21 @@ class WriterApp(ctk.CTk):
             self.name_var.set(v[:aoa_config.MAX_NAME_LEN])
 
     def _on_rule_change(self, _value=None):
-        if self.rule_var.get() == "Loitering":
+        rule = self.rule_var.get()
+        if rule == "Loitering":
             self.loiter_frame.pack(fill="x", padx=12, pady=4)
         else:
             self.loiter_frame.pack_forget()
-        if self.rule_var.get() == "Line Crossing":
+        if rule == "Line Crossing":
             self.mode_var.set("Include")  # no exclusion for line crossing
+            self.fence_frame.pack(fill="x", padx=12, pady=4)
+        else:
+            self.fence_frame.pack_forget()
         self._clear_points()
+
+    def _alarm_direction(self):
+        """The selected crossing direction as the AOA API value (leftToRight/rightToLeft)."""
+        return DIR_TO_API.get(self.dir_var.get(), "leftToRight")
 
     def _set_classes(self, types):
         (self.class_human.select() if "human" in types else self.class_human.deselect())
@@ -291,7 +315,7 @@ class WriterApp(ctk.CTk):
         else:
             self.rule_var.set("Intrusion")
 
-        # Show/hide loiter field WITHOUT _on_rule_change (which would clear the geometry).
+        # Show/hide the type-specific fields WITHOUT _on_rule_change (which clears geometry).
         if self.rule_var.get() == "Loitering":
             self.loiter_frame.pack(fill="x", padx=12, pady=4)
             secs = ""
@@ -304,6 +328,12 @@ class WriterApp(ctk.CTk):
             self.loiter_entry.insert(0, secs)
         else:
             self.loiter_frame.pack_forget()
+
+        if self.rule_var.get() == "Line Crossing":
+            self.dir_var.set(API_TO_DIR.get(trig.get("alarmDirection", "leftToRight"), DIR_L2R))
+            self.fence_frame.pack(fill="x", padx=12, pady=4)
+        else:
+            self.fence_frame.pack_forget()
 
         self.points = [self._norm_to_canvas(float(x), float(y)) for x, y in trig.get("vertices", [])]
         self.exclude_zones = [[self._norm_to_canvas(float(x), float(y)) for x, y in f.get("vertices", [])]
@@ -414,6 +444,28 @@ class WriterApp(ctk.CTk):
         ix, iy = aoa_config.norm_to_pixel(nx, ny, self.img_w, self.img_h)
         return (ix * self.scale + self.offset_x, iy * self.scale + self.offset_y)
 
+    def _draw_fence_arrow(self):
+        """Perpendicular arrow at the line midpoint showing the crossing direction an
+        object must travel to trigger. Computed in AOA normalized space (the authority
+        for leftToRight/rightToLeft, which is relative to vertex[0]->vertex[1]), then
+        mapped to the canvas so it stays correct through the Y-flip."""
+        n0 = aoa_config.pixel_to_norm(*self._canvas_to_image_px(*self.points[0]), self.img_w, self.img_h)
+        n1 = aoa_config.pixel_to_norm(*self._canvas_to_image_px(*self.points[1]), self.img_w, self.img_h)
+        dx, dy = n1[0] - n0[0], n1[1] - n0[1]
+        length = (dx * dx + dy * dy) ** 0.5 or 1.0
+        # In y-up space, the right-hand normal of travel v0->v1 is (dy, -dx); that is the
+        # direction an object moves for "leftToRight". Flip it for "rightToLeft".
+        if self._alarm_direction() == "leftToRight":
+            px, py = dy / length, -dx / length
+        else:
+            px, py = -dy / length, dx / length
+        mid = ((n0[0] + n1[0]) / 2.0, (n0[1] + n1[1]) / 2.0)
+        tip = (mid[0] + px * 0.18, mid[1] + py * 0.18)
+        mcx, mcy = self._norm_to_canvas(*mid)
+        tcx, tcy = self._norm_to_canvas(*tip)
+        self.canvas.create_line(mcx, mcy, tcx, tcy, fill=ZONE_OUTLINE, width=3,
+                                arrow="last", arrowshape=(14, 16, 6))
+
     def _redraw(self):
         self.canvas.delete("all")
         if self.tk_image:
@@ -441,6 +493,7 @@ class WriterApp(ctk.CTk):
         if len(self.points) >= 2:
             if is_line:
                 self.canvas.create_line(*self._flat(self.points[:2]), fill=ZONE_OUTLINE, width=3)
+                self._draw_fence_arrow()
             else:
                 self.canvas.create_polygon(*self._flat(self.points), outline=ZONE_OUTLINE,
                                            fill=ZONE_FILL, stipple="gray25", width=2)
@@ -579,13 +632,15 @@ class WriterApp(ctk.CTk):
                     loiter_seconds = int(self.loiter_entry.get().strip())
                 except ValueError:
                     return None, "Enter loiter seconds as a whole number."
+            alarm_dir = self._alarm_direction() if rule == "Line Crossing" else None
             scenario = aoa_config.update_scenario_geometry(
-                self.editing, norm, classes, exclude_norm, loiter_seconds)
+                self.editing, norm, classes, exclude_norm, loiter_seconds, alarm_dir)
             scenario["name"] = name  # allow rename (replace-by-id keeps the right target)
         elif rule == "Line Crossing":
             if len(norm) != 2:
                 return None, "Line crossing needs exactly 2 points."
-            scenario = aoa_config.build_line_crossing(name, norm, classes=classes)
+            scenario = aoa_config.build_line_crossing(name, norm, classes=classes,
+                                                      alarm_direction=self._alarm_direction())
         elif rule == "Loitering":
             if len(norm) < 3:
                 return None, "Loitering needs an area of at least 3 points."

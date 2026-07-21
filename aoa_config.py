@@ -275,10 +275,21 @@ def build_intrusion(name, vertices_norm, classes=("human",), scenario_id=None, d
     return s
 
 
-def build_line_crossing(name, line_norm, classes=("human",), scenario_id=None, device_id=1):
-    """Virtual fence / line crossing. type=fence, trigger=fence (2..10 vertices)."""
+VALID_ALARM_DIRECTIONS = ("leftToRight", "rightToLeft")  # confirmed live; fence is one-way
+
+
+def build_line_crossing(name, line_norm, classes=("human",), alarm_direction="leftToRight",
+                        scenario_id=None, device_id=1):
+    """Virtual fence / line crossing. type=fence, trigger=fence (2..10 vertices).
+
+    alarm_direction (confirmed live: field `alarmDirection`, values leftToRight/
+    rightToLeft, relative to the line's vertex[0]->vertex[1] direction) sets which
+    way across the line fires. Fence is single-direction -- there is no "both"."""
+    if alarm_direction not in VALID_ALARM_DIRECTIONS:
+        raise ValueError(f"alarm_direction must be one of {VALID_ALARM_DIRECTIONS}")
     s = _scenario_skeleton(name, "fence", classes, scenario_id, device_id)
-    s["triggers"] = [{"type": "fence", "vertices": [[x, y] for (x, y) in line_norm]}]
+    s["triggers"] = [{"type": "fence", "vertices": [[x, y] for (x, y) in line_norm],
+                      "alarmDirection": alarm_direction}]
     return s
 
 
@@ -342,8 +353,12 @@ def validate_scenario(scenario):
     n = len(trig.get("vertices", []))
     if trig.get("type") == "includeArea" and not (AREA_MIN_VERTS <= n <= AREA_MAX_VERTS):
         raise ValueError(f"area needs {AREA_MIN_VERTS}..{AREA_MAX_VERTS} vertices, got {n}")
-    if trig.get("type") == "fence" and not (FENCE_MIN_VERTS <= n <= FENCE_MAX_VERTS):
-        raise ValueError(f"fence needs {FENCE_MIN_VERTS}..{FENCE_MAX_VERTS} vertices, got {n}")
+    if trig.get("type") == "fence":
+        if not (FENCE_MIN_VERTS <= n <= FENCE_MAX_VERTS):
+            raise ValueError(f"fence needs {FENCE_MIN_VERTS}..{FENCE_MAX_VERTS} vertices, got {n}")
+        ad = trig.get("alarmDirection")
+        if ad is not None and ad not in VALID_ALARM_DIRECTIONS:
+            raise ValueError(f"alarmDirection must be one of {VALID_ALARM_DIRECTIONS}, got {ad!r}")
     excludes = [f for f in scenario.get("filters", []) if f.get("type") == "excludeArea"]
     if len(excludes) > MAX_EXCLUDE_ZONES:
         raise ValueError(f"at most {MAX_EXCLUDE_ZONES} exclusion zones, got {len(excludes)}")
@@ -388,7 +403,7 @@ def insert_or_replace_scenario(config, scenario, replace_by_name=True):
 
 
 def update_scenario_geometry(scenario, include_verts_norm, classes,
-                             exclude_zones_norm=None, loiter_seconds=None):
+                             exclude_zones_norm=None, loiter_seconds=None, alarm_direction=None):
     """Patch an EXISTING scenario in place (returns a copy) changing only the
     user-editable fields -- object classes, the trigger polygon/line, exclusion
     zones, and loiter time -- while preserving id, type, perspectives, presets,
@@ -399,6 +414,10 @@ def update_scenario_geometry(scenario, include_verts_norm, classes,
     s["objectClassifications"] = _classifications(classes)
     if s.get("triggers"):
         s["triggers"][0]["vertices"] = [[x, y] for (x, y) in include_verts_norm]
+        if alarm_direction is not None and s["triggers"][0].get("type") == "fence":
+            if alarm_direction not in VALID_ALARM_DIRECTIONS:
+                raise ValueError(f"alarm_direction must be one of {VALID_ALARM_DIRECTIONS}")
+            s["triggers"][0]["alarmDirection"] = alarm_direction
         conds = s["triggers"][0].get("conditions")
         if conds and loiter_seconds is not None:
             for c in conds:
