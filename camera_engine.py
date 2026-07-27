@@ -318,6 +318,29 @@ class HikvisionHandler(CameraHandler):
             if not polygons:
                 continue
 
+            # Min/max object-size boxes from SizeFilter. positionX/Y/width/height share
+            # the 0..1000 grid as the region, so apply the same vertical flip: the box
+            # spans posY..posY+h in raw coords, which flips to top = h-(posY+h), bottom = h-posY.
+            size_boxes = []
+            for box_tag, label in (("MinObjectSize", "min size"), ("MaxObjectSize", "max size")):
+                box = rule.find(f'.//ns:SizeFilter/ns:{box_tag}', namespaces)
+                if box is None:
+                    continue
+                try:
+                    bx = float(box.find('ns:positionX', namespaces).text)
+                    by = float(box.find('ns:positionY', namespaces).text)
+                    bw = float(box.find('ns:width', namespaces).text)
+                    bh = float(box.find('ns:height', namespaces).text)
+                except (AttributeError, TypeError, ValueError):
+                    continue
+                if bw <= 0 or bh <= 0:
+                    continue  # default/empty SizeFilter -- nothing to draw
+                x0 = int((bx / 1000.0) * img_w)
+                x1 = int(((bx + bw) / 1000.0) * img_w)
+                y0 = int(img_h - 1 - ((by + bh) / 1000.0) * img_h)
+                y1 = int(img_h - 1 - (by / 1000.0) * img_h)
+                size_boxes.append({"box": (x0, y0, x1, y1), "label": label})
+
             for zone_index, polygon in enumerate(polygons, start=1):
                 zone_name = rule_name if len(polygons) == 1 else f"{rule_name} [Zone {zone_index}]"
                 parsed_rules.append({
@@ -326,7 +349,9 @@ class HikvisionHandler(CameraHandler):
                     "type": event_type,
                     "duration": duration_val,
                     "target": target_detection,
-                    "vertices": polygon
+                    "vertices": polygon,
+                    "size_boxes": size_boxes,
+                    "bars": [],
                 })
 
         # Deduplicate parsed rules that are exactly identical (same name/type/target/duration/vertices)
@@ -562,6 +587,13 @@ class AxisHandler(CameraHandler):
         if not scenarios:
             return [{"is_placeholder": True, "name": "No Scenarios Configured", "type": "N/A", "target": "No Analytics Configured", "duration": "N/A", "vertices": []}]
 
+        # Perspective calibration bars live at the top level and scenarios reference them
+        # by id; index them so each rule can carry its bars into the overlay.
+        persp_defs = {p.get("id"): p for p in json_data.get("data", {}).get("perspectives", [])}
+
+        def _aoa_to_px(x, y):
+            return (int(((float(x) + 1.0) / 2.0) * img_w), int(((1.0 - float(y)) / 2.0) * img_h))
+
         parsed_rules = []
         for scenario in scenarios:
             if scenario.get("is_placeholder"):
@@ -598,19 +630,41 @@ class AxisHandler(CameraHandler):
             if triggers:
                 raw_vertices = triggers[0].get("vertices", [])
                 for pt in raw_vertices:
-                    raw_x = float(pt[0])
-                    raw_y = float(pt[1])
-                    pixel_x = int(((raw_x + 1.0) / 2.0) * img_w)
-                    pixel_y = int(((1.0 - raw_y) / 2.0) * img_h)
-                    vertices.append((pixel_x, pixel_y))
+                    vertices.append(_aoa_to_px(pt[0], pt[1]))
 
-            parsed_rules.append({"is_placeholder": False, "name": rule_name, "type": rule_type, "duration": duration_val, "target": target_detection, "vertices": vertices})
+            # Perspective calibration bars for this scenario (green in the overlay).
+            bars = []
+            for pid in (scenario.get("perspectives") or []):
+                pdef = persp_defs.get(pid)
+                if not pdef:
+                    continue
+                for b in pdef.get("bars", []):
+                    pts = [_aoa_to_px(x, y) for x, y in b.get("points", [])]
+                    if len(pts) >= 2:
+                        bars.append({"points": pts, "label": f"{b.get('height')}cm"})
+
+            # Minimum object size (sizePercentage = width%/height%, no position) shown as
+            # a bottom-left reference box. sizePerspective (real-world cm) needs calibration
+            # to scale, so it isn't drawn here.
+            size_boxes = []
+            for f in scenario.get("filters", []):
+                if f.get("type") == "sizePercentage":
+                    w, h = f.get("width", 0), f.get("height", 0)
+                    if w and h:
+                        wpx, hpx = int(w / 100.0 * img_w), int(h / 100.0 * img_h)
+                        x0, y1 = int(0.02 * img_w), int(0.97 * img_h)
+                        size_boxes.append({"box": (x0, y1 - hpx, x0 + wpx, y1), "label": "min size"})
+
+            parsed_rules.append({"is_placeholder": False, "name": rule_name, "type": rule_type,
+                                 "duration": duration_val, "target": target_detection,
+                                 "vertices": vertices, "bars": bars, "size_boxes": size_boxes})
         return parsed_rules
 
 
 # --- UNIVERSAL RENDERING ENGINE (JPEG COMPRESSION) ---
 
-def render_overlay_image(camera_image, vertices, index, img_w, img_h, rule_type=""):
+def render_overlay_image(camera_image, vertices, index, img_w, img_h, rule_type="",
+                         size_boxes=None, bars=None):
     snapshot_missing = (camera_image is None)
     if camera_image is not None:
         base_img = camera_image.copy().convert("RGBA")
@@ -722,6 +776,26 @@ def render_overlay_image(camera_image, vertices, index, img_w, img_h, rule_type=
             draw.polygon(polygon_to_draw, outline=rgb_color + (255,), width=3)
         for (x, y) in polygon_to_draw:
             draw.ellipse((x - 6, y - 6, x + 6, y + 6), fill=(255, 255, 0, 255), outline=(0, 0, 0, 255), width=1)
+
+    # Min/max object-size boxes (purple) and perspective calibration bars (green),
+    # matching what the analytics writer shows. Same coordinate spaces as vertices.
+    try:
+        from PIL import ImageFont
+        label_font = ImageFont.load_default()
+    except Exception:
+        label_font = None
+    for sb in (size_boxes or []):
+        x0, y0, x1, y1 = sb.get("box", (0, 0, 0, 0))
+        draw.rectangle([x0, y0, x1, y1], outline=(177, 151, 252, 255), width=3)
+        draw.text((x0 + 2, min(y0, y1) - 12), sb.get("label", ""), fill=(177, 151, 252, 255), font=label_font)
+    for bar in (bars or []):
+        pts = bar.get("points", [])[:2]
+        if len(pts) < 2:
+            continue
+        draw.line([tuple(pts[0]), tuple(pts[1])], fill=(81, 207, 102, 255), width=4)
+        for (bx, by) in pts:
+            draw.line([(bx - 6, by), (bx + 6, by)], fill=(81, 207, 102, 255), width=3)
+        draw.text((pts[0][0] + 6, pts[0][1]), bar.get("label", ""), fill=(81, 207, 102, 255), font=label_font)
 
     if snapshot_missing:
         try:
@@ -1083,7 +1157,8 @@ def process_camera_row(args):
 
             for index, rule in enumerate(rules):
                 try:
-                    img_buf = render_overlay_image(camera_image, rule["vertices"], index, img_w, img_h, rule["type"])
+                    img_buf = render_overlay_image(camera_image, rule["vertices"], index, img_w, img_h, rule["type"],
+                                                       size_boxes=rule.get("size_boxes"), bars=rule.get("bars"))
                     display_name = rule["name"]
                     if camera_image is None:
                         display_name = f"Snapshot Failed: {display_name}"
@@ -1173,7 +1248,8 @@ def process_camera_row(args):
 
         for index, rule in enumerate(rules):
             try:
-                img_buf = render_overlay_image(camera_image, rule["vertices"], index, img_w, img_h, rule["type"])
+                img_buf = render_overlay_image(camera_image, rule["vertices"], index, img_w, img_h, rule["type"],
+                                                       size_boxes=rule.get("size_boxes"), bars=rule.get("bars"))
                 add_main_row({
                     "data": [client_name, location, serial, pos, rule["name"], rule["type"], rule["target"], rule["duration"]],
                     "bg": bg_color, "img": img_buf, "err": ""
