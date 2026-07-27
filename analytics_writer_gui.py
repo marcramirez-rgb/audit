@@ -256,7 +256,7 @@ class WriterApp(ctk.CTk):
         self.class_vehicle.pack(anchor="w", padx=12, pady=2)
 
         self.loiter_frame = ctk.CTkFrame(side, fg_color="transparent")
-        ctk.CTkLabel(self.loiter_frame, text="Loiter seconds", text_color=LVT_TEXT_MUTED,
+        ctk.CTkLabel(self.loiter_frame, text="Dwell / loiter time (sec)", text_color=LVT_TEXT_MUTED,
                      font=ctk.CTkFont(size=10)).pack(anchor="w")
         self.loiter_entry = ctk.CTkEntry(self.loiter_frame, placeholder_text="e.g. 10")
         self.loiter_entry.pack(fill="x")
@@ -383,9 +383,14 @@ class WriterApp(ctk.CTk):
         if len(v) > aoa_config.MAX_NAME_LEN:
             self.name_var.set(v[:aoa_config.MAX_NAME_LEN])
 
+    def _wants_duration(self, rule):
+        """The dwell/loiter-time field applies to Axis Loitering and (Hik) intrusion,
+        where fieldDetection carries a durationTime."""
+        return rule == "Loitering" or (rule == "Intrusion" and self._caps().intrusion_duration)
+
     def _on_rule_change(self, _value=None):
         rule = self.rule_var.get()
-        if rule == "Loitering":
+        if self._wants_duration(rule):
             self.loiter_frame.pack(fill="x", padx=12, pady=4)
         else:
             self.loiter_frame.pack_forget()
@@ -428,7 +433,7 @@ class WriterApp(ctk.CTk):
         self.rule_var.set(KIND_TO_LABEL.get(sc.kind, "Intrusion"))
 
         # Show/hide the type-specific fields WITHOUT _on_rule_change (which clears geometry).
-        if sc.kind == "loiter":
+        if self._wants_duration(KIND_TO_LABEL.get(sc.kind, "Intrusion")):
             self.loiter_frame.pack(fill="x", padx=12, pady=4)
             self.loiter_entry.delete(0, "end")
             self.loiter_entry.insert(0, str(sc.duration or ""))
@@ -870,11 +875,15 @@ class WriterApp(ctk.CTk):
             exclusions = [[self._canvas_to_frac(x, y) for (x, y) in z] for z in zones]
 
         duration = 0
-        if kind == "loiter":
-            try:
-                duration = int(self.loiter_entry.get().strip())
-            except ValueError:
-                return None, "Enter loiter seconds as a whole number."
+        if self._wants_duration(rule):
+            val = self.loiter_entry.get().strip()
+            if kind == "loiter" and not val:
+                return None, "Loitering needs a dwell time in seconds."
+            if val:
+                try:
+                    duration = int(val)
+                except ValueError:
+                    return None, "Enter the dwell / loiter time as a whole number of seconds."
 
         # Perspective calibration bars (Axis only). Include an in-progress complete bar.
         bars = list(self.perspective_bars)

@@ -47,6 +47,7 @@ class Capabilities:
     can_delete: bool                # can remove a scenario via API
     perspective: bool = False       # supports perspective calibration bars
     size_boxes: bool = False        # supports positioned min/max object-size boxes
+    intrusion_duration: bool = False  # intrusion rules carry a dwell/duration (Hik durationTime)
     notes: str = ""
 
 
@@ -169,7 +170,7 @@ class HikAdapter:
     capabilities = Capabilities(
         kinds=("intrusion", "line"), classes=("human", "vehicle"),
         multi_class=True, exclusions=False, direction=True, can_delete=False,
-        size_boxes=True,
+        size_boxes=True, intrusion_duration=True,
         notes="behaviorRule PUT is upsert-only on tested DS-2TD firmware: add/edit "
               "yes, delete no (use web UI). Intrusion (fieldDetection) + line crossing "
               "(lineDetection) supported; loiter/region not yet templated.")
