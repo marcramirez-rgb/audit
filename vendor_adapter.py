@@ -46,6 +46,7 @@ class Capabilities:
     direction: bool                 # supports line-crossing direction
     can_delete: bool                # can remove a scenario via API
     perspective: bool = False       # supports perspective calibration bars
+    size_boxes: bool = False        # supports positioned min/max object-size boxes
     notes: str = ""
 
 
@@ -166,10 +167,12 @@ class AxisAdapter:
 class HikAdapter:
     vendor = "Hikvision"
     capabilities = Capabilities(
-        kinds=("intrusion",), classes=("human", "vehicle"),
-        multi_class=False, exclusions=False, direction=False, can_delete=False,
+        kinds=("intrusion", "line"), classes=("human", "vehicle"),
+        multi_class=True, exclusions=False, direction=True, can_delete=False,
+        size_boxes=True,
         notes="behaviorRule PUT is upsert-only on tested DS-2TD firmware: add/edit "
-              "yes, delete no (use web UI). Line/loiter not yet templated.")
+              "yes, delete no (use web UI). Intrusion (fieldDetection) + line crossing "
+              "(lineDetection) supported; loiter/region not yet templated.")
 
     def __init__(self, ip, port, user, password, channel=2, **_):
         self.client = hik_config.HikClient(ip, user, password, port, channel=channel)
@@ -197,8 +200,9 @@ class HikAdapter:
                    for c in ri.findall(".//ns:RegionCoordinates", hik_config.NS)]
             target = _text(ri, ".//ns:detectionTarget") or "human"
             dur = _text(ri, ".//ns:durationTime") or "0"
+            direction = _HIK_DIR_TO_NEUTRAL.get(_text(ri, ".//ns:directionSensitivity")) if kind == "line" else None
             out.append(Scenario(name=name, kind=kind, points=pts,
-                                classes=(target,) if target in ("human", "vehicle") else ("human",),
+                                classes=_hik_target_to_classes(target), direction=direction,
                                 duration=int(dur) if dur.isdigit() else 0, native_id=name,
                                 min_size=_size_rect(ri, "MinObjectSize"),
                                 max_size=_size_rect(ri, "MaxObjectSize")))
@@ -210,19 +214,62 @@ class HikAdapter:
         size) and other settings are preserved, not rebuilt away."""
         _require(self.capabilities, sc)
         region_hik = [(round(fx * 1000), round((1 - fy) * 1000)) for (fx, fy) in sc.points]
-        target = sc.classes[0] if sc.classes else "human"
+        target = _classes_to_hik_target(sc.classes)
+        direction = _NEUTRAL_DIR_TO_HIK.get(sc.direction, "left-right")
+        # Min/max size boxes: neutral fraction rect -> Hik 0..1000 (x,y,w,h) with the
+        # region Y-flip (inverse of _size_rect). Both must be set to write a SizeFilter.
+        min_box = self._frac_rect_to_hik(sc.min_size)
+        max_box = self._frac_rect_to_hik(sc.max_size)
 
         backup_path, current = self.client.backup_behavior_rule(backup_dir)
-        patched = hik_config.patch_rule_geometry(current, sc.name, region_hik, target=target,
-                                                 duration=sc.duration or None)
-        if patched is not None:                       # edit-in-place: preserves SizeFilter etc.
+        patched = hik_config.patch_rule_geometry(
+            current, sc.name, region_hik, target=target, duration=sc.duration or None,
+            min_box=min_box, max_box=max_box,
+            direction=direction if sc.kind == "line" else None)
+        if patched is not None:                       # edit-in-place: preserves other settings
             self.client.put_behavior_rule(patched)
             return backup_path, self.client.get_behavior_rule()
-        rule = hik_config.build_intrusion_rule(sc.name, region_hik, target=target,
-                                               duration=sc.duration or 1)   # new rule
+
+        if sc.kind == "line":
+            rule = hik_config.build_line_crossing_rule(sc.name, region_hik, target=target,
+                                                       direction=direction,
+                                                       min_box=min_box, max_box=max_box)
+        else:
+            rule = hik_config.build_intrusion_rule(sc.name, region_hik, target=target,
+                                                   duration=sc.duration or 1,
+                                                   min_box=min_box, max_box=max_box)
         new_xml = hik_config.insert_or_replace_rule(current, rule, replace_by_name=True)
         self.client.put_behavior_rule(new_xml)
         return backup_path, self.client.get_behavior_rule()
+
+    @staticmethod
+    def _frac_rect_to_hik(rect):
+        """Neutral (fx,fy,fw,fh) top-left fraction -> Hik (x,y,w,h) in 0..1000 with the
+        region Y-flip. Inverse of _size_rect. None -> None."""
+        if not rect:
+            return None
+        fx, fy, fw, fh = rect
+        return (round(fx * 1000), round((1 - fy - fh) * 1000), round(fw * 1000), round(fh * 1000))
+
+
+# Neutral direction (Axis API values) <-> Hik lineDetection directionSensitivity.
+_NEUTRAL_DIR_TO_HIK = {"leftToRight": "left-right", "rightToLeft": "right-left"}
+_HIK_DIR_TO_NEUTRAL = {"left-right": "leftToRight", "right-left": "rightToLeft"}
+
+
+def _classes_to_hik_target(classes):
+    s = set(classes or ())
+    if "human" in s and "vehicle" in s:
+        return "human_vehicle"
+    if "vehicle" in s:
+        return "vehicle"
+    return "human"
+
+
+def _hik_target_to_classes(target):
+    if target == "human_vehicle":
+        return ("human", "vehicle")
+    return (target,) if target in ("human", "vehicle") else ("human",)
 
 
 def _text(el, path):

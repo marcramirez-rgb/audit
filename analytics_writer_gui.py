@@ -46,7 +46,7 @@ LVT_WHITE = "#FFFFFF"
 LVT_LOG_BG = "#0F1117"
 LVT_LOG_TEXT = "#D6EFEF"
 ZONE_OUTLINE = "#00E5DA"
-ZONE_FILL = "#00A19A"
+ZONE_FILL = "#009CA1"
 EXCL_OUTLINE = "#FF6B6B"  # exclusion zones drawn in red to read as "ignore here"
 EXCL_FILL = "#E03131"
 EXISTING_OUTLINE = "#F7B500"  # scenarios already on the camera, shown as amber reference
@@ -96,7 +96,9 @@ class WriterApp(ctk.CTk):
         self.existing_scenarios = []   # neutral vendor_adapter.Scenario list from last read
         self.editing = None            # native_id being edited, or None = new
         self.adapter = None            # current vendor adapter
-        self.edit_size = []            # [(rect, label)] min/max size of the scenario being edited
+        self.edit_size = []            # [(frac_rect, label)] editable min/max size boxes
+        self.size_mode = None          # None | 'min' | 'max' -- clicks draw that size box
+        self.size_first = None         # first corner (canvas) while drawing a size box
         self.perspective_bars = []     # editable calibration bars: [{"height":cm, "points":[canvas pts]}]
         self.current_bar = []          # in-progress bar (canvas pts; 2 clicks = 1 bar)
         self.bar_mode = False          # canvas clicks place calibration bars instead of zones
@@ -148,6 +150,12 @@ class WriterApp(ctk.CTk):
         else:
             self.persp_frame.pack_forget()
             self.bar_mode = False
+        # Object-size box editor (positioned min/max -- Hik only).
+        if caps.size_boxes:
+            self.size_frame.pack(fill="x", padx=12, pady=4, before=self.push_button)
+        else:
+            self.size_frame.pack_forget()
+            self.size_mode = None
         self._on_rule_change()  # refresh loiter/fence frame visibility under new type list
 
     # -------------------------------------------------------------- layout
@@ -306,6 +314,23 @@ class WriterApp(ctk.CTk):
                       fg_color=LVT_TEAL, hover_color=LVT_TEAL_HOVER).pack(fill="x")
         ctk.CTkLabel(self.persp_frame, text="Set height, click 2 points per bar (2-3 bars).",
                      text_color=LVT_TEXT_MUTED, font=ctk.CTkFont(size=10), justify="left").pack(anchor="w")
+
+        # Object-size filter (Hikvision). Draw min + max object-size boxes (purple).
+        self.size_frame = ctk.CTkFrame(side, fg_color="transparent")
+        ctk.CTkLabel(self.size_frame, text="Object size filter (min/max boxes)",
+                     text_color=LVT_TEXT_DARK, font=ctk.CTkFont(size=12, weight="bold")).pack(anchor="w", pady=(10, 2))
+        srow = ctk.CTkFrame(self.size_frame, fg_color="transparent")
+        srow.pack(fill="x")
+        self.min_size_button = ctk.CTkButton(srow, text="Draw Min", width=120, command=lambda: self._toggle_size_mode("min"),
+                                             fg_color=LVT_TEAL, hover_color=LVT_TEAL_HOVER)
+        self.min_size_button.pack(side="left", padx=(0, 4))
+        self.max_size_button = ctk.CTkButton(srow, text="Draw Max", width=120, command=lambda: self._toggle_size_mode("max"),
+                                             fg_color=LVT_TEAL, hover_color=LVT_TEAL_HOVER)
+        self.max_size_button.pack(side="left")
+        ctk.CTkButton(self.size_frame, text="Clear Sizes", command=self._clear_sizes,
+                      fg_color=LVT_TEAL, hover_color=LVT_TEAL_HOVER).pack(fill="x", pady=4)
+        ctk.CTkLabel(self.size_frame, text="Click 2 opposite corners per box. Set both min and max.",
+                     text_color=LVT_TEXT_MUTED, font=ctk.CTkFont(size=10), justify="left").pack(anchor="w")
         # packed/unpacked by _apply_capabilities
 
         self.push_button = ctk.CTkButton(side, text="Push to Camera", command=self._push,
@@ -385,6 +410,7 @@ class WriterApp(ctk.CTk):
             self.name_var.set("")
             self.points, self.exclude_zones, self.current_exclude = [], [], []
             self.edit_size = []
+            self.size_mode = self.size_first = None
             self.perspective_bars, self.current_bar = [], []
             self._redraw()
             self._log("[.] New scenario mode.")
@@ -522,6 +548,7 @@ class WriterApp(ctk.CTk):
         self.current_exclude = []
         self.existing_overlays = []
         self.edit_size = []
+        self.size_mode = self.size_first = None
         self.perspective_bars, self.current_bar = [], []
         self.editing = None
         if hasattr(self, "edit_var"):
@@ -669,6 +696,20 @@ class WriterApp(ctk.CTk):
         ix, iy = self._canvas_to_image_px(event.x, event.y)
         if not (0 <= ix <= self.img_w and 0 <= iy <= self.img_h):
             return
+        if self.size_mode:
+            if self.size_first is None:
+                self.size_first = (event.x, event.y)
+            else:
+                f0 = self._canvas_to_frac(*self.size_first)
+                f1 = self._canvas_to_frac(event.x, event.y)
+                rect = (min(f0[0], f1[0]), min(f0[1], f1[1]),
+                        abs(f1[0] - f0[0]), abs(f1[1] - f0[1]))
+                self.edit_size = [(r, l) for (r, l) in self.edit_size if l != self.size_mode]
+                self.edit_size.append((rect, self.size_mode))
+                self._log(f"[.] {self.size_mode.capitalize()} size box set.")
+                self._toggle_size_mode(self.size_mode)  # turn the mode off
+            self._redraw()
+            return
         if self.bar_mode:
             self.current_bar.append((event.x, event.y))
             if len(self.current_bar) == 2:
@@ -733,6 +774,25 @@ class WriterApp(ctk.CTk):
         self.current_bar = []
         self._redraw()
         self._log("[.] Calibration bars cleared.")
+
+    def _toggle_size_mode(self, which):
+        self.size_mode = None if self.size_mode == which else which
+        self.size_first = None
+        for w, btn in (("min", self.min_size_button), ("max", self.max_size_button)):
+            btn.configure(fg_color=SIZE_OUTLINE if self.size_mode == w else LVT_TEAL)
+        if self.size_mode:
+            # leaving bar mode if it was on -- one draw mode at a time
+            self.bar_mode = False
+            self._log(f"[.] {which.capitalize()} size box: click 2 opposite corners.")
+
+    def _clear_sizes(self):
+        self.edit_size = []
+        self.size_mode = None
+        self.size_first = None
+        for btn in (self.min_size_button, self.max_size_button):
+            btn.configure(fg_color=LVT_TEAL)
+        self._redraw()
+        self._log("[.] Size boxes cleared.")
 
     def _clear_overlays(self):
         """Remove the reference overlays drawn by Read Current Config (existing
@@ -830,10 +890,19 @@ class WriterApp(ctk.CTk):
             perspective = [{"height": b["height"],
                             "points": [self._canvas_to_frac(x, y) for (x, y) in b["points"]]} for b in bars]
 
+        # Min/max object-size boxes (positioned -- Hik). Both must be set to apply a filter.
+        min_size = max_size = None
+        if self._caps().size_boxes:
+            min_size = next((r for (r, l) in self.edit_size if l == "min"), None)
+            max_size = next((r for (r, l) in self.edit_size if l == "max"), None)
+            if bool(min_size) != bool(max_size):
+                return None, "Set BOTH a min and a max size box (or clear sizes)."
+
         sc = vendor_adapter.Scenario(
             name=name, kind=kind, points=points, classes=classes, duration=duration,
             direction=self._alarm_direction() if kind == "line" else None,
-            exclusions=exclusions, native_id=self.editing, perspective=perspective)
+            exclusions=exclusions, native_id=self.editing, perspective=perspective,
+            min_size=min_size, max_size=max_size)
         return sc, None
 
     def _push(self):

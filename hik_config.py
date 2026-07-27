@@ -40,9 +40,11 @@ NET_TIMEOUT = getattr(camera_engine, "STRICT_TIMEOUT", (3.05, 5.0))
 # (otherwise ElementTree writes ns0: prefixes the firmware may reject).
 ET.register_namespace("", NS_URI)
 
-VALID_TARGETS = ("human", "vehicle")  # detectionTarget; sample uses a single value
+VALID_TARGETS = ("human", "vehicle", "human_vehicle")  # detectionTarget (human_vehicle = both)
 REGION_MIN_VERTS = 3  # intrusion region polygon
 LINE_VERTS = 2        # line-crossing tripwire
+# lineDetection directionSensitivity (confirmed from a real rule on 10.23.5.188 ch2).
+LINE_DIRECTIONS = ("left-right", "right-left", "any")
 
 
 class HikError(RuntimeError):
@@ -167,9 +169,48 @@ def _region(rule_el, coords_hik):
         _sub(rc, "positionY", int(hy))
 
 
-def build_intrusion_rule(name, region_hik, target="human", duration=1, sensitivity=50):
+def _size_filter(rule_el, min_box, max_box):
+    """Append a SizeFilter. min_box/max_box are (x, y, w, h) in 0..1000. Element order
+    matches the real config (enabled, mode, MaxObjectSize, MinObjectSize)."""
+    sf = _sub(rule_el, "SizeFilter")
+    _sub(sf, "enabled", "true")
+    _sub(sf, "mode", "pixels")
+    for tag, box in (("MaxObjectSize", max_box), ("MinObjectSize", min_box)):
+        b = _sub(sf, tag)
+        x, y, w, h = box
+        _sub(b, "positionX", int(x))
+        _sub(b, "positionY", int(y))
+        _sub(b, "width", int(w))
+        _sub(b, "height", int(h))
+
+
+def _set_size_filter(rule_el, min_box, max_box):
+    """Set (or create) the SizeFilter on an existing RuleInfo element. Inserted before
+    RuleRegion to match the schema order; replaces any existing SizeFilter contents."""
+    sf = rule_el.find("ns:SizeFilter", NS)
+    if sf is None:
+        sf = ET.Element(f"{{{NS_URI}}}SizeFilter")
+        rr = rule_el.find("ns:RuleRegion", NS)
+        rule_el.insert(list(rule_el).index(rr) if rr is not None else len(list(rule_el)), sf)
+    else:
+        for c in list(sf):
+            sf.remove(c)
+    _sub(sf, "enabled", "true")
+    _sub(sf, "mode", "pixels")
+    for tag, box in (("MaxObjectSize", max_box), ("MinObjectSize", min_box)):
+        b = _sub(sf, tag)
+        x, y, w, h = box
+        _sub(b, "positionX", int(x))
+        _sub(b, "positionY", int(y))
+        _sub(b, "width", int(w))
+        _sub(b, "height", int(h))
+
+
+def build_intrusion_rule(name, region_hik, target="human", duration=1, sensitivity=50,
+                         min_box=None, max_box=None):
     """Intrusion (eventType=fieldDetection, ruleType=region). region_hik is a list of
-    (x, y) in 0..1000, >=3 points. ruleId is assigned at insert time."""
+    (x, y) in 0..1000, >=3 points. ruleId is assigned at insert time. If both min_box
+    and max_box (each (x,y,w,h) in 0..1000) are given, a SizeFilter is emitted."""
     if target not in VALID_TARGETS:
         raise ValueError(f"target must be one of {VALID_TARGETS}, got {target!r}")
     if len(region_hik) < REGION_MIN_VERTS:
@@ -184,7 +225,37 @@ def build_intrusion_rule(name, region_hik, target="human", duration=1, sensitivi
     _sub(fdp, "durationTime", int(duration))
     _sub(fdp, "sensitivity", int(sensitivity))
     _sub(fdp, "detectionTarget", target)
+    if min_box and max_box:
+        _size_filter(ri, min_box, max_box)  # SizeFilter goes between the param and the region
     _region(ri, region_hik)
+    return ri
+
+
+def build_line_crossing_rule(name, line_hik, target="human", direction="left-right",
+                             sensitivity=50, min_box=None, max_box=None):
+    """Line crossing (eventType=lineDetection, ruleType=line). line_hik is exactly 2
+    (x, y) points in 0..1000. Structure confirmed from a real rule on 10.23.5.188 ch2:
+    LineDetectionParam(directionSensitivity, detectionTarget, sensitivity) + RuleRegion."""
+    if target not in VALID_TARGETS:
+        raise ValueError(f"target must be one of {VALID_TARGETS}, got {target!r}")
+    if direction not in LINE_DIRECTIONS:
+        raise ValueError(f"direction must be one of {LINE_DIRECTIONS}, got {direction!r}")
+    if len(line_hik) != LINE_VERTS:
+        raise ValueError(f"line crossing needs exactly {LINE_VERTS} points, got {len(line_hik)}")
+    ri = ET.Element(f"{{{NS_URI}}}RuleInfo")
+    _sub(ri, "ruleId", 0)
+    _sub(ri, "ruleName", name)
+    _sub(ri, "enabled", "true")
+    _sub(ri, "eventType", "lineDetection")
+    _sub(ri, "ruleType", "line")
+    ldp = _sub(ri, "LineDetectionParam")
+    _sub(ldp, "directionSensitivity", direction)
+    _sub(ldp, "detectionTarget", target)
+    _sub(ldp, "sensitivity", int(sensitivity))
+    if min_box and max_box:
+        _size_filter(ri, min_box, max_box)
+    _region(ri, line_hik)
+    _sub(ri, "backgroundSuppression", "close")
     return ri
 
 
@@ -228,17 +299,21 @@ def insert_or_replace_rule(xml_text, rule_el, replace_by_name=True):
     return _serialize(root)
 
 
-def patch_rule_geometry(xml_text, rule_name, region_hik, target=None, duration=None):
+def patch_rule_geometry(xml_text, rule_name, region_hik, target=None, duration=None,
+                        min_box=None, max_box=None, direction=None):
     """Edit an EXISTING rule in place: replace its RuleRegion coords (and optionally
-    detectionTarget / durationTime) while PRESERVING SizeFilter, sensitivity,
+    detectionTarget / durationTime / min+max size boxes) while PRESERVING sensitivity,
     backgroundSuppression and everything else. Returns new XML, or None if not found.
     This is the Hik analogue of aoa_config.update_scenario_geometry -- so editing a
-    rule doesn't silently drop its min/max size filter."""
+    rule doesn't silently drop its config. If min_box+max_box given, the SizeFilter is
+    set (created if absent); otherwise the existing SizeFilter is preserved untouched."""
     root = ET.fromstring(xml_text)
     for ri in root.findall(".//ns:RuleInfo", NS):
         nm = ri.find("ns:ruleName", NS)
         if nm is None or nm.text != rule_name:
             continue
+        if min_box and max_box:
+            _set_size_filter(ri, min_box, max_box)
         # Replace the region coordinate list.
         rr = ri.find("ns:RuleRegion", NS)
         if rr is not None:
@@ -260,6 +335,10 @@ def patch_rule_geometry(xml_text, rule_name, region_hik, target=None, duration=N
                     d = param.find("ns:durationTime", NS)
                     if d is not None:
                         d.text = str(int(duration))
+                if direction is not None:
+                    ds = param.find("ns:directionSensitivity", NS)
+                    if ds is not None:
+                        ds.text = direction
         return _serialize(root)
     return None
 
