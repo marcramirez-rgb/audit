@@ -16,6 +16,7 @@ from tkinter import filedialog, messagebox
 import customtkinter as ctk
 
 import camera_engine
+import fleet_catalog
 
 try:
     from dotenv import load_dotenv
@@ -85,8 +86,8 @@ class App(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.title("LiveView Technologies Camera Analytics")
-        self.geometry("950x780")
-        self.minsize(820, 650)
+        self.geometry("980x880")
+        self.minsize(860, 720)
         self.configure(fg_color=LVT_WHITE)
 
         self.msg_queue = queue.Queue()
@@ -94,6 +95,14 @@ class App(ctk.CTk):
         self.csv_path = None
         self.worker_thread = None
         self.run_start_time = None
+
+        # --- Fleet Picker (Snowflake / cached catalog) state ---
+        self.catalog_source = None          # a fleet_catalog.CatalogSource, built lazily
+        self.picker_source_pref = "auto"    # "auto" | "live" | "cache"
+        self.picker_basket = []             # resolved camera rows queued for audit
+        self.basket_serials = set()         # TDC serials already in the basket (dedupe)
+        self.unit_checkboxes = {}           # serial -> BooleanVar for the unit list
+        self._clients_loaded = False
 
         self._build_header()
         self._build_tabs()
@@ -126,8 +135,10 @@ class App(ctk.CTk):
         self.tabview.pack(fill="x", padx=20, pady=(16, 8))
         self.tab_single = self.tabview.add("Single Camera Test")
         self.tab_csv = self.tabview.add("CSV Batch")
+        self.tab_picker = self.tabview.add("Fleet Picker")
         self._build_single_tab(self.tab_single)
         self._build_csv_tab(self.tab_csv)
+        self._build_picker_tab(self.tab_picker)
 
     def _build_single_tab(self, tab):
         tab.grid_columnconfigure(1, weight=1)
@@ -170,6 +181,211 @@ class App(ctk.CTk):
         ctk.CTkLabel(tab, text="Custom Tag / Job Name (Optional)", text_color=LVT_TEXT_DARK).grid(row=2, column=0, sticky="w", padx=(4, 12), pady=8)
         self.csv_tag_entry = ctk.CTkEntry(tab, placeholder_text="uses CSV filename if left blank")
         self.csv_tag_entry.grid(row=2, column=1, sticky="ew", pady=(8, 14))
+
+    def _build_picker_tab(self, tab):
+        """Cascading Client -> Location -> TDC picker backed by fleet_catalog.
+
+        Checked units get resolved to camera rows and dropped into a batch
+        basket that persists across client/location changes -- so a TAM can
+        assemble a multi-client audit without a CSV, or mix in units on top of
+        one. Feeds run_batch identically to the CSV tab."""
+        tab.grid_columnconfigure(1, weight=1)
+
+        # -- data source row --
+        ctk.CTkLabel(tab, text="Data source", text_color=LVT_TEXT_DARK).grid(row=0, column=0, sticky="w", padx=(4, 12), pady=(8, 4))
+        source_row = ctk.CTkFrame(tab, fg_color="transparent")
+        source_row.grid(row=0, column=1, sticky="ew", pady=(8, 4))
+        self.picker_source_var = tk.StringVar(value="Auto")
+        self.picker_source_menu = ctk.CTkOptionMenu(
+            source_row, values=["Auto", "Live Snowflake", "Cached catalog"], variable=self.picker_source_var,
+            fg_color=LVT_TEAL, button_color=LVT_DARK_TEAL, button_hover_color=LVT_DARK_TEAL_HOVER,
+            command=self._picker_set_source, width=170)
+        self.picker_source_menu.pack(side="left")
+        ctk.CTkButton(source_row, text="Reload", width=80, command=self._picker_reload,
+                      fg_color=LVT_TEAL, hover_color=LVT_TEAL_HOVER, text_color=LVT_WHITE).pack(side="left", padx=8)
+        self.picker_source_status = ctk.CTkLabel(tab, text="Not loaded yet.", text_color=LVT_TEXT_MUTED, anchor="w")
+        self.picker_source_status.grid(row=1, column=0, columnspan=2, sticky="ew", padx=4, pady=(0, 6))
+
+        # -- cascade dropdowns --
+        ctk.CTkLabel(tab, text="Client", text_color=LVT_TEXT_DARK).grid(row=2, column=0, sticky="w", padx=(4, 12), pady=6)
+        self.picker_client_var = tk.StringVar(value="—")
+        self.picker_client_menu = ctk.CTkOptionMenu(tab, values=["—"], variable=self.picker_client_var,
+                                                    fg_color=LVT_TEAL, button_color=LVT_DARK_TEAL, button_hover_color=LVT_DARK_TEAL_HOVER,
+                                                    command=self._on_client_selected, state="disabled")
+        self.picker_client_menu.grid(row=2, column=1, sticky="ew", pady=6)
+
+        ctk.CTkLabel(tab, text="Location", text_color=LVT_TEXT_DARK).grid(row=3, column=0, sticky="w", padx=(4, 12), pady=6)
+        self.picker_location_var = tk.StringVar(value="—")
+        self.picker_location_menu = ctk.CTkOptionMenu(tab, values=["—"], variable=self.picker_location_var,
+                                                      fg_color=LVT_TEAL, button_color=LVT_DARK_TEAL, button_hover_color=LVT_DARK_TEAL_HOVER,
+                                                      command=self._on_location_selected, state="disabled")
+        self.picker_location_menu.grid(row=3, column=1, sticky="ew", pady=6)
+
+        # -- unit (TDC) multi-select --
+        unit_header = ctk.CTkFrame(tab, fg_color="transparent")
+        unit_header.grid(row=4, column=0, columnspan=2, sticky="ew", padx=4, pady=(8, 2))
+        ctk.CTkLabel(unit_header, text="Units (TDC) — check to select", text_color=LVT_TEXT_DARK).pack(side="left")
+        ctk.CTkButton(unit_header, text="Clear", width=60, command=lambda: self._picker_check_all(False),
+                      fg_color=LVT_TEAL, hover_color=LVT_TEAL_HOVER, text_color=LVT_WHITE).pack(side="right", padx=(6, 0))
+        ctk.CTkButton(unit_header, text="Select all", width=80, command=lambda: self._picker_check_all(True),
+                      fg_color=LVT_TEAL, hover_color=LVT_TEAL_HOVER, text_color=LVT_WHITE).pack(side="right")
+
+        self.picker_units_frame = ctk.CTkScrollableFrame(tab, fg_color=LVT_WHITE, height=130)
+        self.picker_units_frame.grid(row=5, column=0, columnspan=2, sticky="ew", padx=4, pady=(0, 6))
+        self.picker_units_empty = ctk.CTkLabel(self.picker_units_frame, text="Pick a client and location to list units.",
+                                               text_color=LVT_TEXT_MUTED)
+        self.picker_units_empty.pack(anchor="w", padx=6, pady=6)
+
+        self.picker_add_btn = ctk.CTkButton(tab, text="Add checked units to batch  ↓", command=self._add_units_to_batch,
+                                            fg_color=LVT_DARK_TEAL, hover_color=LVT_DARK_TEAL_HOVER, text_color=LVT_WHITE, state="disabled")
+        self.picker_add_btn.grid(row=6, column=0, columnspan=2, sticky="ew", padx=4, pady=(0, 8))
+
+        # -- batch basket (persists across client/location changes) --
+        basket_header = ctk.CTkFrame(tab, fg_color="transparent")
+        basket_header.grid(row=7, column=0, columnspan=2, sticky="ew", padx=4, pady=(2, 2))
+        self.basket_summary = ctk.CTkLabel(basket_header, text="Batch is empty.", text_color=LVT_TEXT_DARK,
+                                           font=ctk.CTkFont(size=13, weight="bold"))
+        self.basket_summary.pack(side="left")
+        ctk.CTkButton(basket_header, text="Clear batch", width=90, command=self._clear_batch,
+                      fg_color=LVT_TEAL, hover_color=LVT_TEAL_HOVER, text_color=LVT_WHITE).pack(side="right")
+
+        self.basket_frame = ctk.CTkScrollableFrame(tab, fg_color=LVT_WHITE, height=110)
+        self.basket_frame.grid(row=8, column=0, columnspan=2, sticky="ew", padx=4, pady=(0, 10))
+        self._refresh_basket_view()
+
+    # --------------------------------------------------------- picker helpers
+
+    def _bg(self, fn, tag, *args):
+        """Run fn(*args) off the UI thread; post (tag, result) or a picker error
+        back through the message queue."""
+        def work():
+            try:
+                self.msg_queue.put((tag, fn(*args)))
+            except Exception as e:  # CatalogError and anything the driver throws
+                self.msg_queue.put(("picker_error", str(e)))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _picker_pref_from_choice(self):
+        return {"Auto": "auto", "Live Snowflake": "live", "Cached catalog": "cache"}[self.picker_source_var.get()]
+
+    def _picker_set_source(self, _choice=None):
+        self.picker_source_pref = self._picker_pref_from_choice()
+        self._picker_reload()
+
+    def _picker_reload(self):
+        # Drop any existing connection and reload the client list from scratch.
+        if self.catalog_source is not None:
+            try:
+                self.catalog_source.close()
+            except Exception:
+                pass
+            self.catalog_source = None
+        self._clients_loaded = False
+        self.picker_client_menu.configure(values=["—"], state="disabled")
+        self.picker_client_var.set("—")
+        self.picker_location_menu.configure(values=["—"], state="disabled")
+        self.picker_location_var.set("—")
+        self._clear_unit_list("Loading…")
+        self.picker_source_status.configure(text="Connecting…", text_color=LVT_TEXT_MUTED)
+        self._bg(self._build_source_and_list_clients, "picker_clients")
+
+    def _build_source_and_list_clients(self):
+        src = fleet_catalog.build_source(prefer=self.picker_source_pref)
+        clients = src.list_clients()
+        return (src, clients)
+
+    def _picker_ensure_loaded(self):
+        """Called when the picker tab is first shown -- kick off the initial load."""
+        if not self._clients_loaded and self.catalog_source is None:
+            self.picker_source_pref = self._picker_pref_from_choice()
+            self._picker_reload()
+
+    def _clear_unit_list(self, message):
+        for child in self.picker_units_frame.winfo_children():
+            child.destroy()
+        self.unit_checkboxes = {}
+        self.picker_units_empty = ctk.CTkLabel(self.picker_units_frame, text=message, text_color=LVT_TEXT_MUTED)
+        self.picker_units_empty.pack(anchor="w", padx=6, pady=6)
+        self.picker_add_btn.configure(state="disabled")
+
+    def _on_client_selected(self, client):
+        if not client or client == "—" or self.catalog_source is None:
+            return
+        self.picker_location_menu.configure(values=["—"], state="disabled")
+        self.picker_location_var.set("—")
+        self._clear_unit_list("Loading locations…")
+        self._bg(self.catalog_source.list_locations, "picker_locations", client)
+
+    def _on_location_selected(self, location):
+        client = self.picker_client_var.get()
+        if not location or location == "—" or client == "—" or self.catalog_source is None:
+            return
+        self._clear_unit_list("Loading units…")
+        self._bg(self.catalog_source.list_units, "picker_units", client, location)
+
+    def _populate_units(self, serials):
+        for child in self.picker_units_frame.winfo_children():
+            child.destroy()
+        self.unit_checkboxes = {}
+        if not serials:
+            self.picker_units_empty = ctk.CTkLabel(self.picker_units_frame, text="No units at this location.",
+                                                   text_color=LVT_TEXT_MUTED)
+            self.picker_units_empty.pack(anchor="w", padx=6, pady=6)
+            self.picker_add_btn.configure(state="disabled")
+            return
+        for serial in serials:
+            var = tk.BooleanVar(value=False)
+            already = serial in self.basket_serials
+            text = f"{serial}   (already in batch)" if already else serial
+            cb = ctk.CTkCheckBox(self.picker_units_frame, text=text, variable=var,
+                                 fg_color=LVT_TEAL, hover_color=LVT_TEAL_HOVER,
+                                 text_color=LVT_TEXT_MUTED if already else LVT_TEXT_DARK)
+            cb.pack(anchor="w", padx=6, pady=2)
+            self.unit_checkboxes[serial] = var
+        self.picker_add_btn.configure(state="normal")
+
+    def _picker_check_all(self, value):
+        for var in self.unit_checkboxes.values():
+            var.set(value)
+
+    def _add_units_to_batch(self):
+        chosen = [s for s, var in self.unit_checkboxes.items() if var.get() and s not in self.basket_serials]
+        if not chosen:
+            messagebox.showinfo("Nothing to add", "Check one or more units that aren't already in the batch.")
+            return
+        if self.catalog_source is None:
+            return
+        self.picker_add_btn.configure(state="disabled", text="Resolving cameras…")
+        self.picker_source_status.configure(text=f"Resolving cameras for {len(chosen)} unit(s)…", text_color=LVT_TEXT_MUTED)
+        self._bg(self.catalog_source.resolve_cameras, "picker_added", chosen)
+
+    def _clear_batch(self):
+        self.picker_basket = []
+        self.basket_serials = set()
+        self._refresh_basket_view()
+        # Repaint the unit list so "already in batch" tags disappear.
+        if self.unit_checkboxes:
+            self._populate_units(list(self.unit_checkboxes.keys()))
+        self._refresh_credential_requirements()
+
+    def _refresh_basket_view(self):
+        for child in self.basket_frame.winfo_children():
+            child.destroy()
+        if not self.picker_basket:
+            self.basket_summary.configure(text="Batch is empty.")
+            ctk.CTkLabel(self.basket_frame, text="Add units above to build a batch (units can span multiple clients).",
+                         text_color=LVT_TEXT_MUTED).pack(anchor="w", padx=6, pady=6)
+            return
+        # Group basket rows by serial for a compact per-unit summary.
+        by_serial = {}
+        for row in self.picker_basket:
+            by_serial.setdefault(row["LIVE_UNIT_SERIAL_NM"], []).append(row)
+        clients = {r["CLIENT_NM"] for r in self.picker_basket}
+        self.basket_summary.configure(
+            text=f"Batch: {len(by_serial)} unit(s), {len(self.picker_basket)} camera(s), {len(clients)} client(s)")
+        for serial, rows in by_serial.items():
+            line = f"{serial}  —  {rows[0]['CLIENT_NM']} / {rows[0]['LOCATION_NM']}  ({len(rows)} cam)"
+            ctk.CTkLabel(self.basket_frame, text=line, text_color=LVT_TEXT_DARK, anchor="w").pack(anchor="w", padx=6, pady=1)
 
     def _build_credentials(self):
         frame = ctk.CTkFrame(self, fg_color="transparent")
@@ -220,15 +436,19 @@ class App(ctk.CTk):
     # ------------------------------------------------------------- behavior
 
     def _on_tab_changed(self):
+        if self.tabview.get() == "Fleet Picker":
+            self._picker_ensure_loaded()
         self._refresh_credential_requirements()
 
     def _current_mfg_needs(self):
         """Returns (needs_axis, needs_hik) for whatever mode/rows are currently active."""
-        if self.tabview.get() == "Single Camera Test":
+        active = self.tabview.get()
+        if active == "Single Camera Test":
             mfg_class = camera_engine.classify_manufacturer(self.single_mfg_var.get())
             return mfg_class == "AXIS", mfg_class == "HIKVISION"
-        if self.csv_rows:
-            classes = [camera_engine.classify_manufacturer(r.get("MANUFACTURER", "")) for r in self.csv_rows if r.get("IP", "").strip()]
+        rows = self.picker_basket if active == "Fleet Picker" else self.csv_rows
+        if rows:
+            classes = [camera_engine.classify_manufacturer(r.get("MANUFACTURER", "")) for r in rows if r.get("IP", "").strip()]
             return "AXIS" in classes or "MIXED" in classes, "HIKVISION" in classes or "MIXED" in classes
         return False, False
 
@@ -316,6 +536,22 @@ class App(ctk.CTk):
             }
             base_filename = f"Diagnostic_Test_{ip.replace('.', '_')}"
             return [row], base_filename
+        elif self.tabview.get() == "Fleet Picker":
+            if not self.picker_basket:
+                messagebox.showerror("Empty batch", "Add at least one unit to the batch before starting.")
+                return None
+            clients = sorted({r["CLIENT_NM"] for r in self.picker_basket if r.get("CLIENT_NM")})
+            if len(clients) == 1:
+                tag = clients[0]
+            elif len(clients) > 1:
+                tag = f"{clients[0]}_and_{len(clients) - 1}_more"
+            else:
+                tag = "Fleet_Picker"
+            base_filename = f"FleetPicker_{tag}".replace(" ", "_").replace("/", "-")
+            # Match the CSV path: collapse rows sharing an IP (a unit exposed on
+            # one public IP across ports) into one device row before the engine
+            # probes it, and let mixed-vendor units be flagged.
+            return camera_engine.dedupe_camera_rows(list(self.picker_basket)), base_filename
         else:
             if not self.csv_rows:
                 messagebox.showerror("No CSV loaded", "Browse for a CSV file before starting.")
@@ -391,6 +627,63 @@ class App(ctk.CTk):
             self._on_run_complete(msg[1])
         elif kind == "error":
             self._on_run_error(msg[1])
+        elif kind == "picker_clients":
+            self._on_clients_loaded(msg[1])
+        elif kind == "picker_locations":
+            self._on_locations_loaded(msg[1])
+        elif kind == "picker_units":
+            self._populate_units(msg[1])
+        elif kind == "picker_added":
+            self._on_cameras_resolved(msg[1])
+        elif kind == "picker_error":
+            self._on_picker_error(msg[1])
+
+    def _on_clients_loaded(self, payload):
+        source, clients = payload
+        self.catalog_source = source
+        self._clients_loaded = True
+        self.picker_source_status.configure(
+            text=f"{source.label} — {len(clients)} client(s).", text_color=LVT_DARK_TEAL)
+        if clients:
+            self.picker_client_menu.configure(values=clients, state="normal")
+            self._clear_unit_list("Pick a client and location to list units.")
+        else:
+            self.picker_client_menu.configure(values=["—"], state="disabled")
+            self._clear_unit_list("No clients found in this source.")
+
+    def _on_locations_loaded(self, locations):
+        if locations:
+            self.picker_location_menu.configure(values=locations, state="normal")
+            self._clear_unit_list("Pick a location to list units.")
+        else:
+            self.picker_location_menu.configure(values=["—"], state="disabled")
+            self._clear_unit_list("No locations for this client.")
+
+    def _on_cameras_resolved(self, rows):
+        self.picker_add_btn.configure(state="normal", text="Add checked units to batch  ↓")
+        added_serials = {r["LIVE_UNIT_SERIAL_NM"] for r in rows if r.get("IP")}
+        # Any checked serial that came back with zero cameras is worth flagging.
+        requested = {s for s, var in self.unit_checkboxes.items() if var.get() and s not in self.basket_serials}
+        empty = requested - added_serials
+        for row in rows:
+            if row.get("IP"):
+                self.picker_basket.append(row)
+        self.basket_serials |= added_serials
+        # Repaint the unit list so newly-added units show their "already in batch" tag.
+        if self.unit_checkboxes:
+            self._populate_units(list(self.unit_checkboxes.keys()))
+        self._refresh_basket_view()
+        self._refresh_credential_requirements()
+        status = f"Added {len(added_serials)} unit(s), {len(rows)} camera(s) to the batch."
+        if empty:
+            status += f"  ({len(empty)} unit(s) had no cameras in the source: {', '.join(sorted(empty))})"
+        self.picker_source_status.configure(text=status, text_color=LVT_DARK_TEAL)
+
+    def _on_picker_error(self, message):
+        add_state = "normal" if self.unit_checkboxes else "disabled"
+        self.picker_add_btn.configure(text="Add checked units to batch  ↓", state=add_state)
+        self.picker_source_status.configure(text=message.split(chr(10))[0], text_color="#B00020")
+        messagebox.showerror("Fleet Picker", message)
 
     def _on_run_complete(self, output_path):
         self.last_report_path = output_path

@@ -27,6 +27,7 @@ from PIL import Image, ImageTk
 
 import aoa_config
 import vendor_adapter
+import fleet_catalog
 
 try:
     from dotenv import load_dotenv
@@ -70,6 +71,217 @@ LABEL_TO_KIND = {"Intrusion": "intrusion", "Line Crossing": "line", "Loitering":
 KIND_TO_LABEL = {v: k for k, v in LABEL_TO_KIND.items()}
 
 ctk.set_appearance_mode("light")
+
+
+class FleetPickerDialog(ctk.CTkToplevel):
+    """Modal Client -> Location -> TDC -> camera picker (v2.0).
+
+    The writer targets one camera at a time, so this resolves a single selected
+    camera and hands its IP + vendor back to the sidebar via ``on_select(ip,
+    mfg_label)``. The LVT port (5010/5015/5020 = Center/Left/Right) stays on the
+    sidebar dropdown -- the catalog can't know which position you're editing.
+
+    Backed by ``fleet_catalog`` (live Snowflake via SSO, or the offline cached
+    catalog), same as the audit tool's Fleet Picker tab. All lookups run off the
+    UI thread and marshal back through a queue.
+    """
+
+    def __init__(self, master, on_select):
+        super().__init__(master)
+        self.on_select = on_select
+        self.title("Fleet Picker")
+        self.geometry("470x600")
+        self.minsize(430, 520)
+        self.configure(fg_color=LVT_WHITE)
+        self.transient(master)
+
+        self._q = queue.Queue()
+        self.source = None
+        self._cam_rows = []          # resolved camera rows for the chosen TDC
+        self.cam_choice = tk.StringVar(value="")
+
+        self._build()
+        self.after(80, self._poll)
+        self._reload()
+        self.after(200, self.grab_set)  # after the window is mapped
+
+    # -- layout --
+    def _build(self):
+        pad = {"padx": 14, "pady": 4}
+        ctk.CTkLabel(self, text="Pick a camera from the fleet", font=ctk.CTkFont(size=16, weight="bold"),
+                     text_color=LVT_TEXT_DARK).pack(anchor="w", padx=14, pady=(14, 2))
+
+        src_row = ctk.CTkFrame(self, fg_color="transparent")
+        src_row.pack(fill="x", **pad)
+        self.source_var = tk.StringVar(value="Auto")
+        ctk.CTkOptionMenu(src_row, values=["Auto", "Live Snowflake", "Cached catalog"], variable=self.source_var,
+                          command=lambda _v: self._reload(), fg_color=LVT_TEAL, button_color=LVT_DARK_TEAL,
+                          button_hover_color=LVT_DARK_TEAL_HOVER, width=160).pack(side="left")
+        ctk.CTkButton(src_row, text="Reload", width=70, command=self._reload, fg_color=LVT_TEAL,
+                      hover_color=LVT_TEAL_HOVER).pack(side="left", padx=8)
+        self.status = ctk.CTkLabel(self, text="Connecting…", text_color=LVT_TEXT_MUTED, anchor="w", justify="left")
+        self.status.pack(fill="x", padx=14, pady=(0, 6))
+
+        self.client_var = tk.StringVar(value="—")
+        self.location_var = tk.StringVar(value="—")
+        self.tdc_var = tk.StringVar(value="—")
+
+        ctk.CTkLabel(self, text="Client", text_color=LVT_TEXT_DARK).pack(anchor="w", padx=14)
+        self.client_menu = ctk.CTkOptionMenu(self, values=["—"], variable=self.client_var, state="disabled",
+                                             command=self._on_client, fg_color=LVT_TEAL, button_color=LVT_DARK_TEAL,
+                                             button_hover_color=LVT_DARK_TEAL_HOVER)
+        self.client_menu.pack(fill="x", **pad)
+
+        ctk.CTkLabel(self, text="Location", text_color=LVT_TEXT_DARK).pack(anchor="w", padx=14)
+        self.location_menu = ctk.CTkOptionMenu(self, values=["—"], variable=self.location_var, state="disabled",
+                                               command=self._on_location, fg_color=LVT_TEAL, button_color=LVT_DARK_TEAL,
+                                               button_hover_color=LVT_DARK_TEAL_HOVER)
+        self.location_menu.pack(fill="x", **pad)
+
+        ctk.CTkLabel(self, text="Unit (TDC)", text_color=LVT_TEXT_DARK).pack(anchor="w", padx=14)
+        self.tdc_menu = ctk.CTkOptionMenu(self, values=["—"], variable=self.tdc_var, state="disabled",
+                                          command=self._on_tdc, fg_color=LVT_TEAL, button_color=LVT_DARK_TEAL,
+                                          button_hover_color=LVT_DARK_TEAL_HOVER)
+        self.tdc_menu.pack(fill="x", **pad)
+
+        ctk.CTkLabel(self, text="Camera on this unit", text_color=LVT_TEXT_DARK).pack(anchor="w", padx=14, pady=(6, 0))
+        self.cam_frame = ctk.CTkScrollableFrame(self, fg_color=LVT_LIGHT, height=150)
+        self.cam_frame.pack(fill="both", expand=True, padx=14, pady=4)
+
+        btn_row = ctk.CTkFrame(self, fg_color="transparent")
+        btn_row.pack(fill="x", padx=14, pady=(4, 12))
+        self.use_btn = ctk.CTkButton(btn_row, text="Use this camera", command=self._use, state="disabled",
+                                     fg_color=LVT_DARK_TEAL, hover_color=LVT_DARK_TEAL_HOVER)
+        self.use_btn.pack(side="left", expand=True, fill="x", padx=(0, 6))
+        ctk.CTkButton(btn_row, text="Cancel", command=self.destroy, fg_color=LVT_TEAL,
+                      hover_color=LVT_TEAL_HOVER, width=90).pack(side="right")
+
+        self._cam_placeholder("Pick a unit to list its cameras.")
+
+    def _cam_placeholder(self, text):
+        for c in self.cam_frame.winfo_children():
+            c.destroy()
+        ctk.CTkLabel(self.cam_frame, text=text, text_color=LVT_TEXT_MUTED).pack(anchor="w", padx=6, pady=6)
+        self.use_btn.configure(state="disabled")
+
+    # -- threaded loads --
+    def _bg(self, fn, tag, *args):
+        def work():
+            try:
+                self._q.put((tag, fn(*args)))
+            except Exception as e:
+                self._q.put(("error", str(e)))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _poll(self):
+        try:
+            while True:
+                tag, payload = self._q.get_nowait()
+                self._handle(tag, payload)
+        except queue.Empty:
+            pass
+        if self.winfo_exists():
+            self.after(80, self._poll)
+
+    def _handle(self, tag, payload):
+        if tag == "clients":
+            self.source, clients = payload
+            self.status.configure(text=f"{self.source.label} — {len(clients)} client(s).", text_color=LVT_DARK_TEAL)
+            self._fill_menu(self.client_menu, self.client_var, clients)
+        elif tag == "locations":
+            self._fill_menu(self.location_menu, self.location_var, payload)
+            self.tdc_menu.configure(values=["—"], state="disabled"); self.tdc_var.set("—")
+            self._cam_placeholder("Pick a unit to list its cameras.")
+        elif tag == "units":
+            self._fill_menu(self.tdc_menu, self.tdc_var, payload)
+            self._cam_placeholder("Pick a unit to list its cameras.")
+        elif tag == "cameras":
+            self._show_cameras(payload)
+        elif tag == "error":
+            self.status.configure(text=payload.split(chr(10))[0], text_color="#B00020")
+            messagebox.showerror("Fleet Picker", payload, parent=self)
+
+    @staticmethod
+    def _fill_menu(menu, var, values):
+        if values:
+            menu.configure(values=values, state="normal")
+        else:
+            menu.configure(values=["—"], state="disabled")
+            var.set("—")
+
+    def _pref(self):
+        return {"Auto": "auto", "Live Snowflake": "live", "Cached catalog": "cache"}[self.source_var.get()]
+
+    def _reload(self):
+        if self.source is not None:
+            try:
+                self.source.close()
+            except Exception:
+                pass
+            self.source = None
+        for menu, var in ((self.client_menu, self.client_var), (self.location_menu, self.location_var),
+                          (self.tdc_menu, self.tdc_var)):
+            menu.configure(values=["—"], state="disabled"); var.set("—")
+        self._cam_placeholder("Loading…")
+        self.status.configure(text="Connecting…", text_color=LVT_TEXT_MUTED)
+        self._bg(self._connect_and_clients, "clients")
+
+    def _connect_and_clients(self):
+        src = fleet_catalog.build_source(prefer=self._pref())
+        return (src, src.list_clients())
+
+    def _on_client(self, client):
+        if not client or client == "—" or self.source is None:
+            return
+        self.location_menu.configure(values=["—"], state="disabled"); self.location_var.set("—")
+        self.tdc_menu.configure(values=["—"], state="disabled"); self.tdc_var.set("—")
+        self._cam_placeholder("Loading locations…")
+        self._bg(self.source.list_locations, "locations", client)
+
+    def _on_location(self, location):
+        client = self.client_var.get()
+        if not location or location == "—" or client == "—" or self.source is None:
+            return
+        self._cam_placeholder("Loading units…")
+        self._bg(self.source.list_units, "units", client, location)
+
+    def _on_tdc(self, serial):
+        if not serial or serial == "—" or self.source is None:
+            return
+        self._cam_placeholder("Loading cameras…")
+        self._bg(self.source.resolve_cameras, "cameras", [serial])
+
+    def _show_cameras(self, rows):
+        for c in self.cam_frame.winfo_children():
+            c.destroy()
+        self._cam_rows = [r for r in rows if r.get("IP")]
+        if not self._cam_rows:
+            self._cam_placeholder("No cameras for this unit in the source.")
+            return
+        self.cam_choice.set(self._cam_rows[0]["IP"])
+        for r in self._cam_rows:
+            vendor = r.get("MANUFACTURER") or "?"
+            model = r.get("MODEL") or ""
+            text = f"{r['IP']}   —   {vendor}" + (f" {model}" if model else "")
+            ctk.CTkRadioButton(self.cam_frame, text=text, variable=self.cam_choice, value=r["IP"],
+                               fg_color=LVT_TEAL, hover_color=LVT_TEAL_HOVER, text_color=LVT_TEXT_DARK).pack(anchor="w", padx=6, pady=2)
+        self.use_btn.configure(state="normal")
+
+    def _use(self):
+        ip = self.cam_choice.get()
+        row = next((r for r in self._cam_rows if r["IP"] == ip), None)
+        if not row:
+            return
+        mfg_class = vendor_adapter.camera_engine.classify_manufacturer(row.get("MANUFACTURER", ""))
+        label = {"AXIS": "Axis", "HIKVISION": "Hikvision"}.get(mfg_class)
+        if label is None:
+            if not messagebox.askyesno(
+                "Unrecognized vendor",
+                f"MANUFACTURER '{row.get('MANUFACTURER')}' for {ip} isn't clearly Axis or Hikvision.\n\n"
+                "Use the IP anyway and set the vendor manually?", parent=self):
+                return
+        self.on_select(ip, label)
+        self.destroy()
 
 
 class WriterApp(ctk.CTk):
@@ -124,6 +336,21 @@ class WriterApp(ctk.CTk):
         self.adapter = None  # force rebuild on next action
         self._prefill_credentials()
         self._apply_capabilities()
+
+    def _open_fleet_picker(self):
+        FleetPickerDialog(self, self._apply_fleet_pick)
+
+    def _apply_fleet_pick(self, ip, mfg_label):
+        """Callback from FleetPickerDialog: drop the chosen camera's IP + vendor
+        into the sidebar. Port/channel stay as the operator set them."""
+        if mfg_label and mfg_label != self.mfg_var.get():
+            self.mfg_var.set(mfg_label)
+            self._on_mfg_change()
+        self.ip_entry.delete(0, "end")
+        self.ip_entry.insert(0, ip)
+        self.adapter = None  # force rebuild against the new IP on next action
+        self._log(f"[*] Fleet Picker selected {mfg_label or 'camera'} at {ip} "
+                  f"(set the port for Center/Left/Right, then Fetch Snapshot).")
 
     def _apply_capabilities(self):
         """Enable/disable UI to match what the selected vendor can actually do."""
@@ -195,6 +422,11 @@ class WriterApp(ctk.CTk):
 
         self.ip_entry = ctk.CTkEntry(side, placeholder_text="Camera IP e.g. 10.23.66.205")
         self.ip_entry.pack(fill="x", padx=12, pady=4)
+
+        # v2.0: pick a camera from the fleet (Client -> Location -> TDC) instead
+        # of typing the IP. Fills IP + vendor; port stays on the dropdown below.
+        ctk.CTkButton(side, text="Pick from fleet…", command=self._open_fleet_picker,
+                      fg_color=LVT_TEAL, hover_color=LVT_TEAL_HOVER).pack(fill="x", padx=12, pady=(0, 4))
 
         # Hik-only: which channel the VCA lives on (optical=1, thermal=2).
         self.channel_frame = ctk.CTkFrame(side, fg_color="transparent")
