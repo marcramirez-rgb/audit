@@ -4,3 +4,10 @@ Pillow==12.2.0
 openpyxl==3.1.5
 customtkinter==6.0.0
 python-dotenv==1.2.2
+
+# Optional (v2.0 Fleet Picker LIVE mode). The picker works offline from a
+# cached catalog CSV without this; install it only to query Snowflake directly.
+# Kept commented so setup.bat's base install stays lean and doesn't fail on
+# locked-down networks. To enable live mode:
+#     .venv\Scripts\python -m pip install snowflake-connector-python
+# snowflake-connector-python>=3.12
