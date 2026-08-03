@@ -4,3 +4,9 @@ Pillow==12.2.0
 openpyxl==3.1.5
 customtkinter==6.0.0
 python-dotenv==1.2.2
+
+# v2.0 Fleet Picker -- live Snowflake mode. The [secure-local-storage] extra
+# pulls keyring so the SSO token is cached (no re-prompt every launch).
+# (No truststore needed: Snowflake's endpoint uses a publicly-trusted cert, and
+# injecting truststore recurses with the connector's vendored urllib3.)
+snowflake-connector-python[secure-local-storage]==4.7.1
