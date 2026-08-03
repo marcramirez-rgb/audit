@@ -7,6 +7,10 @@ access.env
 __pycache__/
 *.pyc
 
+# Per-machine virtual environment -- never commit. Each user builds their own
+# via setup.bat; committing it would ship one machine's absolute paths to others.
+.venv/
+
 # Generated reports shouldn't be committed either
 Camera_Reports_Master/
 
