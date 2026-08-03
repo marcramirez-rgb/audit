@@ -180,6 +180,15 @@ class SnowflakeSource(CatalogSource):
     def _connect(self):
         if self._conn is not None:
             return self._conn
+        # Trust the OS certificate store (Windows) so TLS verification succeeds
+        # behind a corporate self-signed root CA -- the same wall that breaks pip
+        # here. Best-effort: if truststore isn't installed we fall through to the
+        # connector's bundled CAs. Must run before the connector builds its TLS.
+        try:
+            import truststore
+            truststore.inject_into_ssl()
+        except Exception:
+            pass
         try:
             import snowflake.connector  # deferred: app must launch without the driver
         except ImportError as e:
