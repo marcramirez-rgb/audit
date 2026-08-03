@@ -1,0 +1,5 @@
+# Windows batch files must be CRLF for cmd.exe (LF-only can break goto/labels).
+# Mark them as binary (-text) so git stores the bytes exactly -- this makes BOTH
+# `git clone` and GitHub's "Download ZIP" (git archive, which does not apply eol
+# conversion) deliver proper CRLF files. Commit these .bat files with CRLF endings.
+*.bat -text
