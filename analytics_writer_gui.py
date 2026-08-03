@@ -90,6 +90,101 @@ KIND_TO_LABEL = {v: k for k, v in LABEL_TO_KIND.items()}
 ctk.set_appearance_mode("light")
 
 
+def _bind_wheel(scroll_frame):
+    """Forward mouse-wheel events from a CTkScrollableFrame and every child to the
+    frame's canvas, so the wheel scrolls even when the pointer is over a child
+    widget (which otherwise swallows the event)."""
+    canvas = getattr(scroll_frame, "_parent_canvas", None)
+    if canvas is None:
+        return
+
+    def _on_wheel(event):
+        canvas.yview_scroll(int(-event.delta / 120), "units")
+        return "break"
+
+    def _bind(widget):
+        widget.bind("<MouseWheel>", _on_wheel)
+        for child in widget.winfo_children():
+            _bind(child)
+
+    _bind(scroll_frame)
+
+
+class _FilterList(ctk.CTkFrame):
+    """Labelled type-to-filter search box + wheel-scrollable results list.
+
+    Replaces a dropdown whose native pop-out can't be wheel-scrolled and is
+    unusable at fleet scale. ``on_choose(value)`` fires when a result is clicked.
+    """
+    CAP = 50
+
+    def __init__(self, master, label, placeholder, on_choose, results_height=72):
+        super().__init__(master, fg_color="transparent")
+        self._on_choose = on_choose
+        self._all = []
+        self._selected = None
+        ctk.CTkLabel(self, text=label, text_color=LVT_TEXT_DARK).pack(anchor="w")
+        self._entry = ctk.CTkEntry(self, placeholder_text=placeholder)
+        self._entry.pack(fill="x")
+        self._entry.bind("<KeyRelease>", lambda e: self._render())
+        self._results = ctk.CTkScrollableFrame(self, fg_color=LVT_WHITE, height=results_height)
+        self._results.pack(fill="x", pady=(2, 0))
+        self.reset("—")
+
+    def reset(self, hint):
+        self._all = []
+        self._selected = None
+        self._entry.delete(0, "end")
+        self._entry.configure(state="disabled")
+        self._placeholder(hint)
+
+    def set_items(self, items, empty_hint="None."):
+        self._all = list(items)
+        self._selected = None
+        self._entry.configure(state="normal")
+        self._entry.delete(0, "end")
+        if items:
+            self._render()
+        else:
+            self._entry.configure(state="disabled")
+            self._placeholder(empty_hint)
+
+    def get(self):
+        return self._selected
+
+    def _placeholder(self, text):
+        for c in self._results.winfo_children():
+            c.destroy()
+        ctk.CTkLabel(self._results, text=text, text_color=LVT_TEXT_MUTED).pack(anchor="w", padx=6, pady=6)
+
+    def _render(self):
+        typed = self._entry.get().strip().lower()
+        matches = [v for v in self._all if typed in v.lower()] if typed else self._all
+        shown = matches[:self.CAP]
+        for c in self._results.winfo_children():
+            c.destroy()
+        if not shown:
+            self._placeholder("No matches." if typed else "Type to filter…")
+            return
+        for v in shown:
+            is_sel = (v == self._selected)
+            ctk.CTkButton(self._results, text=("✓  " + v) if is_sel else v, anchor="w", height=24,
+                          fg_color=LVT_DARK_TEAL if is_sel else "transparent",
+                          text_color=LVT_WHITE if is_sel else LVT_TEXT_DARK, hover_color=LVT_LIGHT,
+                          command=lambda vv=v: self._choose(vv)).pack(fill="x", padx=4, pady=1)
+        if len(matches) > len(shown):
+            ctk.CTkLabel(self._results, text=f"…and {len(matches) - len(shown)} more — keep typing.",
+                         text_color=LVT_TEXT_MUTED).pack(anchor="w", padx=6, pady=(2, 4))
+        _bind_wheel(self._results)
+
+    def _choose(self, v):
+        self._selected = v
+        self._entry.delete(0, "end")
+        self._entry.insert(0, v)
+        self._render()
+        self._on_choose(v)
+
+
 class FleetPickerDialog(ctk.CTkToplevel):
     """Modal Client -> Location -> TDC -> camera picker (v2.0).
 
@@ -98,17 +193,18 @@ class FleetPickerDialog(ctk.CTkToplevel):
     mfg_label)``. The LVT port (5010/5015/5020 = Center/Left/Right) stays on the
     sidebar dropdown -- the catalog can't know which position you're editing.
 
-    Backed by ``fleet_catalog`` (live Snowflake via SSO, or the offline cached
-    catalog), same as the audit tool's Fleet Picker tab. All lookups run off the
-    UI thread and marshal back through a queue.
+    Each cascade level is a type-to-filter list (client, location, TDC), so it
+    scales to the live fleet and scrolls with the mouse wheel. Backed by
+    ``fleet_catalog`` (live Snowflake via SSO, or the offline cached catalog).
+    All lookups run off the UI thread and marshal back through a queue.
     """
 
     def __init__(self, master, on_select):
         super().__init__(master)
         self.on_select = on_select
         self.title("Fleet Picker")
-        self.geometry("470x600")
-        self.minsize(430, 520)
+        self.geometry("480x820")
+        self.minsize(440, 640)
         self.configure(fg_color=LVT_WHITE)
         self.transient(master)
 
@@ -124,12 +220,11 @@ class FleetPickerDialog(ctk.CTkToplevel):
 
     # -- layout --
     def _build(self):
-        pad = {"padx": 14, "pady": 4}
         ctk.CTkLabel(self, text="Pick a camera from the fleet", font=ctk.CTkFont(size=16, weight="bold"),
                      text_color=LVT_TEXT_DARK).pack(anchor="w", padx=14, pady=(14, 2))
 
         src_row = ctk.CTkFrame(self, fg_color="transparent")
-        src_row.pack(fill="x", **pad)
+        src_row.pack(fill="x", padx=14, pady=4)
         self.source_var = tk.StringVar(value="Auto")
         ctk.CTkOptionMenu(src_row, values=["Auto", "Live Snowflake", "Cached catalog"], variable=self.source_var,
                           command=lambda _v: self._reload(), fg_color=LVT_TEAL, button_color=LVT_DARK_TEAL,
@@ -139,30 +234,15 @@ class FleetPickerDialog(ctk.CTkToplevel):
         self.status = ctk.CTkLabel(self, text="Connecting…", text_color=LVT_TEXT_MUTED, anchor="w", justify="left")
         self.status.pack(fill="x", padx=14, pady=(0, 6))
 
-        self.client_var = tk.StringVar(value="—")
-        self.location_var = tk.StringVar(value="—")
-        self.tdc_var = tk.StringVar(value="—")
-
-        ctk.CTkLabel(self, text="Client", text_color=LVT_TEXT_DARK).pack(anchor="w", padx=14)
-        self.client_menu = ctk.CTkOptionMenu(self, values=["—"], variable=self.client_var, state="disabled",
-                                             command=self._on_client, fg_color=LVT_TEAL, button_color=LVT_DARK_TEAL,
-                                             button_hover_color=LVT_DARK_TEAL_HOVER)
-        self.client_menu.pack(fill="x", **pad)
-
-        ctk.CTkLabel(self, text="Location", text_color=LVT_TEXT_DARK).pack(anchor="w", padx=14)
-        self.location_menu = ctk.CTkOptionMenu(self, values=["—"], variable=self.location_var, state="disabled",
-                                               command=self._on_location, fg_color=LVT_TEAL, button_color=LVT_DARK_TEAL,
-                                               button_hover_color=LVT_DARK_TEAL_HOVER)
-        self.location_menu.pack(fill="x", **pad)
-
-        ctk.CTkLabel(self, text="Unit (TDC)", text_color=LVT_TEXT_DARK).pack(anchor="w", padx=14)
-        self.tdc_menu = ctk.CTkOptionMenu(self, values=["—"], variable=self.tdc_var, state="disabled",
-                                          command=self._on_tdc, fg_color=LVT_TEAL, button_color=LVT_DARK_TEAL,
-                                          button_hover_color=LVT_DARK_TEAL_HOVER)
-        self.tdc_menu.pack(fill="x", **pad)
+        self.client_list = _FilterList(self, "Client", "Type to filter clients…", self._on_client)
+        self.client_list.pack(fill="x", padx=14, pady=2)
+        self.location_list = _FilterList(self, "Location", "Type to filter locations…", self._on_location)
+        self.location_list.pack(fill="x", padx=14, pady=2)
+        self.tdc_list = _FilterList(self, "Unit (TDC)", "Type to filter units…", self._on_tdc)
+        self.tdc_list.pack(fill="x", padx=14, pady=2)
 
         ctk.CTkLabel(self, text="Camera on this unit", text_color=LVT_TEXT_DARK).pack(anchor="w", padx=14, pady=(6, 0))
-        self.cam_frame = ctk.CTkScrollableFrame(self, fg_color=LVT_LIGHT, height=150)
+        self.cam_frame = ctk.CTkScrollableFrame(self, fg_color=LVT_LIGHT, height=120)
         self.cam_frame.pack(fill="both", expand=True, padx=14, pady=4)
 
         btn_row = ctk.CTkFrame(self, fg_color="transparent")
@@ -204,27 +284,19 @@ class FleetPickerDialog(ctk.CTkToplevel):
         if tag == "clients":
             self.source, clients = payload
             self.status.configure(text=f"{self.source.label} — {len(clients)} client(s).", text_color=LVT_DARK_TEAL)
-            self._fill_menu(self.client_menu, self.client_var, clients)
+            self.client_list.set_items(clients, "No clients in this source.")
         elif tag == "locations":
-            self._fill_menu(self.location_menu, self.location_var, payload)
-            self.tdc_menu.configure(values=["—"], state="disabled"); self.tdc_var.set("—")
+            self.location_list.set_items(payload, "No locations for this client.")
+            self.tdc_list.reset("Pick a location first.")
             self._cam_placeholder("Pick a unit to list its cameras.")
         elif tag == "units":
-            self._fill_menu(self.tdc_menu, self.tdc_var, payload)
+            self.tdc_list.set_items(payload, "No units at this location.")
             self._cam_placeholder("Pick a unit to list its cameras.")
         elif tag == "cameras":
             self._show_cameras(payload)
         elif tag == "error":
             self.status.configure(text=payload.split(chr(10))[0], text_color="#B00020")
             messagebox.showerror("Fleet Picker", payload, parent=self)
-
-    @staticmethod
-    def _fill_menu(menu, var, values):
-        if values:
-            menu.configure(values=values, state="normal")
-        else:
-            menu.configure(values=["—"], state="disabled")
-            var.set("—")
 
     def _pref(self):
         return {"Auto": "auto", "Live Snowflake": "live", "Cached catalog": "cache"}[self.source_var.get()]
@@ -236,9 +308,9 @@ class FleetPickerDialog(ctk.CTkToplevel):
             except Exception:
                 pass
             self.source = None
-        for menu, var in ((self.client_menu, self.client_var), (self.location_menu, self.location_var),
-                          (self.tdc_menu, self.tdc_var)):
-            menu.configure(values=["—"], state="disabled"); var.set("—")
+        self.client_list.reset("Connecting…")
+        self.location_list.reset("Pick a client first.")
+        self.tdc_list.reset("Pick a location first.")
         self._cam_placeholder("Loading…")
         self.status.configure(text="Connecting…", text_color=LVT_TEXT_MUTED)
         self._bg(self._connect_and_clients, "clients")
@@ -248,22 +320,23 @@ class FleetPickerDialog(ctk.CTkToplevel):
         return (src, src.list_clients())
 
     def _on_client(self, client):
-        if not client or client == "—" or self.source is None:
+        if not client or self.source is None:
             return
-        self.location_menu.configure(values=["—"], state="disabled"); self.location_var.set("—")
-        self.tdc_menu.configure(values=["—"], state="disabled"); self.tdc_var.set("—")
+        self.location_list.reset("Loading locations…")
+        self.tdc_list.reset("Pick a location first.")
         self._cam_placeholder("Loading locations…")
         self._bg(self.source.list_locations, "locations", client)
 
     def _on_location(self, location):
-        client = self.client_var.get()
-        if not location or location == "—" or client == "—" or self.source is None:
+        client = self.client_list.get()
+        if not location or not client or self.source is None:
             return
+        self.tdc_list.reset("Loading units…")
         self._cam_placeholder("Loading units…")
         self._bg(self.source.list_units, "units", client, location)
 
     def _on_tdc(self, serial):
-        if not serial or serial == "—" or self.source is None:
+        if not serial or self.source is None:
             return
         self._cam_placeholder("Loading cameras…")
         self._bg(self.source.resolve_cameras, "cameras", [serial])
@@ -283,6 +356,7 @@ class FleetPickerDialog(ctk.CTkToplevel):
             ctk.CTkRadioButton(self.cam_frame, text=text, variable=self.cam_choice, value=r["IP"],
                                fg_color=LVT_TEAL, hover_color=LVT_TEAL_HOVER, text_color=LVT_TEXT_DARK).pack(anchor="w", padx=6, pady=2)
         self.use_btn.configure(state="normal")
+        _bind_wheel(self.cam_frame)
 
     def _use(self):
         ip = self.cam_choice.get()
