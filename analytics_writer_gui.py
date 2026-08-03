@@ -111,23 +111,28 @@ def _bind_wheel(scroll_frame):
 
 
 class _FilterList(ctk.CTkFrame):
-    """Labelled type-to-filter search box + wheel-scrollable results list.
+    """Labelled type-to-filter search box + a SHORT results block.
 
     Replaces a dropdown whose native pop-out can't be wheel-scrolled and is
-    unusable at fleet scale. ``on_choose(value)`` fires when a result is clicked.
+    unusable at fleet scale. The results block is a plain frame (not its own
+    scroll region) so it lives inside the dialog's single scroll page -- it shows
+    at most CAP matches and says "keep typing" beyond that, so it never balloons.
+    ``on_choose(value)`` fires when a result is clicked; ``notify`` (if given) is
+    called after every re-render so the page can re-bind wheel scrolling.
     """
-    CAP = 50
+    CAP = 8
 
-    def __init__(self, master, label, placeholder, on_choose, results_height=72):
+    def __init__(self, master, label, placeholder, on_choose, notify=None):
         super().__init__(master, fg_color="transparent")
         self._on_choose = on_choose
+        self._notify = notify
         self._all = []
         self._selected = None
         ctk.CTkLabel(self, text=label, text_color=LVT_TEXT_DARK).pack(anchor="w")
         self._entry = ctk.CTkEntry(self, placeholder_text=placeholder)
         self._entry.pack(fill="x")
         self._entry.bind("<KeyRelease>", lambda e: self._render())
-        self._results = ctk.CTkScrollableFrame(self, fg_color=LVT_WHITE, height=results_height)
+        self._results = ctk.CTkFrame(self, fg_color=LVT_WHITE)
         self._results.pack(fill="x", pady=(2, 0))
         self.reset("—")
 
@@ -156,6 +161,8 @@ class _FilterList(ctk.CTkFrame):
         for c in self._results.winfo_children():
             c.destroy()
         ctk.CTkLabel(self._results, text=text, text_color=LVT_TEXT_MUTED).pack(anchor="w", padx=6, pady=6)
+        if self._notify:
+            self._notify()
 
     def _render(self):
         typed = self._entry.get().strip().lower()
@@ -173,9 +180,10 @@ class _FilterList(ctk.CTkFrame):
                           text_color=LVT_WHITE if is_sel else LVT_TEXT_DARK, hover_color=LVT_LIGHT,
                           command=lambda vv=v: self._choose(vv)).pack(fill="x", padx=4, pady=1)
         if len(matches) > len(shown):
-            ctk.CTkLabel(self._results, text=f"…and {len(matches) - len(shown)} more — keep typing.",
+            ctk.CTkLabel(self._results, text=f"…and {len(matches) - len(shown)} more — keep typing to narrow.",
                          text_color=LVT_TEXT_MUTED).pack(anchor="w", padx=6, pady=(2, 4))
-        _bind_wheel(self._results)
+        if self._notify:
+            self._notify()
 
     def _choose(self, v):
         self._selected = v
@@ -203,8 +211,8 @@ class FleetPickerDialog(ctk.CTkToplevel):
         super().__init__(master)
         self.on_select = on_select
         self.title("Fleet Picker")
-        self.geometry("480x820")
-        self.minsize(440, 640)
+        self.geometry("470x640")
+        self.minsize(420, 480)
         self.configure(fg_color=LVT_WHITE)
         self.transient(master)
 
@@ -220,9 +228,9 @@ class FleetPickerDialog(ctk.CTkToplevel):
 
     # -- layout --
     def _build(self):
+        # Header (fixed, top).
         ctk.CTkLabel(self, text="Pick a camera from the fleet", font=ctk.CTkFont(size=16, weight="bold"),
                      text_color=LVT_TEXT_DARK).pack(anchor="w", padx=14, pady=(14, 2))
-
         src_row = ctk.CTkFrame(self, fg_color="transparent")
         src_row.pack(fill="x", padx=14, pady=4)
         self.source_var = tk.StringVar(value="Auto")
@@ -234,32 +242,42 @@ class FleetPickerDialog(ctk.CTkToplevel):
         self.status = ctk.CTkLabel(self, text="Connecting…", text_color=LVT_TEXT_MUTED, anchor="w", justify="left")
         self.status.pack(fill="x", padx=14, pady=(0, 6))
 
-        self.client_list = _FilterList(self, "Client", "Type to filter clients…", self._on_client)
-        self.client_list.pack(fill="x", padx=14, pady=2)
-        self.location_list = _FilterList(self, "Location", "Type to filter locations…", self._on_location)
-        self.location_list.pack(fill="x", padx=14, pady=2)
-        self.tdc_list = _FilterList(self, "Unit (TDC)", "Type to filter units…", self._on_tdc)
-        self.tdc_list.pack(fill="x", padx=14, pady=2)
-
-        ctk.CTkLabel(self, text="Camera on this unit", text_color=LVT_TEXT_DARK).pack(anchor="w", padx=14, pady=(6, 0))
-        self.cam_frame = ctk.CTkScrollableFrame(self, fg_color=LVT_LIGHT, height=120)
-        self.cam_frame.pack(fill="both", expand=True, padx=14, pady=4)
-
+        # Action buttons pinned to the BOTTOM so they are ALWAYS visible, no
+        # matter how long the lists get. Packed before the scroll page.
         btn_row = ctk.CTkFrame(self, fg_color="transparent")
-        btn_row.pack(fill="x", padx=14, pady=(4, 12))
+        btn_row.pack(side="bottom", fill="x", padx=14, pady=(6, 12))
         self.use_btn = ctk.CTkButton(btn_row, text="Use this camera", command=self._use, state="disabled",
                                      fg_color=LVT_DARK_TEAL, hover_color=LVT_DARK_TEAL_HOVER)
         self.use_btn.pack(side="left", expand=True, fill="x", padx=(0, 6))
         ctk.CTkButton(btn_row, text="Cancel", command=self.destroy, fg_color=LVT_TEAL,
                       hover_color=LVT_TEAL_HOVER, width=90).pack(side="right")
 
+        # Single scroll region for everything between header and buttons.
+        self.page = ctk.CTkScrollableFrame(self, fg_color=LVT_WHITE)
+        self.page.pack(side="top", fill="both", expand=True, padx=8, pady=(0, 4))
+
+        self.client_list = _FilterList(self.page, "Client", "Type to filter clients…", self._on_client, notify=self._rebind_wheel)
+        self.client_list.pack(fill="x", padx=8, pady=2)
+        self.location_list = _FilterList(self.page, "Location", "Type to filter locations…", self._on_location, notify=self._rebind_wheel)
+        self.location_list.pack(fill="x", padx=8, pady=2)
+        self.tdc_list = _FilterList(self.page, "Unit (TDC)", "Type to filter units…", self._on_tdc, notify=self._rebind_wheel)
+        self.tdc_list.pack(fill="x", padx=8, pady=2)
+
+        ctk.CTkLabel(self.page, text="Camera on this unit", text_color=LVT_TEXT_DARK).pack(anchor="w", padx=8, pady=(6, 0))
+        self.cam_frame = ctk.CTkFrame(self.page, fg_color=LVT_LIGHT)
+        self.cam_frame.pack(fill="x", padx=8, pady=4)
+
         self._cam_placeholder("Pick a unit to list its cameras.")
+
+    def _rebind_wheel(self):
+        _bind_wheel(self.page)
 
     def _cam_placeholder(self, text):
         for c in self.cam_frame.winfo_children():
             c.destroy()
         ctk.CTkLabel(self.cam_frame, text=text, text_color=LVT_TEXT_MUTED).pack(anchor="w", padx=6, pady=6)
         self.use_btn.configure(state="disabled")
+        self._rebind_wheel()
 
     # -- threaded loads --
     def _bg(self, fn, tag, *args):
@@ -356,7 +374,7 @@ class FleetPickerDialog(ctk.CTkToplevel):
             ctk.CTkRadioButton(self.cam_frame, text=text, variable=self.cam_choice, value=r["IP"],
                                fg_color=LVT_TEAL, hover_color=LVT_TEAL_HOVER, text_color=LVT_TEXT_DARK).pack(anchor="w", padx=6, pady=2)
         self.use_btn.configure(state="normal")
-        _bind_wheel(self.cam_frame)
+        self._rebind_wheel()
 
     def _use(self):
         ip = self.cam_choice.get()
