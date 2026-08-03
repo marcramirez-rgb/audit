@@ -83,6 +83,11 @@ DIR_R2L = "Right → Left"
 DIR_TO_API = {DIR_L2R: "leftToRight", DIR_R2L: "rightToLeft"}
 API_TO_DIR = {v: k for k, v in DIR_TO_API.items()}
 
+# LVT camera position <-> underlying port. The dropdown shows the position;
+# the actual port is resolved from it (5010=Center, 5015=Left, 5020=Right).
+PORT_LABEL_TO_VALUE = {"Center": "5010", "Left": "5015", "Right": "5020", "Direct (80)": "80"}
+PORT_VALUE_TO_LABEL = {v: k for k, v in PORT_LABEL_TO_VALUE.items()}
+
 # UI label <-> neutral Scenario.kind
 LABEL_TO_KIND = {"Intrusion": "intrusion", "Line Crossing": "line", "Loitering": "loiter"}
 KIND_TO_LABEL = {v: k for k, v in LABEL_TO_KIND.items()}
@@ -558,10 +563,10 @@ class WriterApp(ctk.CTk):
                           button_hover_color=LVT_DARK_TEAL_HOVER).pack(fill="x")
         # packed/unpacked by _on_mfg_change
 
-        self.port_var = tk.StringVar(value="5015")
-        ctk.CTkLabel(side, text="Port (LVT: 5010=Center, 5015=Left, 5020=Right)",
+        self.port_var = tk.StringVar(value="Left")
+        ctk.CTkLabel(side, text="Camera position",
                      text_color=LVT_TEXT_MUTED, font=ctk.CTkFont(size=10)).pack(anchor="w", padx=12)
-        ctk.CTkOptionMenu(side, values=["5010", "5015", "5020", "80"], variable=self.port_var,
+        ctk.CTkOptionMenu(side, values=list(PORT_LABEL_TO_VALUE.keys()), variable=self.port_var,
                           fg_color=LVT_TEAL, button_color=LVT_DARK_TEAL,
                           button_hover_color=LVT_DARK_TEAL_HOVER).pack(fill="x", padx=12, pady=4)
 
@@ -756,6 +761,10 @@ class WriterApp(ctk.CTk):
             self.fence_frame.pack_forget()
         self._clear_points()
 
+    def _port(self):
+        """The underlying port for the selected camera position (Center/Left/Right)."""
+        return PORT_LABEL_TO_VALUE.get(self.port_var.get(), self.port_var.get())
+
     def _alarm_direction(self):
         """The selected crossing direction as the AOA API value (leftToRight/rightToLeft)."""
         return DIR_TO_API.get(self.dir_var.get(), "leftToRight")
@@ -829,7 +838,7 @@ class WriterApp(ctk.CTk):
             return None
         try:
             self.adapter = vendor_adapter.make_adapter(
-                self.mfg_var.get(), ip, self.port_var.get(), user, password,
+                self.mfg_var.get(), ip, self._port(), user, password,
                 channel=self.channel_var.get())
         except Exception as e:
             self._log(f"[!] {e}")
@@ -1350,7 +1359,7 @@ class WriterApp(ctk.CTk):
             messagebox.showwarning("Can't push yet", reason)
             return
 
-        ip, port = self.ip_entry.get().strip(), self.port_var.get()
+        ip, port = self.ip_entry.get().strip(), self._port()
         excl_txt = f"\n{len(sc.exclusions)} exclusion zone(s) included." if sc.exclusions else ""
         verb = "Update existing scenario" if self.editing is not None else "Push new scenario"
         if not messagebox.askyesno(
