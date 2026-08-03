@@ -7,7 +7,6 @@ python-dotenv==1.2.2
 
 # v2.0 Fleet Picker -- live Snowflake mode. The [secure-local-storage] extra
 # pulls keyring so the SSO token is cached (no re-prompt every launch).
-# truststore makes TLS verify against the OS/corporate cert store, the same
-# self-signed-CA wall that needs setup.bat's --use-feature=truststore fallback.
+# (No truststore needed: Snowflake's endpoint uses a publicly-trusted cert, and
+# injecting truststore recurses with the connector's vendored urllib3.)
 snowflake-connector-python[secure-local-storage]==4.7.1
-truststore==0.10.4

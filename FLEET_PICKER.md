@@ -20,9 +20,10 @@ Cached catalog** in the UI):
 1. **Live Snowflake** — queries the fleet directly. Auth is **SSO /
    externalbrowser**: the first query opens your browser for the LVT (Okta)
    login, so no password or key is stored in the app. `setup.bat` installs the
-   driver; to add it to an existing venv (behind the corporate CA):
+   driver; to add it to an existing venv (the `--use-feature=truststore` flag is
+   just so pip itself gets through the corporate proxy):
    ```bash
-   .venv\Scripts\python -m pip install --use-feature=truststore "snowflake-connector-python[secure-local-storage]" truststore
+   .venv\Scripts\python -m pip install --use-feature=truststore "snowflake-connector-python[secure-local-storage]"
    ```
    and in `.env`:
    ```
@@ -33,10 +34,10 @@ Cached catalog** in the UI):
    ```
    `SNOWFLAKE_ACCOUNT` must be the **org-account** identifier (`BWXPHOE-LVT`),
    not the account locator (`MZA23640…`) — the locator URL 404s on the auth
-   endpoint. `truststore` lets TLS verify against the Windows cert store so the
-   corporate self-signed root doesn't break the connection (same wall that
-   breaks pip here); `[secure-local-storage]` caches the SSO token so you're not
-   re-prompted every launch.
+   endpoint. `[secure-local-storage]` caches the SSO token so you're not
+   re-prompted every launch. (No `truststore` needed — Snowflake's cert is
+   publicly trusted; injecting truststore actually recurses with the connector's
+   vendored urllib3.)
 
 2. **Cached catalog** — an offline CSV export, for when the driver can't install
    or the network is locked down. Point `FLEET_CATALOG_PATH` at it, or drop it

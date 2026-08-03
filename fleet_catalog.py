@@ -180,15 +180,12 @@ class SnowflakeSource(CatalogSource):
     def _connect(self):
         if self._conn is not None:
             return self._conn
-        # Trust the OS certificate store (Windows) so TLS verification succeeds
-        # behind a corporate self-signed root CA -- the same wall that breaks pip
-        # here. Best-effort: if truststore isn't installed we fall through to the
-        # connector's bundled CAs. Must run before the connector builds its TLS.
-        try:
-            import truststore
-            truststore.inject_into_ssl()
-        except Exception:
-            pass
+        # NB: no truststore / custom CA handling here. Snowflake's endpoint uses a
+        # publicly-trusted cert (the corporate proxy MITMs pypi but not
+        # *.snowflakecomputing.com), so the connector's bundled CAs verify fine.
+        # Injecting truststore here previously caused a fatal recursion with the
+        # connector's vendored urllib3 ("250003: maximum recursion depth
+        # exceeded") -- don't reintroduce it.
         try:
             import snowflake.connector  # deferred: app must launch without the driver
         except ImportError as e:
@@ -208,6 +205,10 @@ class SnowflakeSource(CatalogSource):
             self._conn = snowflake.connector.connect(
                 authenticator="externalbrowser",
                 client_session_keep_alive=True,
+                # Fail cleanly if the SSO/browser step isn't completed, instead
+                # of hanging the picker's load thread indefinitely.
+                login_timeout=90,
+                network_timeout=90,
                 **self._connect_params,
             )
         except Exception as e:  # snowflake raises many subclasses; surface them
