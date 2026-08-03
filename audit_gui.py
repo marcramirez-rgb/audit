@@ -189,11 +189,18 @@ class App(ctk.CTk):
         basket that persists across client/location changes -- so a TAM can
         assemble a multi-client audit without a CSV, or mix in units on top of
         one. Feeds run_batch identically to the CSV tab."""
-        tab.grid_columnconfigure(1, weight=1)
+        # The whole tab is ONE bounded scroll page, so it can never push the
+        # credentials / Start controls (below the tabview) off-screen -- and the
+        # inner lists are plain blocks, NOT their own scroll regions, so there is
+        # a SINGLE scrollbar for the panel instead of several fighting ones.
+        page = ctk.CTkScrollableFrame(tab, fg_color=LVT_LIGHT, height=430)
+        page.pack(fill="x", expand=False)
+        page.grid_columnconfigure(1, weight=1)
+        self.picker_page = page
 
         # -- data source row --
-        ctk.CTkLabel(tab, text="Data source", text_color=LVT_TEXT_DARK).grid(row=0, column=0, sticky="w", padx=(4, 12), pady=(8, 4))
-        source_row = ctk.CTkFrame(tab, fg_color="transparent")
+        ctk.CTkLabel(page, text="Data source", text_color=LVT_TEXT_DARK).grid(row=0, column=0, sticky="w", padx=(4, 12), pady=(8, 4))
+        source_row = ctk.CTkFrame(page, fg_color="transparent")
         source_row.grid(row=0, column=1, sticky="ew", pady=(8, 4))
         self.picker_source_var = tk.StringVar(value="Auto")
         self.picker_source_menu = ctk.CTkOptionMenu(
@@ -203,7 +210,7 @@ class App(ctk.CTk):
         self.picker_source_menu.pack(side="left")
         ctk.CTkButton(source_row, text="Reload", width=80, command=self._picker_reload,
                       fg_color=LVT_TEAL, hover_color=LVT_TEAL_HOVER, text_color=LVT_WHITE).pack(side="left", padx=8)
-        self.picker_source_status = ctk.CTkLabel(tab, text="Not loaded yet.", text_color=LVT_TEXT_MUTED, anchor="w")
+        self.picker_source_status = ctk.CTkLabel(page, text="Not loaded yet.", text_color=LVT_TEXT_MUTED, anchor="w")
         self.picker_source_status.grid(row=1, column=0, columnspan=2, sticky="ew", padx=4, pady=(0, 6))
 
         # -- client: type-to-filter (the live fleet has thousands of clients, so
@@ -211,35 +218,34 @@ class App(ctk.CTk):
         #    clicking a result selects the client and loads its locations. --
         self.picker_client_var = tk.StringVar(value="—")
         self._all_clients = []
-        ctk.CTkLabel(tab, text="Client", text_color=LVT_TEXT_DARK).grid(row=2, column=0, sticky="w", padx=(4, 12), pady=6)
-        self.picker_client_search = ctk.CTkEntry(tab, placeholder_text="Type to filter clients…")
+        ctk.CTkLabel(page, text="Client", text_color=LVT_TEXT_DARK).grid(row=2, column=0, sticky="w", padx=(4, 12), pady=6)
+        self.picker_client_search = ctk.CTkEntry(page, placeholder_text="Type to filter clients…")
         self.picker_client_search.grid(row=2, column=1, sticky="ew", pady=6)
         self.picker_client_search.bind("<KeyRelease>", self._filter_clients)
         self.picker_client_search.configure(state="disabled")
 
-        self.picker_client_results = ctk.CTkScrollableFrame(tab, fg_color=LVT_WHITE, height=96)
+        self.picker_client_results = ctk.CTkFrame(page, fg_color=LVT_WHITE)
         self.picker_client_results.grid(row=3, column=0, columnspan=2, sticky="ew", padx=4, pady=(0, 6))
         self.picker_client_hint = ctk.CTkLabel(self.picker_client_results, text="Load a source to list clients.",
                                                text_color=LVT_TEXT_MUTED)
         self.picker_client_hint.pack(anchor="w", padx=6, pady=6)
 
-        # -- location: same type-to-filter pattern as client (a native dropdown
-        #    pop-out can't be wheel-scrolled, and some clients have many sites) --
+        # -- location: same type-to-filter pattern as client --
         self.picker_location_var = tk.StringVar(value="—")
         self._all_locations = []
-        ctk.CTkLabel(tab, text="Location", text_color=LVT_TEXT_DARK).grid(row=4, column=0, sticky="w", padx=(4, 12), pady=6)
-        self.picker_location_search = ctk.CTkEntry(tab, placeholder_text="Type to filter locations…")
+        ctk.CTkLabel(page, text="Location", text_color=LVT_TEXT_DARK).grid(row=4, column=0, sticky="w", padx=(4, 12), pady=6)
+        self.picker_location_search = ctk.CTkEntry(page, placeholder_text="Type to filter locations…")
         self.picker_location_search.grid(row=4, column=1, sticky="ew", pady=6)
         self.picker_location_search.bind("<KeyRelease>", self._filter_locations)
         self.picker_location_search.configure(state="disabled")
 
-        self.picker_location_results = ctk.CTkScrollableFrame(tab, fg_color=LVT_WHITE, height=84)
+        self.picker_location_results = ctk.CTkFrame(page, fg_color=LVT_WHITE)
         self.picker_location_results.grid(row=5, column=0, columnspan=2, sticky="ew", padx=4, pady=(0, 6))
         ctk.CTkLabel(self.picker_location_results, text="Pick a client first.",
                      text_color=LVT_TEXT_MUTED).pack(anchor="w", padx=6, pady=6)
 
         # -- unit (TDC) multi-select --
-        unit_header = ctk.CTkFrame(tab, fg_color="transparent")
+        unit_header = ctk.CTkFrame(page, fg_color="transparent")
         unit_header.grid(row=6, column=0, columnspan=2, sticky="ew", padx=4, pady=(8, 2))
         ctk.CTkLabel(unit_header, text="Units (TDC) — check to select", text_color=LVT_TEXT_DARK).pack(side="left")
         ctk.CTkButton(unit_header, text="Clear", width=60, command=lambda: self._picker_check_all(False),
@@ -247,18 +253,18 @@ class App(ctk.CTk):
         ctk.CTkButton(unit_header, text="Select all", width=80, command=lambda: self._picker_check_all(True),
                       fg_color=LVT_TEAL, hover_color=LVT_TEAL_HOVER, text_color=LVT_WHITE).pack(side="right")
 
-        self.picker_units_frame = ctk.CTkScrollableFrame(tab, fg_color=LVT_WHITE, height=110)
+        self.picker_units_frame = ctk.CTkFrame(page, fg_color=LVT_WHITE)
         self.picker_units_frame.grid(row=7, column=0, columnspan=2, sticky="ew", padx=4, pady=(0, 6))
         self.picker_units_empty = ctk.CTkLabel(self.picker_units_frame, text="Pick a client and location to list units.",
                                                text_color=LVT_TEXT_MUTED)
         self.picker_units_empty.pack(anchor="w", padx=6, pady=6)
 
-        self.picker_add_btn = ctk.CTkButton(tab, text="Add checked units to batch  ↓", command=self._add_units_to_batch,
+        self.picker_add_btn = ctk.CTkButton(page, text="Add checked units to batch  ↓", command=self._add_units_to_batch,
                                             fg_color=LVT_DARK_TEAL, hover_color=LVT_DARK_TEAL_HOVER, text_color=LVT_WHITE, state="disabled")
         self.picker_add_btn.grid(row=8, column=0, columnspan=2, sticky="ew", padx=4, pady=(0, 8))
 
         # -- batch basket (persists across client/location changes) --
-        basket_header = ctk.CTkFrame(tab, fg_color="transparent")
+        basket_header = ctk.CTkFrame(page, fg_color="transparent")
         basket_header.grid(row=9, column=0, columnspan=2, sticky="ew", padx=4, pady=(2, 2))
         self.basket_summary = ctk.CTkLabel(basket_header, text="Batch is empty.", text_color=LVT_TEXT_DARK,
                                            font=ctk.CTkFont(size=13, weight="bold"))
@@ -266,7 +272,7 @@ class App(ctk.CTk):
         ctk.CTkButton(basket_header, text="Clear batch", width=90, command=self._clear_batch,
                       fg_color=LVT_TEAL, hover_color=LVT_TEAL_HOVER, text_color=LVT_WHITE).pack(side="right")
 
-        self.basket_frame = ctk.CTkScrollableFrame(tab, fg_color=LVT_WHITE, height=100)
+        self.basket_frame = ctk.CTkFrame(page, fg_color=LVT_WHITE)
         self.basket_frame.grid(row=10, column=0, columnspan=2, sticky="ew", padx=4, pady=(0, 10))
         self._refresh_basket_view()
 
@@ -319,7 +325,7 @@ class App(ctk.CTk):
             self.picker_source_pref = self._picker_pref_from_choice()
             self._picker_reload()
 
-    _CLIENT_RESULT_CAP = 50  # cap rendered rows; the fleet has thousands
+    _CLIENT_RESULT_CAP = 8  # keep the list SHORT (type to narrow); the fleet has thousands
 
     def _filter_clients(self, _event=None):
         if not self._all_clients:
@@ -352,7 +358,7 @@ class App(ctk.CTk):
         if more > 0:
             ctk.CTkLabel(self.picker_client_results, text=f"…and {more} more — keep typing to narrow.",
                          text_color=LVT_TEXT_MUTED).pack(anchor="w", padx=6, pady=(2, 4))
-        self._enable_wheel_scroll(self.picker_client_results)
+        self._enable_wheel_scroll(self.picker_page)
 
     def _choose_client(self, client):
         self.picker_client_var.set(client)
@@ -437,7 +443,7 @@ class App(ctk.CTk):
         if more > 0:
             ctk.CTkLabel(self.picker_location_results, text=f"…and {more} more — keep typing to narrow.",
                          text_color=LVT_TEXT_MUTED).pack(anchor="w", padx=6, pady=(2, 4))
-        self._enable_wheel_scroll(self.picker_location_results)
+        self._enable_wheel_scroll(self.picker_page)
 
     def _choose_location(self, location):
         self.picker_location_var.set(location)
@@ -473,7 +479,7 @@ class App(ctk.CTk):
             cb.pack(anchor="w", padx=6, pady=2)
             self.unit_checkboxes[serial] = var
         self.picker_add_btn.configure(state="normal")
-        self._enable_wheel_scroll(self.picker_units_frame)
+        self._enable_wheel_scroll(self.picker_page)
 
     def _picker_check_all(self, value):
         for var in self.unit_checkboxes.values():
@@ -517,7 +523,7 @@ class App(ctk.CTk):
         for serial, rows in by_serial.items():
             line = f"{serial}  —  {rows[0]['CLIENT_NM']} / {rows[0]['LOCATION_NM']}  ({len(rows)} cam)"
             ctk.CTkLabel(self.basket_frame, text=line, text_color=LVT_TEXT_DARK, anchor="w").pack(anchor="w", padx=6, pady=1)
-        self._enable_wheel_scroll(self.basket_frame)
+        self._enable_wheel_scroll(self.picker_page)
 
     def _build_credentials(self):
         frame = ctk.CTkFrame(self, fg_color="transparent")
