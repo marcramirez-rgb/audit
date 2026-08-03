@@ -119,13 +119,18 @@ class _FilterList(ctk.CTkFrame):
     at most CAP matches and says "keep typing" beyond that, so it never balloons.
     ``on_choose(value)`` fires when a result is clicked; ``notify`` (if given) is
     called after every re-render so the page can re-bind wheel scrolling.
-    """
-    CAP = 8
 
-    def __init__(self, master, label, placeholder, on_choose, notify=None):
+    ``cap`` limits how many matches are shown (with a "keep typing" hint beyond
+    it) -- use it for huge lists like clients. Pass ``cap=None`` for lists you
+    want to BROWSE by scrolling (locations, units) when you may not know the
+    exact name.
+    """
+
+    def __init__(self, master, label, placeholder, on_choose, notify=None, cap=None):
         super().__init__(master, fg_color="transparent")
         self._on_choose = on_choose
         self._notify = notify
+        self._cap = cap
         self._all = []
         self._selected = None
         ctk.CTkLabel(self, text=label, text_color=LVT_TEXT_DARK).pack(anchor="w")
@@ -167,7 +172,7 @@ class _FilterList(ctk.CTkFrame):
     def _render(self):
         typed = self._entry.get().strip().lower()
         matches = [v for v in self._all if typed in v.lower()] if typed else self._all
-        shown = matches[:self.CAP]
+        shown = matches[:self._cap] if self._cap else matches
         for c in self._results.winfo_children():
             c.destroy()
         if not shown:
@@ -256,11 +261,17 @@ class FleetPickerDialog(ctk.CTkToplevel):
         self.page = ctk.CTkScrollableFrame(self, fg_color=LVT_WHITE)
         self.page.pack(side="top", fill="both", expand=True, padx=8, pady=(0, 4))
 
-        self.client_list = _FilterList(self.page, "Client", "Type to filter clients…", self._on_client, notify=self._rebind_wheel)
+        # Client is capped (2,000+ clients -> must type). Location/Unit show the
+        # FULL list so you can scroll and browse when you don't know the exact
+        # name; the filter box only narrows if you do.
+        self.client_list = _FilterList(self.page, "Client", "Type to filter clients…", self._on_client,
+                                       notify=self._rebind_wheel, cap=8)
         self.client_list.pack(fill="x", padx=8, pady=2)
-        self.location_list = _FilterList(self.page, "Location", "Type to filter locations…", self._on_location, notify=self._rebind_wheel)
+        self.location_list = _FilterList(self.page, "Location", "Filter locations, or scroll to browse…", self._on_location,
+                                         notify=self._rebind_wheel, cap=None)
         self.location_list.pack(fill="x", padx=8, pady=2)
-        self.tdc_list = _FilterList(self.page, "Unit (TDC)", "Type to filter units…", self._on_tdc, notify=self._rebind_wheel)
+        self.tdc_list = _FilterList(self.page, "Unit (TDC)", "Filter units, or scroll to browse…", self._on_tdc,
+                                    notify=self._rebind_wheel, cap=None)
         self.tdc_list.pack(fill="x", padx=8, pady=2)
 
         ctk.CTkLabel(self.page, text="Camera on this unit", text_color=LVT_TEXT_DARK).pack(anchor="w", padx=8, pady=(6, 0))

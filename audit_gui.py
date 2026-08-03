@@ -234,7 +234,7 @@ class App(ctk.CTk):
         self.picker_location_var = tk.StringVar(value="—")
         self._all_locations = []
         ctk.CTkLabel(page, text="Location", text_color=LVT_TEXT_DARK).grid(row=4, column=0, sticky="w", padx=(4, 12), pady=6)
-        self.picker_location_search = ctk.CTkEntry(page, placeholder_text="Type to filter locations…")
+        self.picker_location_search = ctk.CTkEntry(page, placeholder_text="Filter locations, or scroll the list to browse…")
         self.picker_location_search.grid(row=4, column=1, sticky="ew", pady=6)
         self.picker_location_search.bind("<KeyRelease>", self._filter_locations)
         self.picker_location_search.configure(state="disabled")
@@ -416,12 +416,13 @@ class App(ctk.CTk):
         if not self._all_locations:
             return
         typed = self.picker_location_search.get().strip().lower()
+        # Show ALL locations (no cap) so you can scroll and browse when you don't
+        # know the exact site name -- the filter box just narrows if you do.
         matches = [l for l in self._all_locations if typed in l.lower()] if typed else self._all_locations
-        shown = matches[:self._CLIENT_RESULT_CAP]
         self._render_location_results(
-            shown,
-            empty_msg="No locations match." if typed else "Type to filter locations…",
-            more=len(matches) - len(shown),
+            matches,
+            empty_msg="No locations match." if typed else "No locations for this client.",
+            more=0,
         )
 
     def _render_location_results(self, locations, empty_msg=None, more=0):
