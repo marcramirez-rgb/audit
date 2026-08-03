@@ -14,19 +14,57 @@ audit log of anything that failed.
 - Network access to the target cameras (same LAN or VPN)
 - Valid admin/operator credentials for the cameras you're testing
 
-## Setup
+## Setup — the easy way (recommended, especially for coworkers)
 
-```
-pip install -r requirements.txt
-```
+You do **not** need to touch a terminal or know any pip commands.
+
+1. Install **Python 3.11 or newer** from <https://www.python.org/downloads/>.
+   On the **first** installer screen, tick **"Add python.exe to PATH"** before
+   clicking Install. (If you skipped that box, `setup.bat` will still try to
+   find Python for you.)
+2. Double-click **`setup.bat`**. It builds a private environment in `.venv`
+   and installs everything. Wait for **"Setup complete!"**.
+3. Double-click **`Run Analytics Writer.bat`** or **`Run Audit Report.bat`**.
 
 That's it — no `.env` file is required. See **Credentials** below.
 
+> **On an LVT-managed laptop the normal download will fail** with an SSL /
+> "certificate verify failed" error. That's the corporate network (Zscaler /
+> Netskope) inspecting traffic. `setup.bat` handles this automatically: it
+> retries using the Windows certificate store (where IT has installed the
+> company root CA) and, if needed, a trusted-host fallback. You don't have to
+> do anything — just let it run. If it still fails after all three attempts,
+> the window stays open so you can copy the error and send it to Marc.
+
+> **"The app opens a black window that disappears instantly."** That means it
+> crashed on startup — almost always because setup wasn't run (or didn't
+> finish) on that machine. Run `setup.bat` first. The `Run *.bat` launchers now
+> keep the window open on any crash so the error is readable.
+
+## Setup — the manual way (if you prefer the terminal)
+
+```
+python -m venv .venv
+.venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+If `pip` fails with an SSL / certificate error on a managed laptop, use the
+Windows cert store:
+
+```
+pip install --use-feature=truststore -r requirements.txt
+```
+
 ## Running it
+
+Once set up, the double-click launchers are the simplest way to run either GUI.
+From an activated venv you can also run them directly:
 
 **GUI (recommended for most people):**
 ```
-python audit_gui.py
+python audit_gui.py            # audit report  (Run Audit Report.bat)
+python analytics_writer_gui.py # analytics writer (Run Analytics Writer.bat)
 ```
 
 **Command-line (same engine, terminal-driven):**
@@ -34,8 +72,8 @@ python audit_gui.py
 python combined.py
 ```
 
-Both call into the same underlying engine (`camera_engine.py`) and produce
-identical reports — pick whichever fits how you work. The GUI is the one to
+Both GUIs call into the same underlying engine (`camera_engine.py`) and produce
+identical reports — pick whichever fits how you work. The GUIs are the ones to
 point non-technical coworkers at.
 
 ## How it works
@@ -152,7 +190,10 @@ environment.
 | Every camera shows a gray/black thumbnail | Snapshot fetch is failing — check the Missed Cameras tab for the actual error (timeout, 401, etc.), not just the main sheet |
 | Widespread `401 Unauthorized` across many devices | Check you can log into one device's web UI manually with the same credentials. If that works, it's likely an account lockout from a prior bad run, not this run's password |
 | A camera hits the wrong API (e.g. Axis URL for a Hikvision unit) | Check the exact `MANUFACTURER` value in the CSV, and the column header spelling — must be exactly `MANUFACTURER` |
-| `ModuleNotFoundError` on launch | Run `pip install -r requirements.txt` |
+| `ModuleNotFoundError` on launch | Setup hasn't run on this machine — double-click `setup.bat` and wait for "Setup complete!" |
+| `'python' is not recognized` | Python isn't on PATH. Either reinstall Python with "Add python.exe to PATH" ticked, or just run `setup.bat` — it finds Python without PATH |
+| `pip` fails with SSL / "certificate verify failed" | Corporate network inspection. `setup.bat` handles it automatically (truststore + trusted-host fallback). Manual: `pip install --use-feature=truststore -r requirements.txt` |
+| Terminal window flashes and vanishes when launching the GUI | Startup crash — run `setup.bat` first. The `Run *.bat` launchers keep the window open on crash so you can read the error |
 | GUI window won't open / import error | Make sure `audit_gui.py` and `camera_engine.py` are in the same folder — the GUI imports the engine module directly |
 | Verify the status of true 401 errors in VMS. If the unit is online, but errored out, try running a single unit audit on that unit. It could be the unit is in an area with poor connectivity
 
@@ -161,6 +202,9 @@ environment.
 
 | File | Purpose |
 |---|---|
+| `setup.bat` | One-click first-time setup (finds Python, builds `.venv`, installs deps, handles corporate SSL). Double-click this first. |
+| `Run Analytics Writer.bat` | One-click launcher for the analytics writer GUI |
+| `Run Audit Report.bat` | One-click launcher for the audit report GUI |
 | `audit_gui.py` | Desktop GUI (CustomTkinter) — the primary way to run this |
 | `combined.py` | Terminal/CLI version, same engine |
 | `camera_engine.py` | All camera-fetching, parsing, and report-generation logic. No UI code. |
