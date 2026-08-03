@@ -89,6 +89,7 @@ class WriterApp(ctk.CTk):
         self.img_w = self.img_h = 0    # original dims (coords normalize against these)
         self.scale = 1.0               # display scale factor
         self.offset_x = self.offset_y = 0
+        self.drag_target = None        # vertex being dragged (grab-and-drag), or None
         self.points = []               # canvas-pixel points for the INCLUDE zone/line
         self.exclude_zones = []        # list of finished exclusion polygons (canvas px)
         self.current_exclude = []      # exclusion polygon currently being drawn
@@ -364,6 +365,8 @@ class WriterApp(ctk.CTk):
                                 highlightthickness=1, highlightbackground=LVT_DARK_TEAL)
         self.canvas.grid(row=1, column=0, sticky="nw")
         self.canvas.bind("<Button-1>", self._on_canvas_click)
+        self.canvas.bind("<B1-Motion>", self._on_canvas_drag)
+        self.canvas.bind("<ButtonRelease-1>", self._on_canvas_release)
         self.canvas.bind("<Motion>", self._on_canvas_motion)
 
         self.log_box = ctk.CTkTextbox(right, fg_color=LVT_LOG_BG, text_color=LVT_LOG_TEXT,
@@ -694,8 +697,67 @@ class WriterApp(ctk.CTk):
         iy = (cy - self.offset_y) / self.scale
         return ix, iy
 
+    DRAG_RADIUS = 9  # px hit-radius for grabbing a plotted vertex
+
+    def _find_vertex(self, cx, cy):
+        """Return a descriptor for the plotted vertex nearest to (cx, cy) within
+        DRAG_RADIUS, or None. Searches include zone/line, exclusion polygons, and
+        perspective-bar endpoints (all canvas-pixel points)."""
+        r2 = self.DRAG_RADIUS ** 2
+        def near(p):
+            return (p[0] - cx) ** 2 + (p[1] - cy) ** 2 <= r2
+        for i, p in enumerate(self.points):
+            if near(p):
+                return ("points", i)
+        for zi, zone in enumerate(self.exclude_zones):
+            for i, p in enumerate(zone):
+                if near(p):
+                    return ("exclude", zi, i)
+        for i, p in enumerate(self.current_exclude):
+            if near(p):
+                return ("current_exclude", i)
+        for bi, bar in enumerate(self.perspective_bars):
+            for i, p in enumerate(bar["points"]):
+                if near(p):
+                    return ("bar", bi, i)
+        for i, p in enumerate(self.current_bar):
+            if near(p):
+                return ("current_bar", i)
+        return None
+
+    def _set_vertex(self, target, x, y):
+        kind = target[0]
+        if kind == "points":
+            self.points[target[1]] = (x, y)
+        elif kind == "exclude":
+            self.exclude_zones[target[1]][target[2]] = (x, y)
+        elif kind == "current_exclude":
+            self.current_exclude[target[1]] = (x, y)
+        elif kind == "bar":
+            self.perspective_bars[target[1]]["points"][target[2]] = (x, y)
+        elif kind == "current_bar":
+            self.current_bar[target[1]] = (x, y)
+
+    def _on_canvas_drag(self, event):
+        if self.drag_target is None:
+            return
+        # clamp to the displayed image so a vertex can't be dragged off-frame
+        x = max(self.offset_x, min(self.offset_x + self.img_w * self.scale, event.x))
+        y = max(self.offset_y, min(self.offset_y + self.img_h * self.scale, event.y))
+        self._set_vertex(self.drag_target, x, y)
+        self._redraw()
+
+    def _on_canvas_release(self, _event):
+        self.drag_target = None
+
     def _on_canvas_click(self, event):
         if not self.tk_image:
+            return
+        # Grab-and-drag: if the click lands on an existing plotted vertex, start dragging
+        # it instead of adding a new point (works in any mode, like the Axis web UI).
+        target = self._find_vertex(event.x, event.y)
+        if target is not None:
+            self.drag_target = target
             return
         # ignore clicks outside the image area
         ix, iy = self._canvas_to_image_px(event.x, event.y)
@@ -747,6 +809,8 @@ class WriterApp(ctk.CTk):
     def _on_canvas_motion(self, event):
         if not self.tk_image:
             return
+        # cursor hint: show a grab cursor when hovering over a draggable vertex
+        self.canvas.configure(cursor="hand2" if self._find_vertex(event.x, event.y) else "")
         ix, iy = self._canvas_to_image_px(event.x, event.y)
         if 0 <= ix <= self.img_w and 0 <= iy <= self.img_h:
             fx, fy = self._canvas_to_frac(event.x, event.y)
@@ -800,15 +864,25 @@ class WriterApp(ctk.CTk):
         self._log("[.] Size boxes cleared.")
 
     def _clear_overlays(self):
-        """Remove the reference overlays drawn by Read Current Config (existing
-        scenarios, size boxes, perspective bars) for a blank snapshot to draw on.
-        Display-only -- does NOT change anything on the camera."""
-        if not self.existing_overlays:
-            self._log("[.] No config overlays to clear.")
+        """Return the canvas to a blank slate: remove the reference overlays drawn by
+        Read Current Config (existing scenarios, size boxes, perspective bars) AND
+        discard any scenario currently loaded for editing, so the view goes back to
+        just the snapshot with the dropdown on New Scenario. Display-only -- does NOT
+        change anything on the camera."""
+        had_overlays = bool(self.existing_overlays)
+        had_active = bool(self.points or self.exclude_zones or self.current_exclude
+                          or self.edit_size or self.perspective_bars or self.editing)
+        if not (had_overlays or had_active):
+            self._log("[.] Nothing to clear.")
             return
         self.existing_overlays = []
-        self._redraw()
-        self._log("[.] Config overlays cleared (camera unchanged). Blank slate to draw on.")
+        # Route the active-drawing reset through the New Scenario path so the editing
+        # state, name, geometry and the scenario dropdown all return to blank together.
+        # (Previously this only cleared the reference overlays, leaving a selected
+        # scenario drawn on screen -- you had to pick "New Scenario" or re-fetch.)
+        self.edit_var.set(NEW_SCENARIO)
+        self._on_edit_select(NEW_SCENARIO)
+        self._log("[.] Cleared to a blank snapshot (camera unchanged).")
 
     def _finish_exclude(self):
         if len(self.current_exclude) < 3:
