@@ -1,7 +1,7 @@
 """Camera analytics engine: fetching, parsing, rendering, and report generation.
 
 No input()/print()/exit() here -- this module is a plain library used by both
-the CLI (combined.py) and the GUI (gui_app.py). Callers pass in credentials and
+the CLI (combined.py) and the GUI (audit_gui.py). Callers pass in credentials and
 a log/progress callback instead of relying on module-level globals or stdout.
 """
 
@@ -290,6 +290,21 @@ class HikvisionHandler(CameraHandler):
                 target_node = rule.find('.//ns:detectionTarget', namespaces) or rule.find('.//ns:TargetType', namespaces)
             target_detection = target_node.text.capitalize() if (target_node is not None and target_node.text) else "All Targets"
 
+            # Line-crossing direction. Hik lineDetection stores directionSensitivity
+            # (left-right / right-left / any) inside LineDetectionParam. Map to the
+            # neutral Axis-style values the renderer expects (leftToRight/rightToLeft/
+            # any) using the same mapping vendor_adapter applies on the writer's read
+            # path -- kept in sync here. The Hik parser vertically flips vertices to
+            # match snapshot orientation; the arrow's rendered side was VERIFIED against
+            # a live device (10.23.5.188 ch2 "TESTZONE" = right-left) on 2026-08-03 --
+            # the audit overlay's arrow matched the camera web UI's direction.
+            direction = None
+            if event_type == "Line Crossing":
+                ds_node = rule.find('.//ns:LineDetectionParam/ns:directionSensitivity', namespaces)
+                ds_val = ds_node.text.strip() if (ds_node is not None and ds_node.text) else None
+                direction = {"left-right": "leftToRight", "right-left": "rightToLeft",
+                             "any": "any"}.get(ds_val)
+
             region_lists = rule.findall('.//ns:RegionCoordinatesList', namespaces)
             polygons = []
             for region in region_lists:
@@ -318,6 +333,29 @@ class HikvisionHandler(CameraHandler):
             if not polygons:
                 continue
 
+            # Min/max object-size boxes from SizeFilter. positionX/Y/width/height share
+            # the 0..1000 grid as the region, so apply the same vertical flip: the box
+            # spans posY..posY+h in raw coords, which flips to top = h-(posY+h), bottom = h-posY.
+            size_boxes = []
+            for box_tag, label in (("MinObjectSize", "min size"), ("MaxObjectSize", "max size")):
+                box = rule.find(f'.//ns:SizeFilter/ns:{box_tag}', namespaces)
+                if box is None:
+                    continue
+                try:
+                    bx = float(box.find('ns:positionX', namespaces).text)
+                    by = float(box.find('ns:positionY', namespaces).text)
+                    bw = float(box.find('ns:width', namespaces).text)
+                    bh = float(box.find('ns:height', namespaces).text)
+                except (AttributeError, TypeError, ValueError):
+                    continue
+                if bw <= 0 or bh <= 0:
+                    continue  # default/empty SizeFilter -- nothing to draw
+                x0 = int((bx / 1000.0) * img_w)
+                x1 = int(((bx + bw) / 1000.0) * img_w)
+                y0 = int(img_h - 1 - ((by + bh) / 1000.0) * img_h)
+                y1 = int(img_h - 1 - (by / 1000.0) * img_h)
+                size_boxes.append({"box": (x0, y0, x1, y1), "label": label})
+
             for zone_index, polygon in enumerate(polygons, start=1):
                 zone_name = rule_name if len(polygons) == 1 else f"{rule_name} [Zone {zone_index}]"
                 parsed_rules.append({
@@ -326,7 +364,10 @@ class HikvisionHandler(CameraHandler):
                     "type": event_type,
                     "duration": duration_val,
                     "target": target_detection,
-                    "vertices": polygon
+                    "vertices": polygon,
+                    "size_boxes": size_boxes,
+                    "bars": [],
+                    "direction": direction,
                 })
 
         # Deduplicate parsed rules that are exactly identical (same name/type/target/duration/vertices)
@@ -562,6 +603,13 @@ class AxisHandler(CameraHandler):
         if not scenarios:
             return [{"is_placeholder": True, "name": "No Scenarios Configured", "type": "N/A", "target": "No Analytics Configured", "duration": "N/A", "vertices": []}]
 
+        # Perspective calibration bars live at the top level and scenarios reference them
+        # by id; index them so each rule can carry its bars into the overlay.
+        persp_defs = {p.get("id"): p for p in json_data.get("data", {}).get("perspectives", [])}
+
+        def _aoa_to_px(x, y):
+            return (int(((float(x) + 1.0) / 2.0) * img_w), int(((1.0 - float(y)) / 2.0) * img_h))
+
         parsed_rules = []
         for scenario in scenarios:
             if scenario.get("is_placeholder"):
@@ -598,19 +646,78 @@ class AxisHandler(CameraHandler):
             if triggers:
                 raw_vertices = triggers[0].get("vertices", [])
                 for pt in raw_vertices:
-                    raw_x = float(pt[0])
-                    raw_y = float(pt[1])
-                    pixel_x = int(((raw_x + 1.0) / 2.0) * img_w)
-                    pixel_y = int(((1.0 - raw_y) / 2.0) * img_h)
-                    vertices.append((pixel_x, pixel_y))
+                    vertices.append(_aoa_to_px(pt[0], pt[1]))
 
-            parsed_rules.append({"is_placeholder": False, "name": rule_name, "type": rule_type, "duration": duration_val, "target": target_detection, "vertices": vertices})
+            # Perspective calibration bars for this scenario (green in the overlay).
+            bars = []
+            for pid in (scenario.get("perspectives") or []):
+                pdef = persp_defs.get(pid)
+                if not pdef:
+                    continue
+                for b in pdef.get("bars", []):
+                    pts = [_aoa_to_px(x, y) for x, y in b.get("points", [])]
+                    if len(pts) >= 2:
+                        bars.append({"points": pts, "label": f"{b.get('height')}cm"})
+
+            # Minimum object size (sizePercentage = width%/height%, no position) shown as
+            # a bottom-left reference box. sizePerspective (real-world cm) needs calibration
+            # to scale, so it isn't drawn here.
+            size_boxes = []
+            for f in scenario.get("filters", []):
+                if f.get("type") == "sizePercentage":
+                    w, h = f.get("width", 0), f.get("height", 0)
+                    if w and h:
+                        wpx, hpx = int(w / 100.0 * img_w), int(h / 100.0 * img_h)
+                        x0, y1 = int(0.02 * img_w), int(0.97 * img_h)
+                        size_boxes.append({"box": (x0, y1 - hpx, x0 + wpx, y1), "label": "min size"})
+
+            # Line-crossing direction (fence alarmDirection: leftToRight / rightToLeft).
+            direction = triggers[0].get("alarmDirection") if triggers and triggers[0].get("type") == "fence" else None
+
+            parsed_rules.append({"is_placeholder": False, "name": rule_name, "type": rule_type,
+                                 "duration": duration_val, "target": target_detection,
+                                 "vertices": vertices, "bars": bars, "size_boxes": size_boxes,
+                                 "direction": direction})
         return parsed_rules
 
 
 # --- UNIVERSAL RENDERING ENGINE (JPEG COMPRESSION) ---
 
-def render_overlay_image(camera_image, vertices, index, img_w, img_h, rule_type=""):
+def _draw_crossing_direction(draw, p0, p1, direction):
+    """Draw a perpendicular arrow at a line's midpoint showing which way an object must
+    cross to trigger. Matches the analytics writer's convention: relative to p0->p1,
+    'leftToRight' points to the (-dpy, dpx) side, 'rightToLeft' the opposite; 'any'
+    draws a double-headed arrow. Computed in pixel space (perpendicular to the line)."""
+    import math
+    x0, y0 = p0
+    x1, y1 = p1
+    dpx, dpy = x1 - x0, y1 - y0
+    length = math.hypot(dpx, dpy) or 1.0
+    if str(direction) == "rightToLeft":
+        nx, ny = dpy / length, -dpx / length
+    else:  # leftToRight and any
+        nx, ny = -dpy / length, dpx / length
+    mx, my = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+    arm = 42
+    color = (0, 229, 218, 255)
+    bidir = (str(direction) == "any")
+    start = (mx - nx * arm, my - ny * arm) if bidir else (mx, my)
+    tip = (mx + nx * arm, my + ny * arm)
+    draw.line([start, tip], fill=color, width=3)
+
+    def _head(at, toward):
+        ang = math.atan2(at[1] - toward[1], at[0] - toward[0])
+        for da in (math.radians(28), math.radians(-28)):
+            draw.line([at, (at[0] + 14 * math.cos(ang + da), at[1] + 14 * math.sin(ang + da))],
+                      fill=color, width=3)
+
+    _head(tip, start)
+    if bidir:
+        _head(start, tip)
+
+
+def render_overlay_image(camera_image, vertices, index, img_w, img_h, rule_type="",
+                         size_boxes=None, bars=None, direction=None):
     snapshot_missing = (camera_image is None)
     if camera_image is not None:
         base_img = camera_image.copy().convert("RGBA")
@@ -715,6 +822,8 @@ def render_overlay_image(camera_image, vertices, index, img_w, img_h, rule_type=
         if is_line_rule or len(polygon_to_draw) <= 2:
             # Teal outline for lines
             draw.line(polygon_to_draw, fill=(0, 161, 154, 255), width=4)
+            if direction and len(polygon_to_draw) >= 2:
+                _draw_crossing_direction(draw, polygon_to_draw[0], polygon_to_draw[1], direction)
         else:
             # Light red fill for polygons
             light_red_fill = (255, 102, 102, 76)
@@ -722,6 +831,26 @@ def render_overlay_image(camera_image, vertices, index, img_w, img_h, rule_type=
             draw.polygon(polygon_to_draw, outline=rgb_color + (255,), width=3)
         for (x, y) in polygon_to_draw:
             draw.ellipse((x - 6, y - 6, x + 6, y + 6), fill=(255, 255, 0, 255), outline=(0, 0, 0, 255), width=1)
+
+    # Min/max object-size boxes (purple) and perspective calibration bars (green),
+    # matching what the analytics writer shows. Same coordinate spaces as vertices.
+    try:
+        from PIL import ImageFont
+        label_font = ImageFont.load_default()
+    except Exception:
+        label_font = None
+    for sb in (size_boxes or []):
+        x0, y0, x1, y1 = sb.get("box", (0, 0, 0, 0))
+        draw.rectangle([x0, y0, x1, y1], outline=(177, 151, 252, 255), width=3)
+        draw.text((x0 + 2, min(y0, y1) - 12), sb.get("label", ""), fill=(177, 151, 252, 255), font=label_font)
+    for bar in (bars or []):
+        pts = bar.get("points", [])[:2]
+        if len(pts) < 2:
+            continue
+        draw.line([tuple(pts[0]), tuple(pts[1])], fill=(81, 207, 102, 255), width=4)
+        for (bx, by) in pts:
+            draw.line([(bx - 6, by), (bx + 6, by)], fill=(81, 207, 102, 255), width=3)
+        draw.text((pts[0][0] + 6, pts[0][1]), bar.get("label", ""), fill=(81, 207, 102, 255), font=label_font)
 
     if snapshot_missing:
         try:
@@ -816,44 +945,89 @@ def render_overlay_image(camera_image, vertices, index, img_w, img_h, rule_type=
     return img_buf
 
 
+# Shared layout for the per-location analytics sheets.
+MAIN_HEADERS = ["Client Name", "Location", "Live Unit Serial", "Camera Position",
+                "Rule Name", "Rule Type", "Target Detection", "Duration (s)",
+                "Rule Visual Overlay Thumbnail"]
+MAIN_WIDTHS = [22, 24, 22, 16, 20, 20, 20, 14, 95]
+
+
+def _safe_sheet_title(name, used_titles):
+    """Excel-worksheet-title-safe version of a location name: strip the characters
+    Excel forbids (: \\ / ? * [ ]), collapse whitespace, cap at 31 chars, never
+    blank, and make it unique within the workbook (append ' (2)', ' (3)', ... on a
+    case-insensitive collision, still <=31). used_titles is mutated with the result."""
+    cleaned = name or "Unspecified Location"
+    for ch in ":\\/?*[]":
+        cleaned = cleaned.replace(ch, " ")
+    cleaned = " ".join(cleaned.split()).strip("'") or "Unspecified Location"
+    base = cleaned[:31]
+    title, n = base, 2
+    while title.casefold() in used_titles:
+        suffix = f" ({n})"
+        title = base[:31 - len(suffix)].rstrip() + suffix
+        n += 1
+    used_titles.add(title.casefold())
+    return title
+
+
+def _style_analytics_sheet(ws, location_label, timeline_text):
+    """Apply the master-report header/styling to a per-location analytics sheet."""
+    header_font  = Font(name="Arial", bold=True, color="FFFFFF", size=11)
+    header_fill  = PatternFill("solid", start_color="1A1D27")
+    center_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    thin = Border(left=Side(style="thin", color="DDDDDD"), right=Side(style="thin", color="DDDDDD"),
+                  top=Side(style="thin", color="DDDDDD"), bottom=Side(style="thin", color="DDDDDD"))
+    ws.views.sheetView[0].showGridLines = True
+
+    ws.merge_cells("A1:I1")
+    ws["A1"] = f"Intelligent Analytics Master Report - {location_label}"
+    ws["A1"].font      = Font(name="Arial", bold=True, size=16, color="FFFFFF")
+    ws["A1"].fill      = PatternFill("solid", start_color="0F1117")
+    ws["A1"].alignment = center_align
+    ws.row_dimensions[1].height = 36
+
+    ws.merge_cells("A2:I2")
+    ws["A2"] = timeline_text
+    ws["A2"].font      = Font(name="Arial", size=10, color="888888")
+    ws["A2"].fill      = PatternFill("solid", start_color="0F1117")
+    ws["A2"].alignment = center_align
+    ws.row_dimensions[2].height = 20
+
+    for col, h in enumerate(MAIN_HEADERS, 1):
+        cell = ws.cell(row=3, column=col, value=h)
+        cell.font = header_font; cell.fill = header_fill; cell.alignment = center_align
+        cell.border = thin
+    ws.row_dimensions[3].height = 22
+
+    for i, w in enumerate(MAIN_WIDTHS, 1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+
+    ws.freeze_panes = "A4"
+    return ws
+
+
+def add_location_sheet(wb, location_label, timeline_text, used_titles):
+    """Create and style a new analytics worksheet for one location, returning it.
+    The tab title is sanitized/uniquified for Excel via _safe_sheet_title."""
+    ws = wb.create_sheet(title=_safe_sheet_title(location_label, used_titles))
+    return _style_analytics_sheet(ws, location_label, timeline_text)
+
+
 def create_master_workbook():
+    """Build the workbook with just the global 'Missed Cameras' sheet. The analytics
+    data is split into one tab per unique location, and those sheets are created on
+    demand during the batch run via add_location_sheet() -- so this no longer creates
+    a single 'Camera Analytics' sheet up front."""
     wb = openpyxl.Workbook()
-    ws_main = wb.active
-    ws_main.title = "Camera Analytics"
-    ws_main.views.sheetView[0].showGridLines = True
+    default_ws = wb.active  # openpyxl always seeds one sheet; we don't want it
+
+    header_font  = Font(name="Arial", bold=True, color="FFFFFF", size=11)
+    failed_fill  = PatternFill("solid", start_color="A61C1C")
+    center_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
     ws_missed = wb.create_sheet(title="Missed Cameras")
     ws_missed.views.sheetView[0].showGridLines = True
-
-    header_font   = Font(name="Arial", bold=True, color="FFFFFF", size=11)
-    header_fill   = PatternFill("solid", start_color="1A1D27")
-    failed_fill   = PatternFill("solid", start_color="A61C1C")
-    center_align  = Alignment(horizontal="center", vertical="center", wrap_text=True)
-
-    ws_main.merge_cells("A1:I1")
-    ws_main["A1"] = f"Intelligent Analytics Master Report"
-    ws_main["A1"].font      = Font(name="Arial", bold=True, size=16, color="FFFFFF")
-    ws_main["A1"].fill      = PatternFill("solid", start_color="0F1117")
-    ws_main["A1"].alignment = center_align
-    ws_main.row_dimensions[1].height = 36
-
-    ws_main.merge_cells("A2:I2")
-    ws_main["A2"] = f"Batch Processing Timeline Context: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-    ws_main["A2"].font      = Font(name="Arial", size=10, color="888888")
-    ws_main["A2"].fill      = PatternFill("solid", start_color="0F1117")
-    ws_main["A2"].alignment = center_align
-    ws_main.row_dimensions[2].height = 20
-
-    main_headers = ["Client Name", "Location", "Live Unit Serial", "Camera Position", "Rule Name", "Rule Type", "Target Detection", "Duration (s)", "Rule Visual Overlay Thumbnail"]
-    for col, h in enumerate(main_headers, 1):
-        cell = ws_main.cell(row=3, column=col, value=h)
-        cell.font = header_font; cell.fill = header_fill; cell.alignment = center_align
-        cell.border = Border(left=Side(style="thin", color="DDDDDD"), right=Side(style="thin", color="DDDDDD"), top=Side(style="thin", color="DDDDDD"), bottom=Side(style="thin", color="DDDDDD"))
-    ws_main.row_dimensions[3].height = 22
-
-    main_widths = [22, 24, 22, 16, 20, 20, 20, 14, 95]
-    for i, w in enumerate(main_widths, 1):
-        ws_main.column_dimensions[get_column_letter(i)].width = w
 
     ws_missed.merge_cells("A1:G1")
     ws_missed["A1"] = "Analytics Fetch Exception Audit Log"
@@ -871,10 +1045,10 @@ def create_master_workbook():
     for i, w in enumerate(missed_widths, 1):
         ws_missed.column_dimensions[get_column_letter(i)].width = w
 
-    ws_main.freeze_panes = "A4"
     ws_missed.freeze_panes = "A3"
 
-    return wb, ws_main, ws_missed
+    wb.remove(default_ws)  # safe now that ws_missed exists as the workbook's sheet
+    return wb, ws_missed
 
 
 def dedupe_main_rows(main_rows):
@@ -1083,7 +1257,8 @@ def process_camera_row(args):
 
             for index, rule in enumerate(rules):
                 try:
-                    img_buf = render_overlay_image(camera_image, rule["vertices"], index, img_w, img_h, rule["type"])
+                    img_buf = render_overlay_image(camera_image, rule["vertices"], index, img_w, img_h, rule["type"],
+                                                       size_boxes=rule.get("size_boxes"), bars=rule.get("bars"), direction=rule.get("direction"))
                     display_name = rule["name"]
                     if camera_image is None:
                         display_name = f"Snapshot Failed: {display_name}"
@@ -1121,7 +1296,10 @@ def process_camera_row(args):
             camera_image, snap_url, snap_err, snap_auth_rejected = handler.fetch_snapshot(sess, port)
             if camera_image is None:
                 img_w, img_h = handler.fallback_dim
-                results["logs"].append(f"    [!] Warning: Failed to fetch stream snapshot ({snap_err}). Defaulting to {img_w}x{img_h} canvas.")
+                if snap_auth_rejected:
+                    results["logs"].append(f"    [!] Port {port} REJECTED THE LOGIN (HTTP 401) -- wrong Axis username/password for this unit. This is NOT a camera-type/manufacturer problem; re-run with the correct Axis credentials. Defaulting to {img_w}x{img_h} canvas.")
+                else:
+                    results["logs"].append(f"    [!] Warning: Failed to fetch stream snapshot ({snap_err}). Defaulting to {img_w}x{img_h} canvas.")
                 timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 results["missed"].append([timestamp, client_name, location, serial, f"{pos} ({port}) [SNAPSHOT]", snap_url, snap_err])
             else:
@@ -1144,7 +1322,10 @@ def process_camera_row(args):
             camera_image, snap_url, snap_err, snap_auth_rejected = handler.fetch_snapshot(sess, port)
             if camera_image is None:
                 img_w, img_h = handler.fallback_dim
-                results["logs"].append(f"    [!] Warning: Failed to fetch stream snapshot ({snap_err}). Defaulting to {img_w}x{img_h} canvas.")
+                if snap_auth_rejected:
+                    results["logs"].append(f"    [!] Port {port} REJECTED THE LOGIN (HTTP 401) -- wrong Hikvision username/password for this unit. This is NOT a camera-type/manufacturer problem; re-run with the correct Hikvision credentials. Defaulting to {img_w}x{img_h} canvas.")
+                else:
+                    results["logs"].append(f"    [!] Warning: Failed to fetch stream snapshot ({snap_err}). Defaulting to {img_w}x{img_h} canvas.")
                 timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 results["missed"].append([timestamp, client_name, location, serial, f"{pos} ({port}) [SNAPSHOT]", snap_url, snap_err])
             else:
@@ -1173,7 +1354,8 @@ def process_camera_row(args):
 
         for index, rule in enumerate(rules):
             try:
-                img_buf = render_overlay_image(camera_image, rule["vertices"], index, img_w, img_h, rule["type"])
+                img_buf = render_overlay_image(camera_image, rule["vertices"], index, img_w, img_h, rule["type"],
+                                                       size_boxes=rule.get("size_boxes"), bars=rule.get("bars"), direction=rule.get("direction"))
                 add_main_row({
                     "data": [client_name, location, serial, pos, rule["name"], rule["type"], rule["target"], rule["duration"]],
                     "bg": bg_color, "img": img_buf, "err": ""
@@ -1196,10 +1378,11 @@ def process_camera_row(args):
         # For Hikvision, preserve both checks intact to prevent lockout windows.
         should_break = snap_auth_rejected if is_axis else (snap_auth_rejected or analytics_auth_rejected)
         if should_break:
+            vendor = "Axis" if is_axis else "Hikvision"
             timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            results["logs"].append(f"    [!] Authentication flatly rejected on Port {port} -- skipping remaining ports on this device to avoid triggering an account lockout.")
+            results["logs"].append(f"    [!] WRONG LOGIN on Port {port} (HTTP 401) -- the {vendor} username/password is being rejected. Skipping this unit's remaining ports so repeated bad logins don't lock the account. Fix: re-run with the correct {vendor} credentials (this is a password problem, NOT a camera-type/manufacturer problem).")
             results["missed"].append([timestamp, client_name, location, serial, "REMAINING PORTS SKIPPED", "N/A",
-                                       f"Authentication rejected on port {port} -- remaining ports skipped to avoid repeated failed-login attempts against the same device."])
+                                       f"Wrong {vendor} login (HTTP 401) on port {port} -- credentials rejected. Remaining ports skipped to avoid locking the account. Re-run with the correct {vendor} username/password."])
             break
 
     return results
@@ -1220,10 +1403,22 @@ def run_batch(camera_rows, credentials, output_dir, base_filename, log_cb=None, 
     date_suffix = datetime.now().strftime("%Y%m%d_%H%M%S")
     master_report_file = f"{base_filename}_Master_{date_suffix}.xlsx"
 
-    current_main_row = 4
     current_missed_row = 3
 
-    wb, ws_main, ws_missed = create_master_workbook()
+    wb, ws_missed = create_master_workbook()
+
+    # One analytics tab per unique location, created on demand. Each entry tracks
+    # its worksheet and the next free row on that sheet (data starts at row 4).
+    timeline_text = f"Batch Processing Timeline Context: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+    loc_sheets = {}
+    used_titles = set()
+
+    def get_location_sheet(loc):
+        key = (loc or "").strip() or "Unspecified Location"
+        if key not in loc_sheets:
+            ws = add_location_sheet(wb, key, timeline_text, used_titles)
+            loc_sheets[key] = {"ws": ws, "row": 4}
+        return loc_sheets[key]
 
     normal_font = Font(name="Arial", size=10)
     bold_font   = Font(name="Arial", bold=True, size=10)
@@ -1270,32 +1465,41 @@ def run_batch(camera_rows, credentials, output_dir, base_filename, log_cb=None, 
             main_rows = dedupe_main_rows(res["main"])
             if len(main_rows) < len(res["main"]):
                 log(f"[!] Removed {len(res['main']) - len(main_rows)} duplicate analytics row(s) for IP {res['ip']}")
+            if main_rows:
+                entry = get_location_sheet(res["loc"])
+                ws_loc = entry["ws"]
             for main_row in main_rows:
+                current_main_row = entry["row"]
                 bg = main_row["bg"]
                 row_fill = PatternFill("solid", start_color=bg)
                 active_normal_font = white_normal_font if bg == "00726E" else normal_font
                 active_bold_font = white_bold_font if bg == "00726E" else bold_font
 
                 for col_idx, val in enumerate(main_row["data"], 1):
-                    c = ws_main.cell(row=current_main_row, column=col_idx, value=val)
+                    c = ws_loc.cell(row=current_main_row, column=col_idx, value=val)
                     c.font = active_bold_font if col_idx == 4 else active_normal_font
                     c.fill = row_fill
                     c.alignment = center_align if col_idx in [3, 4, 7, 8] else left_align
                     c.border = thin_border
 
-                thumb_cell = ws_main.cell(row=current_main_row, column=9, value=main_row["err"])
+                thumb_cell = ws_loc.cell(row=current_main_row, column=9, value=main_row["err"])
                 thumb_cell.fill = row_fill; thumb_cell.border = thin_border
 
                 if main_row["img"]:
                     xl_img = OpenpyxlImage(main_row["img"])
                     xl_img.anchor = TwoCellAnchor(editAs="oneCell", _from=AnchorMarker(col=8, colOff=0, row=current_main_row - 1, rowOff=0), to=AnchorMarker(col=9, colOff=0, row=current_main_row, rowOff=0))
-                    ws_main.add_image(xl_img)
+                    ws_loc.add_image(xl_img)
 
-                ws_main.row_dimensions[current_main_row].height = ROW_H
-                current_main_row += 1
+                ws_loc.row_dimensions[current_main_row].height = ROW_H
+                entry["row"] = current_main_row + 1
 
             done_count += 1
             report_progress(done_count, total_cameras)
+
+    # Keep the global Missed Cameras tab last so the report opens on a location tab.
+    missed = wb["Missed Cameras"]
+    wb._sheets.remove(missed)
+    wb._sheets.append(missed)
 
     final_output_path = Path(output_dir) / master_report_file
     wb.save(final_output_path)

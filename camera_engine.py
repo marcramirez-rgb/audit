@@ -1296,7 +1296,10 @@ def process_camera_row(args):
             camera_image, snap_url, snap_err, snap_auth_rejected = handler.fetch_snapshot(sess, port)
             if camera_image is None:
                 img_w, img_h = handler.fallback_dim
-                results["logs"].append(f"    [!] Warning: Failed to fetch stream snapshot ({snap_err}). Defaulting to {img_w}x{img_h} canvas.")
+                if snap_auth_rejected:
+                    results["logs"].append(f"    [!] Port {port} REJECTED THE LOGIN (HTTP 401) -- wrong Axis username/password for this unit. This is NOT a camera-type/manufacturer problem; re-run with the correct Axis credentials. Defaulting to {img_w}x{img_h} canvas.")
+                else:
+                    results["logs"].append(f"    [!] Warning: Failed to fetch stream snapshot ({snap_err}). Defaulting to {img_w}x{img_h} canvas.")
                 timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 results["missed"].append([timestamp, client_name, location, serial, f"{pos} ({port}) [SNAPSHOT]", snap_url, snap_err])
             else:
@@ -1319,7 +1322,10 @@ def process_camera_row(args):
             camera_image, snap_url, snap_err, snap_auth_rejected = handler.fetch_snapshot(sess, port)
             if camera_image is None:
                 img_w, img_h = handler.fallback_dim
-                results["logs"].append(f"    [!] Warning: Failed to fetch stream snapshot ({snap_err}). Defaulting to {img_w}x{img_h} canvas.")
+                if snap_auth_rejected:
+                    results["logs"].append(f"    [!] Port {port} REJECTED THE LOGIN (HTTP 401) -- wrong Hikvision username/password for this unit. This is NOT a camera-type/manufacturer problem; re-run with the correct Hikvision credentials. Defaulting to {img_w}x{img_h} canvas.")
+                else:
+                    results["logs"].append(f"    [!] Warning: Failed to fetch stream snapshot ({snap_err}). Defaulting to {img_w}x{img_h} canvas.")
                 timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 results["missed"].append([timestamp, client_name, location, serial, f"{pos} ({port}) [SNAPSHOT]", snap_url, snap_err])
             else:
@@ -1372,10 +1378,11 @@ def process_camera_row(args):
         # For Hikvision, preserve both checks intact to prevent lockout windows.
         should_break = snap_auth_rejected if is_axis else (snap_auth_rejected or analytics_auth_rejected)
         if should_break:
+            vendor = "Axis" if is_axis else "Hikvision"
             timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            results["logs"].append(f"    [!] Authentication flatly rejected on Port {port} -- skipping remaining ports on this device to avoid triggering an account lockout.")
+            results["logs"].append(f"    [!] WRONG LOGIN on Port {port} (HTTP 401) -- the {vendor} username/password is being rejected. Skipping this unit's remaining ports so repeated bad logins don't lock the account. Fix: re-run with the correct {vendor} credentials (this is a password problem, NOT a camera-type/manufacturer problem).")
             results["missed"].append([timestamp, client_name, location, serial, "REMAINING PORTS SKIPPED", "N/A",
-                                       f"Authentication rejected on port {port} -- remaining ports skipped to avoid repeated failed-login attempts against the same device."])
+                                       f"Wrong {vendor} login (HTTP 401) on port {port} -- credentials rejected. Remaining ports skipped to avoid locking the account. Re-run with the correct {vendor} username/password."])
             break
 
     return results
