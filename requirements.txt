@@ -1,12 +1,18 @@
-requests==2.34.2
-urllib3==2.7.0
-Pillow==12.2.0
-openpyxl==3.1.5
-customtkinter==6.0.0
-python-dotenv==1.2.2
+# Full dependency set for the LVT Camera Analytics tools.
+#
+# setup.bat installs this in TWO groups on purpose:
+#   1. requirements-core.txt      -- everything needed to launch. Safe to
+#                                    install with pip's truststore fallback.
+#   2. snowflake-connector-python -- the live Fleet Picker driver. Installed
+#                                    SEPARATELY and NEVER with truststore, whose
+#                                    vendored urllib3 recurses (see
+#                                    fleet_catalog.py). Optional: the apps launch
+#                                    fine without it (cached catalog still works).
+#
+# A plain "pip install -r requirements.txt" still pulls everything, so nothing
+# downstream that relies on this file breaks.
+-r requirements-core.txt
 
 # v2.0 Fleet Picker -- live Snowflake mode. The [secure-local-storage] extra
 # pulls keyring so the SSO token is cached (no re-prompt every launch).
-# (No truststore needed: Snowflake's endpoint uses a publicly-trusted cert, and
-# injecting truststore recurses with the connector's vendored urllib3.)
 snowflake-connector-python[secure-local-storage]==4.7.1
