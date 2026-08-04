@@ -195,6 +195,11 @@ class HikAdapter:
         out = []
         for ri in root.findall(".//ns:RuleInfo", hik_config.NS):
             name = _text(ri, "ns:ruleName")
+            # ruleId is the rule's true identity: the firmware upserts by ruleId, and two
+            # rules can share a ruleName. Key native_id on it so duplicate names stay
+            # distinct through select/edit/push. Fall back to name if ruleId is absent.
+            rid = _text(ri, "ns:ruleId")
+            native = int(rid) if rid.isdigit() else name
             etype = _text(ri, "ns:eventType") or ""
             kind = "line" if "line" in etype.lower() else "intrusion"
             pts = [(int(_text(c, "ns:positionX")) / 1000.0, 1 - int(_text(c, "ns:positionY")) / 1000.0)
@@ -204,7 +209,7 @@ class HikAdapter:
             direction = _HIK_DIR_TO_NEUTRAL.get(_text(ri, ".//ns:directionSensitivity")) if kind == "line" else None
             out.append(Scenario(name=name, kind=kind, points=pts,
                                 classes=_hik_target_to_classes(target), direction=direction,
-                                duration=int(dur) if dur.isdigit() else 0, native_id=name,
+                                duration=int(dur) if dur.isdigit() else 0, native_id=native,
                                 min_size=_size_rect(ri, "MinObjectSize"),
                                 max_size=_size_rect(ri, "MaxObjectSize")))
         return out
@@ -223,10 +228,14 @@ class HikAdapter:
         max_box = self._frac_rect_to_hik(sc.max_size)
 
         backup_path, current = self.client.backup_behavior_rule(backup_dir)
+        # On edit, sc.native_id is the rule's ruleId (int) -- locate by it so a duplicate
+        # ruleName can't send the patch to the wrong rule. On create it's None -> patch
+        # finds no match and we fall through to insert_or_replace_rule below.
+        edit_id = sc.native_id if isinstance(sc.native_id, int) else None
         patched = hik_config.patch_rule_geometry(
             current, sc.name, region_hik, target=target, duration=sc.duration or None,
             min_box=min_box, max_box=max_box,
-            direction=direction if sc.kind == "line" else None)
+            direction=direction if sc.kind == "line" else None, rule_id=edit_id)
         if patched is not None:                       # edit-in-place: preserves other settings
             self.client.put_behavior_rule(patched)
             return backup_path, self.client.get_behavior_rule()

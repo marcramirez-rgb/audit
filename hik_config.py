@@ -300,18 +300,27 @@ def insert_or_replace_rule(xml_text, rule_el, replace_by_name=True):
 
 
 def patch_rule_geometry(xml_text, rule_name, region_hik, target=None, duration=None,
-                        min_box=None, max_box=None, direction=None):
+                        min_box=None, max_box=None, direction=None, rule_id=None):
     """Edit an EXISTING rule in place: replace its RuleRegion coords (and optionally
     detectionTarget / durationTime / min+max size boxes) while PRESERVING sensitivity,
     backgroundSuppression and everything else. Returns new XML, or None if not found.
     This is the Hik analogue of aoa_config.update_scenario_geometry -- so editing a
     rule doesn't silently drop its config. If min_box+max_box given, the SizeFilter is
-    set (created if absent); otherwise the existing SizeFilter is preserved untouched."""
+    set (created if absent); otherwise the existing SizeFilter is preserved untouched.
+
+    Locates the rule by ruleId when rule_id is given (the true identity -- two rules can
+    share a ruleName, so matching by name would patch the wrong one); otherwise falls
+    back to matching by ruleName."""
     root = ET.fromstring(xml_text)
     for ri in root.findall(".//ns:RuleInfo", NS):
-        nm = ri.find("ns:ruleName", NS)
-        if nm is None or nm.text != rule_name:
-            continue
+        if rule_id is not None:
+            rid = ri.find("ns:ruleId", NS)
+            if rid is None or rid.text != str(rule_id):
+                continue
+        else:
+            nm = ri.find("ns:ruleName", NS)
+            if nm is None or nm.text != rule_name:
+                continue
         if min_box and max_box:
             _set_size_filter(ri, min_box, max_box)
         # Replace the region coordinate list.

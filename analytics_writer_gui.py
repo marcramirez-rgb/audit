@@ -432,6 +432,7 @@ class WriterApp(ctk.CTk):
         self.current_exclude = []      # exclusion polygon currently being drawn
         self.existing_overlays = []    # {name, kind, verts(frac), exclusions} for the canvas
         self.existing_scenarios = []   # neutral vendor_adapter.Scenario list from last read
+        self.edit_label_map = {}       # dropdown display label -> Scenario (disambiguates dup names)
         self.editing = None            # native_id being edited, or None = new
         self.adapter = None            # current vendor adapter
         self.edit_size = []            # [(frac_rect, label)] editable min/max size boxes
@@ -773,6 +774,24 @@ class WriterApp(ctk.CTk):
         (self.class_human.select() if "human" in types else self.class_human.deselect())
         (self.class_vehicle.select() if "vehicle" in types else self.class_vehicle.deselect())
 
+    @staticmethod
+    def _build_edit_labels(scenarios):
+        """Map each scenario to a UNIQUE dropdown label. Two rules can share a name
+        (e.g. two 'RULE1's on a Hik camera); a bare name would collide so both entries
+        point at the first. When a name repeats we append '  #1/#2/...' (display only --
+        the pushed scenario keeps its real name). Preserves read order."""
+        from collections import Counter
+        counts = Counter(s.name for s in scenarios)
+        seen, out = {}, {}
+        for s in scenarios:
+            if counts[s.name] > 1:
+                seen[s.name] = seen.get(s.name, 0) + 1
+                label = f"{s.name}  #{seen[s.name]}"
+            else:
+                label = s.name
+            out[label] = s
+        return out
+
     def _on_edit_select(self, choice):
         if choice == NEW_SCENARIO:
             self.editing = None
@@ -784,7 +803,10 @@ class WriterApp(ctk.CTk):
             self._redraw()
             self._log("[.] New scenario mode.")
             return
-        sc = next((s for s in self.existing_scenarios if s.name == choice), None)
+        sc = self.edit_label_map.get(choice)
+        if sc is None:
+            # Fallback for a plain-name choice (e.g. programmatic set with no dup labels).
+            sc = next((s for s in self.existing_scenarios if s.name == choice), None)
         if sc is None:
             return
         if not self.tk_image:
@@ -1232,7 +1254,8 @@ class WriterApp(ctk.CTk):
         change anything on the camera."""
         had_overlays = bool(self.existing_overlays)
         had_active = bool(self.points or self.exclude_zones or self.current_exclude
-                          or self.edit_size or self.perspective_bars or self.editing)
+                          or self.edit_size or self.perspective_bars
+                          or self.editing is not None)
         if not (had_overlays or had_active):
             self._log("[.] Nothing to clear.")
             return
@@ -1472,7 +1495,8 @@ class WriterApp(ctk.CTk):
                     _, overlays, lines, scenarios = msg
                     self.existing_overlays = overlays
                     self.existing_scenarios = scenarios
-                    names = [NEW_SCENARIO] + [s.name for s in scenarios]
+                    self.edit_label_map = self._build_edit_labels(scenarios)
+                    names = [NEW_SCENARIO] + list(self.edit_label_map.keys())
                     self.edit_menu.configure(values=names)
                     self._redraw()
                     self._log("\n".join(lines))
