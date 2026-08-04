@@ -1,0 +1,16 @@
+# Core dependencies -- everything the apps need to LAUNCH.
+#
+# These are safe to install with pip's --use-feature=truststore fallback
+# (corporate SSL). The Snowflake driver is deliberately NOT in here: it must
+# never be installed with truststore (its vendored urllib3 recurses -- see the
+# note in fleet_catalog.py). setup.bat installs it separately.
+requests==2.34.2
+urllib3==2.7.0
+Pillow==12.2.0
+openpyxl==3.1.5
+customtkinter==6.0.0
+python-dotenv==1.2.2
+
+# AI zone suggestion (zone_suggester.py / suggestion_report.py). Needs an
+# ANTHROPIC_API_KEY in the environment or access.env to actually run.
+anthropic==0.120.2
