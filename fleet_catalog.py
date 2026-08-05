@@ -194,12 +194,15 @@ class SnowflakeSource(CatalogSource):
                 "picker is unavailable. Install it, or switch the picker to the "
                 "cached catalog."
             ) from e
-        missing = [k for k in ("account", "user") if not self._connect_params.get(k)]
-        if missing:
+        if not self._connect_params.get("user"):
+            # account is baked in (SNOWFLAKE_DEFAULTS), so the only thing we can
+            # fail to resolve is the user -- and only when auto-detect came up
+            # empty (e.g. a non-Entra-joined machine).
             raise CatalogError(
-                "Missing Snowflake config: "
-                + ", ".join(f"SNOWFLAKE_{k.upper()}" for k in missing)
-                + ".\nSet them in .env (see .env.example) or switch to the cached catalog."
+                "Couldn't auto-detect your LVT login for Snowflake SSO.\n"
+                "This normally comes from your Windows account automatically. "
+                "If it didn't, set SNOWFLAKE_USER=your.name@lvt.com as an "
+                "environment variable (or in a .env file) and try again."
             )
         try:
             self._conn = snowflake.connector.connect(
@@ -295,14 +298,61 @@ class SnowflakeSource(CatalogSource):
 # Source selection
 # --------------------------------------------------------------------------- #
 
+# LVT's Snowflake org constants -- the SAME for every user, so they're baked in
+# here instead of forcing each person to hand-write a .env. These are NOT secrets
+# (SSO/externalbrowser handles auth; there's no password or key). Any of them can
+# still be overridden by the matching SNOWFLAKE_* env var if that ever changes.
+SNOWFLAKE_DEFAULTS = {
+    "account": "BWXPHOE-LVT",                 # org-account form, NOT the MZA... locator
+    "warehouse": "PRODUCT_WH",
+    "role": "APP-SNOWFLAKE-PRODUCT_ANALYST",
+}
+
+
+def _detect_lvt_user():
+    """Best-effort LVT login (email) for SSO, so no .env is needed on a managed
+    laptop. Order: SNOWFLAKE_USER env override -> the Windows Entra/AD UPN
+    (`whoami /upn`, which is the person's @lvt.com address) -> USERPRINCIPALNAME
+    -> git email. Returns '' if none look like an email."""
+    env = os.environ.get("SNOWFLAKE_USER", "").strip()
+    if env:
+        return env
+    # On Entra/AzureAD-joined LVT laptops the UPN is exactly the login email.
+    try:
+        import subprocess
+        out = subprocess.run(
+            ["whoami", "/upn"], capture_output=True, text=True, timeout=5,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        cand = (out.stdout or "").strip()
+        if "@" in cand:
+            return cand
+    except Exception:
+        pass
+    upn = os.environ.get("USERPRINCIPALNAME", "").strip()
+    if "@" in upn:
+        return upn
+    try:
+        import subprocess
+        out = subprocess.run(
+            ["git", "config", "user.email"], capture_output=True, text=True, timeout=5,
+        )
+        cand = (out.stdout or "").strip()
+        if cand.lower().endswith("@lvt.com"):
+            return cand
+    except Exception:
+        pass
+    return ""
+
+
 def _snowflake_params_from_env():
-    """Read Snowflake connection settings from the environment. Only account +
-    user are required; the rest are passed through when present."""
-    params = {
-        "account": os.environ.get("SNOWFLAKE_ACCOUNT", "").strip(),
-        "user": os.environ.get("SNOWFLAKE_USER", "").strip(),
-    }
+    """Build the Snowflake connect params with zero required setup: LVT's org
+    constants are baked in (SNOWFLAKE_DEFAULTS) and the user is auto-detected, so
+    the picker works on a managed laptop with no .env. Every value is still
+    overridable via the matching SNOWFLAKE_* env var (e.g. from a .env)."""
+    params = dict(SNOWFLAKE_DEFAULTS)
     for env_key, param_key in (
+        ("SNOWFLAKE_ACCOUNT", "account"),
         ("SNOWFLAKE_WAREHOUSE", "warehouse"),
         ("SNOWFLAKE_ROLE", "role"),
         ("SNOWFLAKE_DATABASE", "database"),
@@ -311,6 +361,9 @@ def _snowflake_params_from_env():
         val = os.environ.get(env_key, "").strip()
         if val:
             params[param_key] = val
+    user = _detect_lvt_user()
+    if user:
+        params["user"] = user
     return {k: v for k, v in params.items() if v}
 
 
