@@ -193,6 +193,9 @@ environment.
 | `ModuleNotFoundError` on launch | Setup hasn't run on this machine — double-click `setup.bat` and wait for "Setup complete!" |
 | `'python' is not recognized` | Python isn't on PATH. Either reinstall Python with "Add python.exe to PATH" ticked, or just run `setup.bat` — it finds Python without PATH |
 | `pip` fails with SSL / "certificate verify failed" | Corporate network inspection. `setup.bat` handles it automatically (truststore + trusted-host fallback). Manual: `pip install --use-feature=truststore -r requirements.txt` |
+| Fleet Picker: `snowflake-connector-python is not installed` | Driver didn't install. Run `".venv\Scripts\python.exe" -m pip install --use-feature=truststore "snowflake-connector-python[secure-local-storage]==4.7.1"`. See **Fleet Picker (Snowflake)** |
+| Fleet Picker: `Missing Snowflake config` / `Catalog file not found` | No `.env`. Copy `.env.example` → `.env` and set `SNOWFLAKE_USER` to your LVT email (account `BWXPHOE-LVT` is already filled in) |
+| Fleet Picker: `404` on auth / can't reach account | You used the account *locator* (`MZA23640…`). Use the org-account form `BWXPHOE-LVT` |
 | Terminal window flashes and vanishes when launching the GUI | Startup crash — run `setup.bat` first. The `Run *.bat` launchers keep the window open on crash so you can read the error |
 | GUI window won't open / import error | Make sure `audit_gui.py` and `camera_engine.py` are in the same folder — the GUI imports the engine module directly |
 | Verify the status of true 401 errors in VMS. If the unit is online, but errored out, try running a single unit audit on that unit. It could be the unit is in an area with poor connectivity
@@ -209,13 +212,77 @@ environment.
 | `combined.py` | Terminal/CLI version, same engine |
 | `camera_engine.py` | All camera-fetching, parsing, and report-generation logic. No UI code. |
 | `requirements.txt` | Pinned dependency versions |
-| `.env.example` | Template for local credential env vars (currently unused by either entry point — see note in the file) |
+| `.env.example` | Template for `.env`. Camera-credential vars are unused (both GUIs prompt fresh); the **`SNOWFLAKE_*`** vars **are** used by the Fleet Picker — copy to `.env` and set `SNOWFLAKE_USER`. See **Fleet Picker (Snowflake)** |
+| `fleet_catalog.py` | Snowflake/offline-CSV data layer behind the Fleet Picker (Client → Location → TDC → camera rows) |
 
 
-## Getting data
-| In snowflake you will want to use the below query:
-| SELECT
-    nc.PUBLIC_IP AS IP, 
+## Fleet Picker (Snowflake) — pick a unit instead of typing IPs
+
+Both GUIs can pull the fleet straight from Snowflake so you select
+**Client → Location → TDC** from dropdowns instead of hand-typing IPs:
+
+- **Audit Report GUI** — the **Fleet Picker** tab (build a multi-client batch, no CSV).
+- **Analytics Writer GUI** — the **Pick from fleet…** button (fill IP + vendor for one camera).
+
+Auth is **SSO / externalbrowser**: the first query opens your browser for the
+LVT (Okta) login. **No password or key is stored** — the browser handles it, and
+the login token is cached so you're not prompted every launch.
+
+### One-time setup (two steps)
+
+**1. The Snowflake driver.** `setup.bat` installs it automatically (including the
+corporate-SSL fallback). When setup finishes, check the summary line:
+
+```
+Snowflake driver: installed - live Fleet Picker ready
+```
+
+If it instead says **`MISSING`**, or the picker later shows
+**"snowflake-connector-python is not installed"**, install just the driver with:
+
+```
+".venv\Scripts\python.exe" -m pip install --use-feature=truststore "snowflake-connector-python[secure-local-storage]==4.7.1"
+```
+
+**2. Your `.env` file.** The driver installing is not enough — the app also needs
+to know *who* is logging in. Copy **`.env.example`** to **`.env`** and set your own
+user (the account is already filled in):
+
+```
+SNOWFLAKE_ACCOUNT=BWXPHOE-LVT          # already correct — do NOT use the MZA... locator
+SNOWFLAKE_USER=your.name@lvt.com       # <-- YOUR LVT email
+SNOWFLAKE_WAREHOUSE=PRODUCT_WH
+SNOWFLAKE_ROLE=APP-SNOWFLAKE-PRODUCT_ANALYST
+```
+
+`.env` is gitignored — everyone makes their own; it's never committed or shared.
+Without it, the picker silently falls back to an offline cached CSV (if present)
+instead of connecting live.
+
+### Requesting access
+
+Access is requested through **Okta** — the `APP-SNOWFLAKE-PRODUCT_ANALYST` role
+(warehouse `PRODUCT_WH`). Until your account has that role the browser login will
+succeed but queries will fail with a permissions error.
+
+### If it won't connect
+
+| Message in the picker | Fix |
+|---|---|
+| `snowflake-connector-python is not installed` | Run the driver install command above (setup step 1). |
+| `Missing Snowflake config: SNOWFLAKE_ACCOUNT/USER` | Create `.env` from `.env.example` (setup step 2). |
+| `Catalog file not found` | Same as above — no `.env`, and no offline `fleet_catalog.csv` to fall back to. Make the `.env`. |
+| `404` on the auth endpoint / can't reach the account | You used the locator (`MZA23640…`). Use the org-account form **`BWXPHOE-LVT`**. |
+| Browser login works but queries fail with a permission error | Your Okta role isn't granted yet — request `APP-SNOWFLAKE-PRODUCT_ANALYST`. |
+
+### Getting the data as a CSV (manual, no picker)
+
+The Fleet Picker runs the query below for you. To build a bulk-upload CSV by hand
+instead, run it in Snowflake — the CSV **must** have these 6 columns:
+
+```sql
+SELECT
+    nc.PUBLIC_IP AS IP,
     lu.LIVE_UNIT_SERIAL_NR AS LIVE_UNIT_SERIAL_NM,
     lu.LOCATION_NM,
     lu.CLIENT_NM,
@@ -226,10 +293,10 @@ JOIN EDW.DM_PRODUCT.LIVE_UNIT lu
     ON nc.LIVE_UNIT_ID = lu.LIVE_UNIT_ID
 LEFT JOIN STAGING.HORUS.CAMERA_MFTRS cm
     ON nc.CAMERA_MFTRS_ID = cm.ID
-WHERE lu.live_unit_serial_nr in ('TDC14016')
+WHERE lu.live_unit_serial_nr IN ('TDC14016')
 GROUP BY lu.CLIENT_NM, lu.LOCATION_NM, nc.PUBLIC_IP, lu.LIVE_UNIT_SERIAL_NR, cm.MANUFACTURER, cm.MODEL
 ORDER BY lu.LOCATION_NM
-|Use whatever filtering clause you want to retrieve the data but it the csv file for bulk upload most have those 6 columns. For bulk data collection, you should be querying on the client_nm and with accounts with a flattened heirarchy, you should include a location filter for 'sub clients'
+```
 
-## Snowflake access
-Access can be requested in via Okta 
+Use whatever filter you want. For bulk collection, query on `CLIENT_NM`; for
+accounts with a flattened hierarchy, also add a `LOCATION_NM` filter for sub-clients. 
