@@ -194,8 +194,8 @@ environment.
 | `'python' is not recognized` | Python isn't on PATH. Either reinstall Python with "Add python.exe to PATH" ticked, or just run `setup.bat` — it finds Python without PATH |
 | `pip` fails with SSL / "certificate verify failed" | Corporate network inspection. `setup.bat` handles it automatically (truststore + trusted-host fallback). Manual: `pip install --use-feature=truststore -r requirements.txt` |
 | Fleet Picker: `snowflake-connector-python is not installed` | Driver didn't install. Run `".venv\Scripts\python.exe" -m pip install --use-feature=truststore "snowflake-connector-python[secure-local-storage]==4.7.1"`. See **Fleet Picker (Snowflake)** |
-| Fleet Picker: `Missing Snowflake config` / `Catalog file not found` | No `.env`. Copy `.env.example` → `.env` and set `SNOWFLAKE_USER` to your LVT email (account `BWXPHOE-LVT` is already filled in) |
-| Fleet Picker: `404` on auth / can't reach account | You used the account *locator* (`MZA23640…`). Use the org-account form `BWXPHOE-LVT` |
+| Fleet Picker: `Couldn't auto-detect your LVT login` | Rare (non-Entra-joined machine). Set env var `SNOWFLAKE_USER=your.name@lvt.com` and retry |
+| Fleet Picker: browser login works but queries fail on permissions | Okta role not granted — request `APP-SNOWFLAKE-PRODUCT_ANALYST` |
 | Terminal window flashes and vanishes when launching the GUI | Startup crash — run `setup.bat` first. The `Run *.bat` launchers keep the window open on crash so you can read the error |
 | GUI window won't open / import error | Make sure `audit_gui.py` and `camera_engine.py` are in the same folder — the GUI imports the engine module directly |
 | Verify the status of true 401 errors in VMS. If the unit is online, but errored out, try running a single unit audit on that unit. It could be the unit is in an area with poor connectivity
@@ -212,7 +212,7 @@ environment.
 | `combined.py` | Terminal/CLI version, same engine |
 | `camera_engine.py` | All camera-fetching, parsing, and report-generation logic. No UI code. |
 | `requirements.txt` | Pinned dependency versions |
-| `.env.example` | Template for `.env`. Camera-credential vars are unused (both GUIs prompt fresh); the **`SNOWFLAKE_*`** vars **are** used by the Fleet Picker — copy to `.env` and set `SNOWFLAKE_USER`. See **Fleet Picker (Snowflake)** |
+| `.env.example` | Template for an optional `.env`. Not needed normally — camera creds are prompted fresh, and Snowflake config is baked in + auto-detected. Only for overrides (e.g. a non-Entra machine that needs `SNOWFLAKE_USER`) |
 | `fleet_catalog.py` | Snowflake/offline-CSV data layer behind the Fleet Picker (Client → Location → TDC → camera rows) |
 
 
@@ -224,56 +224,46 @@ Both GUIs can pull the fleet straight from Snowflake so you select
 - **Audit Report GUI** — the **Fleet Picker** tab (build a multi-client batch, no CSV).
 - **Analytics Writer GUI** — the **Pick from fleet…** button (fill IP + vendor for one camera).
 
-Auth is **SSO / externalbrowser**: the first query opens your browser for the
-LVT (Okta) login. **No password or key is stored** — the browser handles it, and
-the login token is cached so you're not prompted every launch.
+**There's nothing to configure — no `.env` file.** LVT's Snowflake
+account/warehouse/role are built into the app, and your login is auto-detected
+from your Windows (Entra) account. Auth is **SSO / externalbrowser**: the first
+query opens your browser for the LVT (Okta) login. **No password or key is
+stored** — the browser handles it, and the login token is cached so you're not
+prompted every launch.
 
-### One-time setup (two steps)
+So on a normal LVT laptop: run `setup.bat` once, open the picker, log in through
+the browser when it pops up. That's it.
 
-**1. The Snowflake driver.** `setup.bat` installs it automatically (including the
-corporate-SSL fallback). When setup finishes, check the summary line:
+### The only requirement: the Snowflake driver
+
+`setup.bat` installs it automatically (with the corporate-SSL fallback). When
+setup finishes, the summary line should read:
 
 ```
 Snowflake driver: installed - live Fleet Picker ready
 ```
 
-If it instead says **`MISSING`**, or the picker later shows
-**"snowflake-connector-python is not installed"**, install just the driver with:
+If it says **`MISSING`**, or the picker shows **"snowflake-connector-python is
+not installed"**, install just the driver with:
 
 ```
 ".venv\Scripts\python.exe" -m pip install --use-feature=truststore "snowflake-connector-python[secure-local-storage]==4.7.1"
 ```
 
-**2. Your `.env` file.** The driver installing is not enough — the app also needs
-to know *who* is logging in. Copy **`.env.example`** to **`.env`** and set your own
-user (the account is already filled in):
-
-```
-SNOWFLAKE_ACCOUNT=BWXPHOE-LVT          # already correct — do NOT use the MZA... locator
-SNOWFLAKE_USER=your.name@lvt.com       # <-- YOUR LVT email
-SNOWFLAKE_WAREHOUSE=PRODUCT_WH
-SNOWFLAKE_ROLE=APP-SNOWFLAKE-PRODUCT_ANALYST
-```
-
-`.env` is gitignored — everyone makes their own; it's never committed or shared.
-Without it, the picker silently falls back to an offline cached CSV (if present)
-instead of connecting live.
-
 ### Requesting access
 
-Access is requested through **Okta** — the `APP-SNOWFLAKE-PRODUCT_ANALYST` role
-(warehouse `PRODUCT_WH`). Until your account has that role the browser login will
-succeed but queries will fail with a permissions error.
+Access is requested through **Okta** — the `APP-SNOWFLAKE-PRODUCT_ANALYST` role.
+Until your account has that role the browser login will succeed but queries will
+fail with a permissions error.
 
 ### If it won't connect
 
 | Message in the picker | Fix |
 |---|---|
-| `snowflake-connector-python is not installed` | Run the driver install command above (setup step 1). |
-| `Missing Snowflake config: SNOWFLAKE_ACCOUNT/USER` | Create `.env` from `.env.example` (setup step 2). |
-| `Catalog file not found` | Same as above — no `.env`, and no offline `fleet_catalog.csv` to fall back to. Make the `.env`. |
-| `404` on the auth endpoint / can't reach the account | You used the locator (`MZA23640…`). Use the org-account form **`BWXPHOE-LVT`**. |
+| `snowflake-connector-python is not installed` | Run the driver install command above. |
+| `Couldn't auto-detect your LVT login` | Rare (non-Entra-joined machine). Set an env var `SNOWFLAKE_USER=your.name@lvt.com` (or put it in a `.env`) and retry. |
 | Browser login works but queries fail with a permission error | Your Okta role isn't granted yet — request `APP-SNOWFLAKE-PRODUCT_ANALYST`. |
+| Auto-detect picked the wrong email | Override it: set `SNOWFLAKE_USER=your.name@lvt.com`. |
 
 ### Getting the data as a CSV (manual, no picker)
 
