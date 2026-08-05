@@ -916,21 +916,33 @@ def _draw_crossing_direction(draw, p0, p1, direction):
         nx, ny = -dpy / length, dpx / length
     mx, my = (x0 + x1) / 2.0, (y0 + y1) / 2.0
     arm = 42
-    color = (0, 229, 218, 255)
+    color = (0, 229, 218, 255)      # teal fill
+    edge = (0, 40, 38, 200)         # dark edge for contrast on any background
+    head_len = 20.0                 # length of the triangular head along the shaft
+    head_half = 9.0                 # half-width of the head base
     bidir = (str(direction) == "any")
     start = (mx - nx * arm, my - ny * arm) if bidir else (mx, my)
     tip = (mx + nx * arm, my + ny * arm)
-    draw.line([start, tip], fill=color, width=3)
 
-    def _head(at, toward):
-        ang = math.atan2(at[1] - toward[1], at[0] - toward[0])
-        for da in (math.radians(28), math.radians(-28)):
-            draw.line([at, (at[0] + 14 * math.cos(ang + da), at[1] + 14 * math.sin(ang + da))],
-                      fill=color, width=3)
+    def _filled_head(at, dirx, diry):
+        """Solid triangle pointing along (dirx, diry) with its point at `at`."""
+        base = (at[0] - dirx * head_len, at[1] - diry * head_len)
+        px, py = -diry, dirx  # perpendicular unit vector
+        left = (base[0] + px * head_half, base[1] + py * head_half)
+        right = (base[0] - px * head_half, base[1] - py * head_half)
+        draw.polygon([at, left, right], fill=color, outline=edge)
+        return base
 
-    _head(tip, start)
+    # Shaft: stop short of each head's base so the triangle reads as the point,
+    # not a blob on the end of the line. Draw a dark underlay first for contrast.
+    tip_base = (tip[0] - nx * head_len, tip[1] - ny * head_len)
+    shaft_start = (start[0] + nx * head_len, start[1] + ny * head_len) if bidir else start
+    draw.line([shaft_start, tip_base], fill=edge, width=6)
+    draw.line([shaft_start, tip_base], fill=color, width=3)
+
+    _filled_head(tip, nx, ny)
     if bidir:
-        _head(start, tip)
+        _filled_head(start, -nx, -ny)
 
 
 def render_overlay_image(camera_image, vertices, index, img_w, img_h, rule_type="",
