@@ -71,8 +71,9 @@ echo Upgrading pip ...
 if errorlevel 1 "%VENV_PY%" -m pip install --use-feature=truststore --upgrade pip >nul 2>&1
 
 REM --- 4. Install CORE packages (three-tier fallback) ------------------
-REM These are safe to install with truststore. The Snowflake driver is
-REM installed separately below because truststore breaks it.
+REM Installed separately from the Snowflake driver only so the driver gets
+REM its own import check + clear status line -- both use the same truststore
+REM fallback for corporate SSL.
 echo.
 echo Installing core packages from requirements-core.txt ...
 echo.
@@ -106,21 +107,32 @@ echo Verifying the core install ...
 if errorlevel 1 goto :verifyfail
 
 REM --- 6. Install the Snowflake driver (live Fleet Picker) -------------
-REM IMPORTANT: never use --use-feature=truststore here. Snowflake's vendored
-REM urllib3 recurses with it ("250003: maximum recursion depth exceeded"),
-REM which is how this package used to silently fail to install while the app
-REM still launched. Its endpoint uses a publicly-trusted cert, so a normal
-REM install works; trusted-host is the only fallback we allow.
+REM Same three-tier fallback as the core packages. IMPORTANT distinction:
+REM pip's --use-feature=truststore only changes how pip VERIFIES THE DOWNLOAD
+REM (it trusts the Windows cert store, where IT installs the corporate CA). It
+REM does NOT change the installed driver's runtime TLS. The old "250003 maximum
+REM recursion" bug was the APP calling truststore.inject_into_ssl() at RUNTIME
+REM (fleet_catalog.py no longer does that) -- a completely separate thing from
+REM this install step. On SSL-inspected laptops the truststore tier is exactly
+REM what makes the download succeed, same as the core packages above.
 echo.
 echo Installing the Snowflake driver for the live Fleet Picker ...
 echo.
 
-echo   [1/2] Trying a normal install ...
+echo   [1/3] Trying a normal install ...
 "%VENV_PY%" -m pip install "%SNOWFLAKE_PKG%"
 if not errorlevel 1 goto :snowflake_ok
 
 echo.
-echo   [2/2] Retrying in trusted-host mode (corporate SSL) ...
+echo   [2/3] Normal install failed - retrying via the Windows certificate
+echo         store (corporate SSL inspection: Zscaler / Netskope) ...
+echo.
+"%VENV_PY%" -m pip install --use-feature=truststore "%SNOWFLAKE_PKG%"
+if not errorlevel 1 goto :snowflake_ok
+
+echo.
+echo   [3/3] Still failing - retrying in trusted-host mode (skips SSL
+echo         checking for the PyPI download hosts only) ...
 echo.
 "%VENV_PY%" -m pip install --trusted-host pypi.org --trusted-host files.pythonhosted.org --trusted-host pypi.python.org "%SNOWFLAKE_PKG%"
 if not errorlevel 1 goto :snowflake_ok
@@ -133,10 +145,9 @@ echo   [WARNING] The Snowflake driver did not install.
 echo.
 echo   The apps will still run, but the live Fleet Picker will show
 echo   "snowflake-connector-python is not installed". You can retry
-echo   just the driver later with this one command (do NOT add
-echo   truststore to it):
+echo   just the driver later with this one command:
 echo.
-echo     ".venv\Scripts\python.exe" -m pip install --trusted-host pypi.org --trusted-host files.pythonhosted.org "%SNOWFLAKE_PKG%"
+echo     ".venv\Scripts\python.exe" -m pip install --use-feature=truststore "%SNOWFLAKE_PKG%"
 echo.
 echo   If it keeps failing, copy the error above and send it to Marc.
 echo ------------------------------------------------------------
