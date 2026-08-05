@@ -1106,6 +1106,13 @@ class WriterApp(ctk.CTk):
         for i, p in enumerate(self.current_bar):
             if near(p):
                 return ("current_bar", i)
+        # Min/max size-box corners (rects stored as fractions; derive canvas corners).
+        for si, (rect, _lbl) in enumerate(self.edit_size):
+            fx, fy, fw, fh = rect
+            corners = ((fx, fy), (fx + fw, fy), (fx + fw, fy + fh), (fx, fy + fh))
+            for ci, (cfx, cfy) in enumerate(corners):
+                if near(self._frac_to_canvas(cfx, cfy)):
+                    return ("size", si, ci)
         return None
 
     def _set_vertex(self, target, x, y):
@@ -1120,6 +1127,14 @@ class WriterApp(ctk.CTk):
             self.perspective_bars[target[1]]["points"][target[2]] = (x, y)
         elif kind == "current_bar":
             self.current_bar[target[1]] = (x, y)
+        elif kind == "size":
+            # target = ("size", box_index, (anchor_fx, anchor_fy)); resize the rect so the
+            # grabbed corner follows the mouse while the opposite corner stays pinned.
+            si, (ax, ay) = target[1], target[2]
+            fx, fy = self._canvas_to_frac(x, y)
+            rect = (min(ax, fx), min(ay, fy), abs(fx - ax), abs(fy - ay))
+            _r, lbl = self.edit_size[si]
+            self.edit_size[si] = (rect, lbl)
 
     def _on_canvas_drag(self, event):
         if self.drag_target is None:
@@ -1140,7 +1155,15 @@ class WriterApp(ctk.CTk):
         # it instead of adding a new point (works in any mode, like the Axis web UI).
         target = self._find_vertex(event.x, event.y)
         if target is not None:
-            self.drag_target = target
+            if target[0] == "size":
+                # Pin the diagonally-opposite corner (in fractions) for the whole drag so
+                # the box resizes cleanly and can't flip-flop as corners cross over.
+                _, si, ci = target
+                fx, fy, fw, fh = self.edit_size[si][0]
+                corners = ((fx, fy), (fx + fw, fy), (fx + fw, fy + fh), (fx, fy + fh))
+                self.drag_target = ("size", si, corners[(ci + 2) % 4])
+            else:
+                self.drag_target = target
             return
         # ignore clicks outside the image area
         ix, iy = self._canvas_to_image_px(event.x, event.y)
