@@ -60,6 +60,7 @@ WRITE_ENABLED = True
 
 CANVAS_W, CANVAS_H = 900, 506  # 16:9 drawing surface
 BACKUP_DIR = Path(__file__).with_name("aoa_backups")
+HIK_BACKUP_DIR = Path(__file__).with_name("hik_backups")
 
 
 def save_snapshot_pair(backup_path, pil_img):
@@ -1425,7 +1426,7 @@ class WriterApp(ctk.CTk):
 
         self.push_button.configure(state="disabled", text="Pushing...")
         self._log(f"[*] Backing up + pushing '{sc.name}' to {adapter.vendor} {ip}:{port} ...")
-        backup_dir = "hik_backups" if adapter.vendor == "Hikvision" else BACKUP_DIR
+        backup_dir = HIK_BACKUP_DIR if adapter.vendor == "Hikvision" else BACKUP_DIR
 
         snapshot_img = self.pil_image  # frame the zone was drawn on; save it beside the backup
 

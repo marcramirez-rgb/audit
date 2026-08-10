@@ -47,6 +47,18 @@ LINE_VERTS = 2        # line-crossing tripwire
 LINE_DIRECTIONS = ("left-right", "right-left", "any")
 
 
+def _debug_dump_push(ip, port, channel, xml_text):
+    """Temporary diagnostic: record the exact outgoing PUT body for the 400
+    badParameter investigation, since the request never touches disk otherwise and a
+    failure gives no way to see what was actually sent. Overwrites one file per call
+    (not a growing log) -- gitignored, local-only."""
+    out_dir = Path("hik_push_debug")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%dT%H%M%S")
+    (out_dir / f"last_push_{ip.replace('.', '_')}_{port}_ch{channel}.xml").write_text(
+        f"<!-- sent {stamp} to {ip}:{port} ch{channel} -->\n" + xml_text, encoding="utf-8")
+
+
 class HikError(RuntimeError):
     """Camera reached but reported a logical failure (ISAPI ResponseStatus)."""
 
@@ -100,7 +112,11 @@ class HikClient:
             sub = _status_of(r.text)
             if r.status_code == 200 and (sub is None or sub in ("ok", "1")):
                 return r.text
-            last = f"HTTP {r.status_code}" + (f" ({sub})" if sub else f": {r.text[:200]}")
+            # Keep the full body even when a subStatusCode is found -- ISAPI often
+            # carries an errorCode/errorMsg alongside it naming the actual bad field,
+            # which a bare "(badParameter)" tag throws away.
+            detail = (r.text or "").strip()[:500]
+            last = f"HTTP {r.status_code}" + (f" ({sub})" if sub else "") + (f": {detail}" if detail else "")
             if r.status_code != 401:
                 raise HikError(last)
         if saw_401:
@@ -112,6 +128,7 @@ class HikClient:
         return self._request("GET")
 
     def put_behavior_rule(self, xml_text):
+        _debug_dump_push(self.ip, self.port, self.channel, xml_text)
         return self._request("PUT", body=xml_text.encode("utf-8"))
 
     def backup_behavior_rule(self, backup_dir):
