@@ -204,26 +204,39 @@ class HikAdapter:
         return img
 
     def read_scenarios(self):
-        scenarios = self._parse_scenarios(self.client.get_behavior_rule())
+        # Hik's optical(1)/thermal(2) split means a camera can carry rules on only one
+        # of the two channels -- and on single-imager units the other channel may not
+        # even exist (the GET errors instead of returning an empty document). The GUI's
+        # channel picker is just a guess, so mirror camera_engine.fetch_analytics()
+        # (the fleet audit's path): probe the selected channel, and if it errors OR has
+        # no rules, probe the sibling. The client is left stuck on whichever channel
+        # actually holds rules (or the only one that answers) so a later edit/push
+        # patches the right document instead of creating a duplicate on the empty one.
+        original = self.client.channel
+        primary_err = None
+        try:
+            scenarios = self._parse_scenarios(self.client.get_behavior_rule())
+        except Exception as e:
+            scenarios, primary_err = [], e
         if scenarios:
             return scenarios
-        # Nothing on the selected channel -- Hik's optical(1)/thermal(2) split means a
-        # camera can carry rules on only one of the two, and the GUI's channel picker is
-        # just a guess. camera_engine.fetch_analytics() (used by the fleet audit) already
-        # probes both and takes whichever answers; mirror that here so the writer doesn't
-        # report "0 configured" on a rule-less channel while the sibling channel has one.
-        # Sticks the client on the channel that actually answered so a later edit/push
-        # patches the right document instead of creating a duplicate on the empty one.
-        alt = "1" if self.client.channel == "2" else "2"
-        original = self.client.channel
-        self.client.channel = alt
+
+        self.client.channel = "1" if original == "2" else "2"
         try:
             alt_scenarios = self._parse_scenarios(self.client.get_behavior_rule())
         except Exception:
-            alt_scenarios = []
+            # Sibling channel is no better; put the selection back and report the
+            # selected channel's own failure if it had one.
+            self.client.channel = original
+            if primary_err is not None:
+                raise primary_err
+            return []
         if alt_scenarios:
             return alt_scenarios
-        self.client.channel = original
+        # Both channels answered but neither has rules. Stay on the sibling only when
+        # the selected channel is actually broken (it's then the only writable one).
+        if primary_err is None:
+            self.client.channel = original
         return []
 
     @staticmethod
@@ -340,6 +353,12 @@ def _size_rect(rule_el, box_tag):
         return int(n.text) if n is not None and (n.text or "").isdigit() else None
     x, y, w, h = g("positionX"), g("positionY"), g("width"), g("height")
     if None in (x, y, w, h):
+        return None
+    # Zero-area boxes (seen live on 10.23.39.254:5015) are firmware placeholders, not
+    # a real size filter -- treat as absent so we don't draw a degenerate rect or
+    # round-trip it through an edit (patch_rule_geometry then leaves the camera's
+    # SizeFilter untouched).
+    if not w or not h:
         return None
     return (x / 1000.0, 1 - (y + h) / 1000.0, w / 1000.0, h / 1000.0)
 

@@ -1620,7 +1620,16 @@ class WriterApp(ctk.CTk):
         env_file = Path(__file__).with_name("access.env")
         if (not user or not password) and env_file.exists():
             try:
-                env = dict(re.findall(r"^([A-Z_]+)=(.*)$", env_file.read_text(), re.M))
+                # Guard against a mangled append (PowerShell `>>` writes UTF-16 and a
+                # file without a trailing newline glues the new line onto the last
+                # value) -- that once corrupted HIK_PASSWORD and made every Hik read
+                # in this GUI fail auth. Strip NULs, then truncate any value that has
+                # another VAR= assignment fused onto it.
+                text = env_file.read_text(errors="ignore").replace("\0", "")
+                env = {}
+                for k, v in re.findall(r"^([A-Z_]+)=(.*)$", text, re.M):
+                    glued = re.search(r"[A-Z][A-Z_]{2,}=", v)
+                    env[k] = (v[:glued.start()] if glued else v).strip()
                 user = user or env.get(f"{prefix}_USER")
                 password = password or env.get(f"{prefix}_PASSWORD") or env.get(f"{prefix}_PASS")
             except OSError:
