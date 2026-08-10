@@ -821,10 +821,11 @@ class WriterApp(ctk.CTk):
         """Map each scenario to a UNIQUE dropdown label. Operators often reuse one
         name for many zones ('RULE1' x6 on a real thermal unit), so a bare name would
         collide and every entry would point at the first. Duplicates get '  #n' plus
-        what actually differs -- classes/duration and, for Hik, the (channel, scene,
-        ruleId) address the rule lives at. Display only: the pushed scenario keeps
-        its real name. Selecting an entry also highlights its zone on the canvas,
-        which is the real disambiguator. Preserves read order."""
+        classes/duration. The rule's technical address (channel/scene/ruleId) is
+        deliberately NOT shown -- it confused operators; it stays inside native_id so
+        the push still targets the exact rule, and selecting an entry highlights its
+        zone on the canvas, which is the real disambiguator. Display only: the pushed
+        scenario keeps its real name. Preserves read order."""
         from collections import Counter
         counts = Counter(s.name for s in scenarios)
         seen, out = {}, {}
@@ -834,9 +835,6 @@ class WriterApp(ctk.CTk):
                 label = f"{s.name}  #{seen[s.name]} · {'+'.join(s.classes)}"
                 if s.duration:
                     label += f" · {s.duration}s"
-                if isinstance(s.native_id, tuple):
-                    ch, sid, rid = s.native_id
-                    label += f" (ch{ch} s{sid} r{rid})"
             else:
                 label = s.name
             out[label] = s
