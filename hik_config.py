@@ -52,7 +52,7 @@ def _debug_dump_push(ip, port, channel, xml_text):
     badParameter investigation, since the request never touches disk otherwise and a
     failure gives no way to see what was actually sent. Overwrites one file per call
     (not a growing log) -- gitignored, local-only."""
-    out_dir = Path("hik_push_debug")
+    out_dir = Path(__file__).with_name("hik_push_debug")
     out_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%dT%H%M%S")
     (out_dir / f"last_push_{ip.replace('.', '_')}_{port}_ch{channel}.xml").write_text(
