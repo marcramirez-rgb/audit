@@ -472,14 +472,25 @@ class WriterApp(ctk.CTk):
 
     def _on_mfg_change(self, _value=None):
         mfg = self.mfg_var.get()
-        # Hik needs a channel; Axis doesn't.
+        # Hik needs a fixed channel; Axis instead gets an (optional) sensor picker
+        # for multi-sensor units.
         if vendor_adapter.camera_engine.classify_manufacturer(mfg) == "HIKVISION":
             self.channel_frame.pack(fill="x", padx=12, pady=4, after=self.ip_entry)
+            self.axis_sensor_frame.pack_forget()
         else:
             self.channel_frame.pack_forget()
+            self.axis_sensor_frame.pack(fill="x", padx=12, pady=4, after=self.ip_entry)
         self.adapter = None  # force rebuild on next action
         self._prefill_credentials()
         self._apply_capabilities()
+
+    def _on_axis_sensor_change(self):
+        self.adapter = None  # force rebuild so the new sensor takes effect
+        self.tk_image = None  # stale snapshot was from a different sensor
+
+    def _axis_sensor_or_none(self):
+        v = self.axis_sensor_var.get()
+        return None if v == "Auto" else v
 
     def _open_fleet_picker(self):
         FleetPickerDialog(self, self._apply_fleet_pick)
@@ -578,6 +589,19 @@ class WriterApp(ctk.CTk):
                      text_color=LVT_TEXT_MUTED, font=ctk.CTkFont(size=10)).pack(anchor="w")
         self.channel_var = tk.StringVar(value="2")
         ctk.CTkOptionMenu(self.channel_frame, values=["1", "2"], variable=self.channel_var,
+                          fg_color=LVT_TEAL, button_color=LVT_DARK_TEAL,
+                          button_hover_color=LVT_DARK_TEAL_HOVER).pack(fill="x")
+        # packed/unpacked by _on_mfg_change
+
+        # Axis-only: which physical sensor on a multi-sensor unit (e.g. P3747, verified
+        # against a real 10.23.135.24:5010). "Auto" (default) means an ordinary
+        # single-sensor camera -- behaves exactly as before this was added.
+        self.axis_sensor_frame = ctk.CTkFrame(side, fg_color="transparent")
+        ctk.CTkLabel(self.axis_sensor_frame, text="Sensor (multi-sensor units only, e.g. P3747)",
+                     text_color=LVT_TEXT_MUTED, font=ctk.CTkFont(size=10)).pack(anchor="w")
+        self.axis_sensor_var = tk.StringVar(value="Auto")
+        ctk.CTkOptionMenu(self.axis_sensor_frame, values=["Auto", "1", "2", "3", "4"],
+                          variable=self.axis_sensor_var, command=lambda _v: self._on_axis_sensor_change(),
                           fg_color=LVT_TEAL, button_color=LVT_DARK_TEAL,
                           button_hover_color=LVT_DARK_TEAL_HOVER).pack(fill="x")
         # packed/unpacked by _on_mfg_change
@@ -883,10 +907,12 @@ class WriterApp(ctk.CTk):
         if not (ip and user and password):
             self._log("[!] Enter IP, username, and password first.")
             return None
+        is_axis = vendor_adapter.camera_engine.classify_manufacturer(self.mfg_var.get()) == "AXIS"
+        channel = self._axis_sensor_or_none() if is_axis else self.channel_var.get()
         try:
             self.adapter = vendor_adapter.make_adapter(
                 self.mfg_var.get(), ip, self._port(), user, password,
-                channel=self.channel_var.get())
+                channel=channel)
         except Exception as e:
             self._log(f"[!] {e}")
             return None
@@ -1441,11 +1467,14 @@ class WriterApp(ctk.CTk):
             return
 
         ip, port = self.ip_entry.get().strip(), self._port()
+        sensor_txt = ""
+        if adapter.vendor == "Axis" and getattr(adapter, "device_id", None):
+            sensor_txt = f", sensor {adapter.device_id}"
         excl_txt = f"\n{len(sc.exclusions)} exclusion zone(s) included." if sc.exclusions else ""
         verb = "Update existing scenario" if self.editing is not None else "Push new scenario"
         if not messagebox.askyesno(
             "Confirm live write",
-            f"{verb} '{sc.name}' ({sc.kind}) on {adapter.vendor}\n{ip}:{port}?{excl_txt}\n\n"
+            f"{verb} '{sc.name}' ({sc.kind}) on {adapter.vendor}\n{ip}:{port}{sensor_txt}?{excl_txt}\n\n"
             f"The current config is backed up first, and other scenarios are preserved. "
             f"This changes live camera analytics."):
             self._log("[.] Push cancelled.")

@@ -58,11 +58,17 @@ class AOAClient:
     """One camera + one port. Cheap to construct; opens a session lazily."""
 
     def __init__(self, ip, user, password, port, api_version=DEFAULT_API_VERSION,
-                 use_https=False, session=None):
+                 use_https=False, session=None, channel_idx=None):
         self.ip = ip
         self.port = str(port)
         self.user = user
         self.api_version = api_version
+        # Which physical sensor to fetch a snapshot from on a multi-sensor Axis unit
+        # (e.g. P3747) via VAPIX's `camera=` param. None -- the vast majority of Axis
+        # cameras -- keeps the plain single-sensor snapshot URL. getConfiguration/
+        # setConfiguration are unaffected: that config is global per port regardless
+        # of sensor count (see camera_engine.get_analytics_device_ids).
+        self.channel_idx = int(channel_idx) if channel_idx else None
         self.scheme = "https" if use_https else "http"
         # Same order the audit engine uses: digest first, basic fallback.
         self.auth_strategies = [HTTPDigestAuth(user, password), HTTPBasicAuth(user, password)]
@@ -159,7 +165,7 @@ class AOAClient:
     def fetch_snapshot(self):
         """PIL image for the drawing surface. Delegates to the audit engine's Axis
         snapshot logic (GET->POST fallback, both auth strategies)."""
-        img, url, err, auth_rejected = self._axis.fetch_snapshot(self.session, self.port)
+        img, url, err, auth_rejected = self._axis.fetch_snapshot(self.session, self.port, channel_idx=self.channel_idx)
         if img is None:
             if auth_rejected:
                 raise AOAAuthError(f"Snapshot auth rejected at {url}")

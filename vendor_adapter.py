@@ -60,8 +60,12 @@ class AxisAdapter:
         multi_class=True, exclusions=True, direction=True, can_delete=True, perspective=True,
         notes="AOA: full config replace -- add/edit/delete all supported.")
 
-    def __init__(self, ip, port, user, password, **_):
-        self.client = aoa_config.AOAClient(ip, user, password, port)
+    def __init__(self, ip, port, user, password, channel=None, **_):
+        # channel selects a physical sensor on a multi-sensor Axis unit (e.g. P3747,
+        # verified against a real 10.23.135.24:5010). None (the default, ordinary
+        # single-sensor cameras) preserves the exact prior single-image behavior.
+        self.device_id = int(channel) if channel else None
+        self.client = aoa_config.AOAClient(ip, user, password, port, channel_idx=self.device_id)
 
     def fetch_snapshot(self):
         return self.client.fetch_snapshot()
@@ -71,6 +75,14 @@ class AxisAdapter:
         persp_defs = {p.get("id"): p for p in cfg.get("data", {}).get("perspectives", [])}
         out = []
         for s in cfg.get("data", {}).get("scenarios", []):
+            # On a multi-sensor unit, only show/edit scenarios bound to the selected
+            # sensor -- every scenario carries a "devices" list (required key, even on
+            # single-sensor cameras where it's just [{"id": 1}]), so when no sensor is
+            # selected (self.device_id is None) nothing is filtered here at all.
+            if self.device_id is not None:
+                devs = [d.get("id") for d in s.get("devices", []) if isinstance(d, dict)]
+                if devs and self.device_id not in devs:
+                    continue
             trig = (s.get("triggers") or [{}])[0]
             verts = [(( ax + 1) / 2.0, (1 - ay) / 2.0) for ax, ay in trig.get("vertices", [])]
             conds = trig.get("conditions") or []
@@ -138,11 +150,14 @@ class AxisAdapter:
             scenario["name"] = sc.name
         elif sc.kind == "line":
             scenario = aoa_config.build_line_crossing(sc.name, verts, classes=sc.classes,
-                                                      alarm_direction=sc.direction or "leftToRight")
+                                                      alarm_direction=sc.direction or "leftToRight",
+                                                      device_id=self.device_id or 1)
         elif sc.kind == "loiter":
-            scenario = aoa_config.build_loiter(sc.name, verts, sc.duration or 1, classes=sc.classes)
+            scenario = aoa_config.build_loiter(sc.name, verts, sc.duration or 1, classes=sc.classes,
+                                               device_id=self.device_id or 1)
         else:
-            scenario = aoa_config.build_intrusion(sc.name, verts, classes=sc.classes)
+            scenario = aoa_config.build_intrusion(sc.name, verts, classes=sc.classes,
+                                                  device_id=self.device_id or 1)
         if excl and sc.kind != "line":
             aoa_config.add_exclude_zones(scenario, excl)
 
@@ -189,8 +204,31 @@ class HikAdapter:
         return img
 
     def read_scenarios(self):
+        scenarios = self._parse_scenarios(self.client.get_behavior_rule())
+        if scenarios:
+            return scenarios
+        # Nothing on the selected channel -- Hik's optical(1)/thermal(2) split means a
+        # camera can carry rules on only one of the two, and the GUI's channel picker is
+        # just a guess. camera_engine.fetch_analytics() (used by the fleet audit) already
+        # probes both and takes whichever answers; mirror that here so the writer doesn't
+        # report "0 configured" on a rule-less channel while the sibling channel has one.
+        # Sticks the client on the channel that actually answered so a later edit/push
+        # patches the right document instead of creating a duplicate on the empty one.
+        alt = "1" if self.client.channel == "2" else "2"
+        original = self.client.channel
+        self.client.channel = alt
+        try:
+            alt_scenarios = self._parse_scenarios(self.client.get_behavior_rule())
+        except Exception:
+            alt_scenarios = []
+        if alt_scenarios:
+            return alt_scenarios
+        self.client.channel = original
+        return []
+
+    @staticmethod
+    def _parse_scenarios(xml):
         import xml.etree.ElementTree as ET
-        xml = self.client.get_behavior_rule()
         root = ET.fromstring(xml)
         out = []
         for ri in root.findall(".//ns:RuleInfo", hik_config.NS):
@@ -326,7 +364,7 @@ def make_adapter(vendor, ip, port, user, password, channel=None):
     import camera_engine
     v = camera_engine.classify_manufacturer(vendor)
     if v == "AXIS":
-        return AxisAdapter(ip, port, user, password)
+        return AxisAdapter(ip, port, user, password, channel=channel)
     if v == "HIKVISION":
         return HikAdapter(ip, port, user, password, channel=int(channel) if channel else 2)
     raise ValueError(f"unsupported vendor: {vendor!r}")
