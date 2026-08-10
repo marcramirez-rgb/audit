@@ -124,6 +124,20 @@ def dedupe_camera_rows(rows):
     return deduped + passthrough
 
 
+def get_analytics_device_ids(payload_data):
+    """Sensor ids present in an Axis Object Analytics getConfiguration response's
+    top-level "devices" list -- one entry per physical sensor on the unit. Ordinary
+    single-sensor Axis cameras report exactly one device id (or the key may be
+    absent depending on firmware); multi-sensor units (e.g. P3747, verified against
+    a real 10.23.135.24:5010) report one per sensor (ids 1..N). Returns [] for
+    anything that isn't a plain Object Analytics dict (e.g. the Perimeter Defender
+    tagged payload), so callers can safely treat that as "not multi-sensor"."""
+    if not isinstance(payload_data, dict) or "__perimeter_defender__" in payload_data:
+        return []
+    devices = payload_data.get("data", {}).get("devices", [])
+    return sorted({d.get("id") for d in devices if isinstance(d, dict) and d.get("id") is not None})
+
+
 def _extract_hik_channel_id(behavior_rule_url):
     """Pulls the channel id back out of a successful Hikvision behaviorRule URL,
     e.g. '.../channels/2/behaviorRule/1' -> '2'. Returns None for anything that
@@ -419,8 +433,14 @@ class AxisHandler(CameraHandler):
         super().__init__(ip, user, password)
         self.fallback_dim = (1280, 720)
 
-    def fetch_snapshot(self, session, port):
-        img_url = f"http://{self.ip}:{port}/axis-cgi/jpg/image.cgi?resolution=1280x720"
+    def fetch_snapshot(self, session, port, channel_idx=None):
+        # channel_idx selects a sensor on multi-sensor Axis units (e.g. P3747) via the
+        # VAPIX `camera=` query param. Verified against a real P3747 (10.23.135.24:5010):
+        # camera=1-4 return the four distinct sensor views, camera=5 returns a combined
+        # 2x2 overview of all four, camera=6+ returns HTTP 400. Omitted entirely (None)
+        # for single-sensor cameras to keep the exact URL these always used.
+        suffix = f"&camera={channel_idx}" if channel_idx is not None else ""
+        img_url = f"http://{self.ip}:{port}/axis-cgi/jpg/image.cgi?resolution=1280x720{suffix}"
         last_err = "All authentication attempts failed"
         saw_401 = False
         saw_other = False
@@ -695,10 +715,18 @@ class AxisHandler(CameraHandler):
             # Line-crossing direction (fence alarmDirection: leftToRight / rightToLeft).
             direction = triggers[0].get("alarmDirection") if triggers and triggers[0].get("type") == "fence" else None
 
+            # Which sensor(s) this scenario is bound to on a multi-sensor Axis unit (e.g.
+            # P3747) -- absent/single-item on ordinary single-sensor cameras. Verified
+            # against a real P3747: getConfiguration returns one global "devices" list
+            # (one entry per physical sensor) and each scenario carries its own
+            # "devices": [{"id": N}] pointing at exactly which sensor it applies to.
+            scenario_devices = [d.get("id") for d in scenario.get("devices", [])
+                                 if isinstance(d, dict) and d.get("id") is not None]
+
             parsed_rules.append({"is_placeholder": False, "name": rule_name, "type": rule_type,
                                  "duration": duration_val, "target": target_detection,
                                  "vertices": vertices, "bars": bars, "size_boxes": size_boxes,
-                                 "direction": direction})
+                                 "direction": direction, "devices": scenario_devices})
         return parsed_rules
 
 
@@ -1354,6 +1382,69 @@ def process_camera_row(args):
 
             if payload_data is not None and camera_image is None:
                 results["logs"].append("    [!] Analytics retrieved but snapshot unavailable; rendering overlay on placeholder canvas.")
+
+        # --- MULTI-SENSOR AXIS UNIT (e.g. P3747): one row per physical sensor ---
+        # Detected generically from the analytics response itself (more than one entry
+        # in Object Analytics' top-level "devices" list) rather than by model name, so
+        # any future multi-sensor Axis unit is picked up the same way. Verified against
+        # a real P3747 (10.23.135.24:5010): camera=1..N selects each sensor's snapshot,
+        # and each scenario's own "devices" list says which sensor it belongs to -- see
+        # [[axis-p3747-quad-sensor-support]].
+        device_ids = get_analytics_device_ids(payload_data) if (is_axis and payload_data is not None) else []
+        if len(device_ids) > 1:
+            if camera_image is not None:
+                camera_image.close()  # default/unsuffixed snapshot -- each sensor is re-fetched below via channel_idx
+
+            sensor_auth_rejected = False
+            for device_id in device_ids:
+                sensor_pos = f"{pos}-S{device_id}"
+                sensor_img, sensor_snap_url, sensor_snap_err, sensor_snap_auth_rejected = handler.fetch_snapshot(sess, port, channel_idx=device_id)
+                if sensor_snap_auth_rejected:
+                    sensor_auth_rejected = True
+
+                if sensor_img is None:
+                    sensor_img_w, sensor_img_h = handler.fallback_dim
+                    results["logs"].append(f"    [!] Warning: Failed to fetch sensor {device_id} snapshot on Port {port} ({sensor_snap_err}). Defaulting to {sensor_img_w}x{sensor_img_h} canvas.")
+                    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    results["missed"].append([timestamp, client_name, location, serial, f"{sensor_pos} ({port}) [SNAPSHOT]", sensor_snap_url, sensor_snap_err])
+                else:
+                    sensor_img_w, sensor_img_h = sensor_img.size
+
+                all_sensor_rules = handler.parse_analytics(payload_data, sensor_img_w, sensor_img_h)
+                sensor_rules = [r for r in all_sensor_rules if not r.get("is_placeholder") and device_id in r.get("devices", [])]
+                if not sensor_rules:
+                    sensor_rules = [{"is_placeholder": True, "name": "No Scenarios Configured", "type": "N/A",
+                                      "target": "No Analytics Configured", "duration": "N/A", "vertices": []}]
+
+                for index, rule in enumerate(sensor_rules):
+                    try:
+                        img_buf = render_overlay_image(sensor_img, rule["vertices"], index, sensor_img_w, sensor_img_h, rule["type"],
+                                                         size_boxes=rule.get("size_boxes"), bars=rule.get("bars"), direction=rule.get("direction"))
+                        add_main_row({
+                            "data": [client_name, location, serial, sensor_pos, rule["name"], rule["type"], rule["target"], rule["duration"]],
+                            "bg": bg_color, "img": img_buf, "err": ""
+                        })
+                        if rule.get("is_placeholder"):
+                            results["logs"].append(f"    [+] Logged snapshot row for {sensor_pos} (Port {port}, no rules bound to this sensor)")
+                        else:
+                            results["logs"].append(f"    [+] Logged metrics for {sensor_pos} (Port {port}) Scenario: {rule['name']} ({rule['duration']}s)")
+                    except Exception as e:
+                        add_main_row({
+                            "data": [client_name, location, serial, sensor_pos, rule["name"], rule["type"], rule["target"], rule["duration"]],
+                            "bg": bg_color, "img": None, "err": f"(Image failed: {e})"
+                        })
+
+                if sensor_img is not None:
+                    sensor_img.close()
+
+            if sensor_auth_rejected:
+                timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                results["logs"].append(f"    [!] WRONG LOGIN on Port {port} (HTTP 401) -- the Axis username/password is being rejected. Skipping this unit's remaining ports so repeated bad logins don't lock the account.")
+                results["missed"].append([timestamp, client_name, location, serial, "REMAINING PORTS SKIPPED", "N/A",
+                                           f"Wrong Axis login (HTTP 401) on port {port} -- credentials rejected. Remaining ports skipped to avoid locking the account."])
+                break
+
+            continue
 
         if payload_data is None:
             err_msg = err_msg or "Unauthorized Connection (All auth variations failed)"
