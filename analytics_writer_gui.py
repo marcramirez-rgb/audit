@@ -818,17 +818,25 @@ class WriterApp(ctk.CTk):
 
     @staticmethod
     def _build_edit_labels(scenarios):
-        """Map each scenario to a UNIQUE dropdown label. Two rules can share a name
-        (e.g. two 'RULE1's on a Hik camera); a bare name would collide so both entries
-        point at the first. When a name repeats we append '  #1/#2/...' (display only --
-        the pushed scenario keeps its real name). Preserves read order."""
+        """Map each scenario to a UNIQUE dropdown label. Operators often reuse one
+        name for many zones ('RULE1' x6 on a real thermal unit), so a bare name would
+        collide and every entry would point at the first. Duplicates get '  #n' plus
+        what actually differs -- classes/duration and, for Hik, the (channel, scene,
+        ruleId) address the rule lives at. Display only: the pushed scenario keeps
+        its real name. Selecting an entry also highlights its zone on the canvas,
+        which is the real disambiguator. Preserves read order."""
         from collections import Counter
         counts = Counter(s.name for s in scenarios)
         seen, out = {}, {}
         for s in scenarios:
             if counts[s.name] > 1:
                 seen[s.name] = seen.get(s.name, 0) + 1
-                label = f"{s.name}  #{seen[s.name]}"
+                label = f"{s.name}  #{seen[s.name]} · {'+'.join(s.classes)}"
+                if s.duration:
+                    label += f" · {s.duration}s"
+                if isinstance(s.native_id, tuple):
+                    ch, sid, rid = s.native_id
+                    label += f" (ch{ch} s{sid} r{rid})"
             else:
                 label = s.name
             out[label] = s
@@ -967,7 +975,13 @@ class WriterApp(ctk.CTk):
                     size_txt = ""
                     if s.min_size or s.max_size:
                         size_txt = " size[min/max]"
-                    lines.append(f"    '{s.name}' {s.kind} classes={s.classes}"
+                    # Hik rules carry their address (channel/scene doc/ruleId) so six
+                    # same-named rules stay tellable-apart in the log.
+                    loc_txt = ""
+                    if isinstance(s.native_id, tuple):
+                        ch, sid, rid = s.native_id
+                        loc_txt = f" @ch{ch}/s{sid}/r{rid}"
+                    lines.append(f"    '{s.name}'{loc_txt} {s.kind} classes={s.classes}"
                                  + (f" dur={s.duration}" if s.duration else "")
                                  + (f" excl={len(s.exclusions)}" if s.exclusions else "") + size_txt)
                 self.msg_queue.put(("overlays", overlays, lines, scenarios))
@@ -1470,6 +1484,11 @@ class WriterApp(ctk.CTk):
         sensor_txt = ""
         if adapter.vendor == "Axis" and getattr(adapter, "device_id", None):
             sensor_txt = f", sensor {adapter.device_id}"
+        elif isinstance(self.editing, tuple):
+            # Hik edit: say exactly which rule gets patched -- with six same-named
+            # rules on a camera, "RULE1" alone doesn't identify the write target.
+            e_ch, e_sid, e_rid = self.editing
+            sensor_txt = f", ch{e_ch} scene {e_sid} rule {e_rid}"
         excl_txt = f"\n{len(sc.exclusions)} exclusion zone(s) included." if sc.exclusions else ""
         verb = "Update existing scenario" if self.editing is not None else "Push new scenario"
         if not messagebox.askyesno(

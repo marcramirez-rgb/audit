@@ -1,9 +1,15 @@
 """Hikvision ISAPI analytics WRITE layer -- the Hik counterpart to aoa_config.py.
 
 Where Axis AOA is JSON over one control.cgi, Hikvision is XML over ISAPI. VCA rules
-live in a per-channel document at:
+live in a per-channel, per-SCENE document at:
 
-    GET/PUT  /ISAPI/Intelligent/channels/{ch}/behaviorRule/1
+    GET/PUT  /ISAPI/Intelligent/channels/{ch}/behaviorRule/{sid}
+
+The trailing {sid} is a scene-document id, NOT a constant: an LVT-384-25MM thermal
+dome (10.23.39.254:5015) keeps its rules in ch2 document 2 while document 1 is
+empty, so code that only ever reads .../behaviorRule/1 silently misses them. Docs
+beyond the camera's real scene count answer 200 with an empty RuleInfoList; scan
+1..MAX_SCENE_DOCS to find them all.
 
 The document is <BehaviorRule><RuleInfoList><RuleInfo>...</RuleInfo>...</RuleInfoList>.
 
@@ -35,6 +41,7 @@ import camera_engine
 NS_URI = "http://www.std-cgi.com/ver20/XMLSchema"
 NS = {"ns": NS_URI}
 NET_TIMEOUT = getattr(camera_engine, "STRICT_TIMEOUT", (3.05, 5.0))
+MAX_SCENE_DOCS = getattr(camera_engine, "MAX_SCENE_DOCS", 8)
 
 # Emit the default namespace with no prefix so PUT bodies match the camera's own format
 # (otherwise ElementTree writes ns0: prefixes the firmware may reject).
@@ -68,12 +75,15 @@ class HikAuthError(HikError):
 
 
 class HikClient:
-    """One camera + one channel. Mirrors aoa_config.AOAClient."""
+    """One camera + one channel + one scene document. Mirrors aoa_config.AOAClient.
+    `sid` picks the behaviorRule scene document (default 1, the pre-scene-aware
+    behavior); vendor_adapter retargets channel/sid per rule when reading/editing."""
 
-    def __init__(self, ip, user, password, port, channel=1, session=None):
+    def __init__(self, ip, user, password, port, channel=1, sid=1, session=None):
         self.ip = ip
         self.port = str(port)
         self.channel = str(channel)
+        self.sid = int(sid)
         self.auth_strategies = [HTTPDigestAuth(user, password), HTTPBasicAuth(user, password)]
         self.session = session or self._build_session()
 
@@ -88,7 +98,7 @@ class HikClient:
 
     @property
     def behavior_url(self):
-        return f"http://{self.ip}:{self.port}/ISAPI/Intelligent/channels/{self.channel}/behaviorRule/1"
+        return f"http://{self.ip}:{self.port}/ISAPI/Intelligent/channels/{self.channel}/behaviorRule/{self.sid}"
 
     # ------------------------------------------------------------------ transport
     def _request(self, method, body=None):
@@ -136,7 +146,7 @@ class HikClient:
         backup_dir.mkdir(parents=True, exist_ok=True)
         xml = self.get_behavior_rule()
         stamp = datetime.now().strftime("%Y%m%dT%H%M%S")
-        path = backup_dir / f"hik_behaviorRule_{self.ip.replace('.', '_')}_{self.port}_ch{self.channel}_{stamp}.xml"
+        path = backup_dir / f"hik_behaviorRule_{self.ip.replace('.', '_')}_{self.port}_ch{self.channel}_s{self.sid}_{stamp}.xml"
         path.write_text(xml, encoding="utf-8")
         return path, xml
 

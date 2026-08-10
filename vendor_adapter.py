@@ -204,53 +204,53 @@ class HikAdapter:
         return img
 
     def read_scenarios(self):
-        # Hik's optical(1)/thermal(2) split means a camera can carry rules on only one
-        # of the two channels -- and on single-imager units the other channel may not
-        # even exist (the GET errors instead of returning an empty document). The GUI's
-        # channel picker is just a guess, so mirror camera_engine.fetch_analytics()
-        # (the fleet audit's path): probe the selected channel, and if it errors OR has
-        # no rules, probe the sibling. The client is left stuck on whichever channel
-        # actually holds rules (or the only one that answers) so a later edit/push
-        # patches the right document instead of creating a duplicate on the empty one.
-        original = self.client.channel
-        primary_err = None
-        try:
-            scenarios = self._parse_scenarios(self.client.get_behavior_rule())
-        except Exception as e:
-            scenarios, primary_err = [], e
-        if scenarios:
-            return scenarios
+        """Return every rule on the camera: scan BOTH channels and ALL scene docs.
 
-        self.client.channel = "1" if original == "2" else "2"
+        Two Hik realities force the wide scan (both confirmed live on an LVT-384-25MM
+        thermal dome, 10.23.39.254:5015):
+          - the optical(1)/thermal(2) split: rules can live on either channel, and the
+            GUI's channel picker is just a guess;
+          - the trailing number in .../behaviorRule/{sid} is a SCENE document id, not
+            a constant -- that unit keeps its six real rules in ch2 doc 2 while doc 1
+            is empty, so reading only doc 1 misses all of them.
+        Each scenario's native_id is (channel, sid, ruleId) so an edit patches exactly
+        the document+rule it came from -- vital when operators reuse one name
+        ("RULE1" x6 on that unit) for many different zones. A channel whose first
+        document errors (auth/network/notSupport) is skipped whole; if nothing is
+        readable anywhere, the first error is raised."""
+        out, first_err = [], None
+        selected, original_sid = self.client.channel, self.client.sid
         try:
-            alt_scenarios = self._parse_scenarios(self.client.get_behavior_rule())
-        except Exception:
-            # Sibling channel is no better; put the selection back and report the
-            # selected channel's own failure if it had one.
-            self.client.channel = original
-            if primary_err is not None:
-                raise primary_err
-            return []
-        if alt_scenarios:
-            return alt_scenarios
-        # Both channels answered but neither has rules. Stay on the sibling only when
-        # the selected channel is actually broken (it's then the only writable one).
-        if primary_err is None:
-            self.client.channel = original
-        return []
+            for ch in (selected, "1" if selected == "2" else "2"):
+                self.client.channel = ch
+                for sid in range(1, hik_config.MAX_SCENE_DOCS + 1):
+                    self.client.sid = sid
+                    try:
+                        xml = self.client.get_behavior_rule()
+                    except Exception as e:
+                        if first_err is None:
+                            first_err = e
+                        break  # auth/network/notSupport won't differ for higher docs
+                    out.extend(self._parse_scenarios(xml, channel=ch, sid=sid))
+        finally:
+            self.client.channel, self.client.sid = selected, original_sid
+        if not out and first_err is not None:
+            raise first_err
+        return out
 
     @staticmethod
-    def _parse_scenarios(xml):
+    def _parse_scenarios(xml, channel, sid):
         import xml.etree.ElementTree as ET
         root = ET.fromstring(xml)
         out = []
         for ri in root.findall(".//ns:RuleInfo", hik_config.NS):
             name = _text(ri, "ns:ruleName")
-            # ruleId is the rule's true identity: the firmware upserts by ruleId, and two
-            # rules can share a ruleName. Key native_id on it so duplicate names stay
-            # distinct through select/edit/push. Fall back to name if ruleId is absent.
+            # native_id is (channel, sid, ruleId): ruleId is the identity the firmware
+            # upserts by, but it's only unique WITHIN one scene document, and many
+            # rules can share a ruleName -- the full triple pins down exactly one rule
+            # on the camera. Falls back to the name when ruleId is absent.
             rid = _text(ri, "ns:ruleId")
-            native = int(rid) if rid.isdigit() else name
+            native = (channel, sid, int(rid) if rid.isdigit() else name)
             etype = _text(ri, "ns:eventType") or ""
             kind = "line" if "line" in etype.lower() else "intrusion"
             pts = [(int(_text(c, "ns:positionX")) / 1000.0, 1 - int(_text(c, "ns:positionY")) / 1000.0)
@@ -278,11 +278,22 @@ class HikAdapter:
         min_box = self._frac_rect_to_hik(sc.min_size)
         max_box = self._frac_rect_to_hik(sc.max_size)
 
+        # Aim the client at the exact document the rule lives in. On edit,
+        # native_id is (channel, sid, ruleId) from read_scenarios; the ruleId part
+        # locates the rule so a duplicate ruleName can't send the patch to the wrong
+        # one. On create (native_id None) the rule lands in the selected channel's
+        # rule-bearing scene document (see _locate_create_sid); patch then finds no
+        # match and falls through to insert_or_replace_rule below.
+        edit_id = None
+        if isinstance(sc.native_id, tuple):
+            ch, sid, rid = sc.native_id
+            self.client.channel, self.client.sid = str(ch), int(sid)
+            if isinstance(rid, int):
+                edit_id = rid
+        else:
+            self.client.sid = self._locate_create_sid()
+
         backup_path, current = self.client.backup_behavior_rule(backup_dir)
-        # On edit, sc.native_id is the rule's ruleId (int) -- locate by it so a duplicate
-        # ruleName can't send the patch to the wrong rule. On create it's None -> patch
-        # finds no match and we fall through to insert_or_replace_rule below.
-        edit_id = sc.native_id if isinstance(sc.native_id, int) else None
         patched = hik_config.patch_rule_geometry(
             current, sc.name, region_hik, target=target, duration=sc.duration or None,
             min_box=min_box, max_box=max_box,
@@ -302,6 +313,26 @@ class HikAdapter:
         new_xml = hik_config.insert_or_replace_rule(current, rule, replace_by_name=True)
         self.client.put_behavior_rule(new_xml)
         return backup_path, self.client.get_behavior_rule()
+
+    def _locate_create_sid(self):
+        """Scene document a NEW rule should land in on the currently selected channel:
+        the first document that already carries rules -- rules in an inactive scene
+        document do nothing, and where the existing rules sit is where the camera's
+        active scene lives. Falls back to document 1 (the pre-scene-aware behavior)
+        when the whole channel is empty."""
+        original = self.client.sid
+        try:
+            for sid in range(1, hik_config.MAX_SCENE_DOCS + 1):
+                self.client.sid = sid
+                try:
+                    count, _, _ = hik_config.rule_summary(self.client.get_behavior_rule())
+                except Exception:
+                    break
+                if count:
+                    return sid
+            return 1
+        finally:
+            self.client.sid = original
 
     @staticmethod
     def _frac_rect_to_hik(rect):

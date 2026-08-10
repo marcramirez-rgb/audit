@@ -6,6 +6,7 @@ a log/progress callback instead of relying on module-level globals or stdout.
 """
 
 import concurrent.futures
+import re
 import time
 import xml.etree.ElementTree as ET
 from datetime import datetime
@@ -38,6 +39,14 @@ CAMERA_CONFIGS = [
     {"port": "5015", "position": "LEFT",   "color": "00A19A"},  # LVT Normal
     {"port": "5020", "position": "RIGHT",  "color": "00726E"}   # LVT Dark
 ]
+
+# Hikvision keeps VCA rules in per-SCENE behaviorRule documents: the trailing number
+# in /ISAPI/Intelligent/channels/{ch}/behaviorRule/{sid} is a scene id, not a
+# constant. Confirmed live on an LVT-384-25MM thermal dome (10.23.39.254:5015): its
+# six real rules sit in channel 2 document 2 while document 1 is empty. Scan this
+# many scene documents per channel (docs beyond the camera's real scene count just
+# return an empty RuleInfoList).
+MAX_SCENE_DOCS = 8
 
 
 def get_ptz_endpoint_catalog(ip, port):
@@ -153,6 +162,15 @@ def _extract_hik_channel_id(behavior_rule_url):
     return candidate if candidate.isdigit() else None
 
 
+def _extract_hik_scene_id(behavior_rule_url):
+    """Scene-document id from a concrete behaviorRule URL ('.../behaviorRule/2' ->
+    '2'), or None for the bracketed placeholder URL used on a failed fetch. Feeds
+    reposition_for_scene so the PTZ goes to the scene whose rules were found, not
+    always scene 1."""
+    m = re.search(r"/behaviorRule/(\d+)$", behavior_rule_url or "")
+    return m.group(1) if m else None
+
+
 # --- OBJECT-ORIENTED ARCHITECTURE (OOP) ---
 
 class CameraHandler:
@@ -241,40 +259,85 @@ class HikvisionHandler(CameraHandler):
         return None, fallback_url, last_err, auth_rejected
 
     def fetch_analytics(self, session, port):
+        # Rules can live on either channel (optical=1 / thermal=2) AND in any scene
+        # document (see MAX_SCENE_DOCS) -- scan channels x docs and merge every rule
+        # found into one synthetic BehaviorRule document for the parser, so a camera
+        # whose rules sit in ch2 doc2 isn't reported by an unrelated rule in ch1 doc1.
         last_status = None
         last_snippet = None
         saw_401 = False
         saw_other = False
         saw_ok = False
+        collected = []       # (channel_id, sid, ruleId, ruleName, raw <RuleInfo> chunk)
+        best_doc_url = None  # rule-bearing doc with the most rules -- the PTZ scene target
+        best_doc_count = 0
         for channel_id in [1, 2]:
-            rule_url = f"http://{self.ip}:{port}/ISAPI/Intelligent/channels/{channel_id}/behaviorRule/1"
-            for auth in self.auth_strategies:
-                try:
-                    response = session.get(rule_url, auth=auth, timeout=STRICT_TIMEOUT, verify=False)
-                    last_status = response.status_code
-                    if response.status_code == 200:
-                        temp_xml = response.text
-                        if temp_xml and ("positionX" in temp_xml or "RegionCoordinates" in temp_xml):
-                            return temp_xml, rule_url, None, False
-                        # A clean 200 with no coordinate tags means the camera answered
-                        # fine, it just has no analytic zones configured on this channel.
-                        saw_ok = True
-                        last_snippet = (temp_xml[:200] + "...") if temp_xml and len(temp_xml) > 200 else (temp_xml or "(empty body)")
-                    elif response.status_code == 401:
-                        saw_401 = True
-                    else:
+            working_auth = None
+            for sid in range(1, MAX_SCENE_DOCS + 1):
+                rule_url = f"http://{self.ip}:{port}/ISAPI/Intelligent/channels/{channel_id}/behaviorRule/{sid}"
+                doc_xml = None
+                # Once an auth strategy works for this channel, keep using it -- the
+                # camera won't switch auth schemes between scene documents.
+                for auth in ([working_auth] if working_auth else self.auth_strategies):
+                    try:
+                        response = session.get(rule_url, auth=auth, timeout=STRICT_TIMEOUT, verify=False)
+                        last_status = response.status_code
+                        if response.status_code == 200:
+                            working_auth = auth
+                            doc_xml = response.text or ""
+                            break
+                        if response.status_code == 401:
+                            saw_401 = True
+                        else:
+                            saw_other = True
+                    except requests.exceptions.RequestException as e:
                         saw_other = True
-                except requests.exceptions.RequestException as e:
-                    saw_other = True
-                    last_snippet = f"{type(e).__name__}: {e}"
-                    continue
+                        last_snippet = f"{type(e).__name__}: {e}"
+                if doc_xml is None:
+                    break  # auth/network/notSupport state won't differ for higher scene docs
+                chunks = [c for c in re.findall(r"<RuleInfo>.*?</RuleInfo>", doc_xml, re.S)
+                          if "positionX" in c or "RegionCoordinates" in c]
+                if chunks:
+                    for c in chunks:
+                        rid = re.search(r"<ruleId>\s*(\d+)\s*</ruleId>", c)
+                        nm = re.search(r"<ruleName>(.*?)</ruleName>", c, re.S)
+                        collected.append((channel_id, sid, rid.group(1) if rid else "?",
+                                          nm.group(1) if nm else "", c))
+                    if len(chunks) > best_doc_count:
+                        best_doc_count = len(chunks)
+                        best_doc_url = rule_url
+                else:
+                    # A clean 200 with no coordinate tags: the camera answered fine,
+                    # this scene document just has no zones configured.
+                    saw_ok = True
+                    last_snippet = (doc_xml[:200] + "...") if len(doc_xml) > 200 else (doc_xml or "(empty body)")
+
+        if collected:
+            # Operators often reuse one rule name for many zones ("RULE1" x6 on the
+            # LVT-384-25MM above) -- suffix duplicates with where each rule lives so
+            # report rows stay distinguishable. str.replace is literal, so names with
+            # regex metacharacters are safe.
+            name_counts = {}
+            for _, _, _, nm, _ in collected:
+                name_counts[nm] = name_counts.get(nm, 0) + 1
+            merged_chunks = []
+            for channel_id, sid, rid, nm, chunk in collected:
+                if nm and name_counts[nm] > 1:
+                    chunk = chunk.replace(f"<ruleName>{nm}</ruleName>",
+                                          f"<ruleName>{nm} [ch{channel_id} s{sid} #{rid}]</ruleName>", 1)
+                merged_chunks.append(chunk)
+            merged = ('<?xml version="1.0" encoding="UTF-8"?>'
+                      '<BehaviorRule version="2.0" xmlns="http://www.std-cgi.com/ver20/XMLSchema">'
+                      '<RuleInfoList>' + "".join(merged_chunks) + '</RuleInfoList></BehaviorRule>')
+            return merged, best_doc_url, None, False
+
         auth_rejected = saw_401 and not saw_other and not saw_ok
         if last_status is None:
             diag = f"No response from any channel/auth combo (last error: {last_snippet})"
         else:
             diag = f"Last HTTP {last_status} response did not contain expected rule tags. Body snippet: {last_snippet}"
 
-        url = f"http://{self.ip}:{port}/ISAPI/Intelligent/channels/[1,2]/behaviorRule/1"
+        url = f"http://{self.ip}:{port}/ISAPI/Intelligent/channels/[1,2]/behaviorRule/[1-{MAX_SCENE_DOCS}]"
 
         # Thermal/bi-spectrum units (e.g. DS-2TD4237-7/V2) are intentionally NOT
         # special-cased here. Verified against real device traffic (see
@@ -1276,8 +1339,9 @@ def process_camera_row(args):
 
             if vendor_label == "Hikvision" and payload_data is not None:
                 channel_id = _extract_hik_channel_id(req_url)
-                if channel_id and handler.reposition_for_scene(sess, port, channel_id, "1"):
-                    results["logs"].append(f"    [+] Repositioned PTZ to analytics scene, re-fetching snapshot (Port {port}, Channel {channel_id}).")
+                scene_id = _extract_hik_scene_id(req_url) or "1"
+                if channel_id and handler.reposition_for_scene(sess, port, channel_id, scene_id):
+                    results["logs"].append(f"    [+] Repositioned PTZ to analytics scene {scene_id}, re-fetching snapshot (Port {port}, Channel {channel_id}).")
                     fresh_img, _, _, _ = handler.fetch_snapshot(sess, port)
                     if fresh_img is not None:
                         camera_image.close()
@@ -1364,8 +1428,9 @@ def process_camera_row(args):
             if payload_data is not None:
                 channel_id = _extract_hik_channel_id(req_url)
                 if channel_id:
-                    if handler.reposition_for_scene(sess, port, channel_id, "1"):
-                        results["logs"].append(f"    [+] Repositioned PTZ to analytics scene before snapshot (Port {port}, Channel {channel_id}).")
+                    scene_id = _extract_hik_scene_id(req_url) or "1"
+                    if handler.reposition_for_scene(sess, port, channel_id, scene_id):
+                        results["logs"].append(f"    [+] Repositioned PTZ to analytics scene {scene_id} before snapshot (Port {port}, Channel {channel_id}).")
 
             # Fetch snapshot: fetch_snapshot will try Channel 201 first and fallback to 101 automatically
             camera_image, snap_url, snap_err, snap_auth_rejected = handler.fetch_snapshot(sess, port)
