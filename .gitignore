@@ -38,3 +38,9 @@ aoa_backups/
 hik_probes/
 hik_backups/
 hik_push_debug/
+
+# PTZ drift audit reports (ptz_tester.py output -- real fleet IPs + scene imagery)
+PTZ_*.xlsx
+
+# ML zone-suggestion experiment data -- real fleet snapshots, never commit
+ai_suggest_jobs/
