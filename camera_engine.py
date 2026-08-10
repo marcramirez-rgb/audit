@@ -40,6 +40,27 @@ CAMERA_CONFIGS = [
 ]
 
 
+def get_ptz_endpoint_catalog(ip, port):
+    """Return vendor-specific PTZ endpoint examples that the PTZ tooling can probe.
+
+    The current engine already uses the Hikvision scenePtz goto endpoint for scene
+    repositioning, while the Axis path uses the standard PTZ CGI query endpoint.
+    These are intentionally exposed here so a PTZ comparison script can print and
+    probe them without duplicating endpoint strings in another project.
+    """
+    return {
+        "axis": {
+            "query_position": f"http://{ip}:{port}/axis-cgi/com/ptz.cgi?camera=1&query=position",
+            "move_absolute": f"http://{ip}:{port}/axis-cgi/com/ptz.cgi?camera=1&move=absolute&pan=0&tilt=0&zoom=0",
+        },
+        "hikvision": {
+            "ptz_status": f"http://{ip}:{port}/ISAPI/PTZCtrl/channels/1/status",
+            "ptz_absolute": f"http://{ip}:{port}/ISAPI/PTZCtrl/channels/1/absolute",
+            "scene_ptz_goto": f"http://{ip}:{port}/ISAPI/Intelligent/channels/1/scenePtz/1/goto",
+        },
+    }
+
+
 def default_output_dir():
     downloads_path = Path.home() / "Downloads"
     output_dir = downloads_path / "Camera_Reports_Master"

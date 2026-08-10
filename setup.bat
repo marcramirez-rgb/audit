@@ -1,6 +1,10 @@
 @echo off
 setlocal enableextensions
-cd /d "%~dp0"
+REM pushd (not cd /d) so this also works when double-clicked from a
+REM network share (\\server\share\axis_api_testing) -- cd /d leaves the
+REM working directory on a UNC path, which several tools called below
+REM don't handle; pushd maps a temporary drive letter instead.
+pushd "%~dp0"
 
 echo ============================================================
 echo   LVT Camera Analytics - First-time setup
@@ -23,35 +27,149 @@ if not "%PROJDIR:~140,1%"=="" goto :pathtoolong
 
 set "REQ_CORE=%~dp0requirements-core.txt"
 set "SNOWFLAKE_PKG=snowflake-connector-python[secure-local-storage]==4.7.1"
+set "PYCHECK_FILE=%TEMP%\lvt_pycheck_%RANDOM%.txt"
+set "PF86=%ProgramFiles(x86)%"
 
 REM --- 1. Find a Python interpreter (does NOT rely on PATH) --------------
-set "PYEXE="
+call :find_python
+if defined PYEXE goto :python_found
 
-REM The "py" launcher is installed by python.org even when the
-REM "Add python.exe to PATH" box was left unchecked, so try it first.
-py -3 --version >nul 2>&1 && set "PYEXE=py -3"
-
-if not defined PYEXE python  --version >nul 2>&1 && set "PYEXE=python"
-if not defined PYEXE python3 --version >nul 2>&1 && set "PYEXE=python3"
-
-REM Last resort: look in the usual install locations.
-if not defined PYEXE for %%D in (
-  "%LOCALAPPDATA%\Programs\Python\Python313\python.exe"
-  "%LOCALAPPDATA%\Programs\Python\Python312\python.exe"
-  "%LOCALAPPDATA%\Programs\Python\Python311\python.exe"
-  "%PROGRAMFILES%\Python313\python.exe"
-  "%PROGRAMFILES%\Python312\python.exe"
-  "%PROGRAMFILES%\Python311\python.exe"
-  "C:\Python313\python.exe"
-  "C:\Python312\python.exe"
-  "C:\Python311\python.exe"
-) do if not defined PYEXE if exist "%%~D" set PYEXE="%%~D"
-
+REM --- 1b. Nothing usable on this machine -- install Python ourselves ---
+REM Per-user install (InstallAllUsers=0) needs no admin rights, so this
+REM works even on locked-down corporate laptops.
+echo No usable Python was found on this computer.
+echo Installing Python for your account only (no admin rights needed,
+echo does not touch any other app on this computer) ...
+echo.
+call :bootstrap_python
 if not defined PYEXE goto :nopython
 
+:python_found
 echo Found Python: %PYEXE%
 %PYEXE% --version
 echo.
+goto :after_python
+
+REM ======================================================================
+REM Finds a real, working Python and sets PYEXE. Every candidate is proven
+REM by actually running "--version" and checking the output -- never by
+REM looking at its file path. (An earlier draft rejected anything whose
+REM path contained "WindowsApps" to dodge the Microsoft Store's placeholder
+REM stub -- but a *legitimately* Store-installed Python also resolves
+REM through that same WindowsApps path once "App execution aliases" are
+REM turned on for it, so that draft broke on exactly that machine. A
+REM functional check can't make that mistake: if it prints a real version,
+REM it works, no matter where the exe lives.)
+REM ======================================================================
+:find_python
+set "PYEXE="
+
+py -3 --version >"%PYCHECK_FILE%" 2>&1
+findstr /b /i "Python " "%PYCHECK_FILE%" >nul 2>&1 && set "PYEXE=py -3"
+
+if not defined PYEXE (
+  python --version >"%PYCHECK_FILE%" 2>&1
+  findstr /b /i "Python " "%PYCHECK_FILE%" >nul 2>&1 && set "PYEXE=python"
+)
+
+if not defined PYEXE (
+  python3 --version >"%PYCHECK_FILE%" 2>&1
+  findstr /b /i "Python " "%PYCHECK_FILE%" >nul 2>&1 && set "PYEXE=python3"
+)
+
+REM Microsoft Store install: same functional check, just a fixed path --
+REM works whether or not "App execution aliases" happen to be on.
+if not defined PYEXE (
+  set "STORE_PY=%LOCALAPPDATA%\Microsoft\WindowsApps\python.exe"
+  "%STORE_PY%" --version >"%PYCHECK_FILE%" 2>&1
+  findstr /b /i "Python " "%PYCHECK_FILE%" >nul 2>&1 && set "PYEXE="%STORE_PY%""
+)
+
+REM Registry (covers machines where both PATH and aliases are misconfigured)
+if not defined PYEXE (
+  reg query "HKCU\Software\Python\PythonCore" /s /v ExecutablePath >"%TEMP%\lvt_pyreg.txt" 2>nul
+  for /f "tokens=2,*" %%A in ('findstr /i "ExecutablePath" "%TEMP%\lvt_pyreg.txt"') do if exist "%%B" if not defined PYEXE set "PYEXE="%%B""
+)
+if not defined PYEXE (
+  reg query "HKLM\Software\Python\PythonCore" /s /v ExecutablePath >"%TEMP%\lvt_pyreg.txt" 2>nul
+  for /f "tokens=2,*" %%A in ('findstr /i "ExecutablePath" "%TEMP%\lvt_pyreg.txt"') do if exist "%%B" if not defined PYEXE set "PYEXE="%%B""
+)
+del "%TEMP%\lvt_pyreg.txt" >nul 2>&1
+
+REM Last resort: common install folders, Python 3.8 through 3.15+.
+if not defined PYEXE (
+  for /d %%D in (
+    "%LOCALAPPDATA%\Programs\Python\Python3*"
+    "%PROGRAMFILES%\Python3*"
+    "%PF86%\Python3*"
+    "C:\Python3*"
+  ) do if exist "%%D\python.exe" if not defined PYEXE set "PYEXE="%%D\python.exe""
+)
+
+del "%PYCHECK_FILE%" >nul 2>&1
+exit /b 0
+
+REM ======================================================================
+REM Downloads and silently installs Python 3.12 for the current user only,
+REM then re-runs find_python so the rest of the script picks it up. Two
+REM download methods are tried: curl.exe (built into Windows 10 1803+ and
+REM Windows 11) already trusts the Windows certificate store -- the same
+REM store corporate SSL-inspection proxies (Zscaler / Netskope) install
+REM their CA into -- so it usually just works; PowerShell is the fallback
+REM for the rare machine without curl.
+REM ======================================================================
+:bootstrap_python
+set "PYVER=3.12.7"
+set "PYINSTALLER=%TEMP%\lvt_python_installer.exe"
+set "PYURL=https://www.python.org/ftp/python/%PYVER%/python-%PYVER%-amd64.exe"
+
+if exist "%PYINSTALLER%" del "%PYINSTALLER%" >nul 2>&1
+
+echo   [1/2] Downloading Python %PYVER% via curl ...
+curl.exe -fsSL -o "%PYINSTALLER%" "%PYURL%" >nul 2>&1
+
+if not exist "%PYINSTALLER%" (
+  echo   [2/2] curl unavailable or blocked - retrying via PowerShell ...
+  powershell -NoProfile -ExecutionPolicy Bypass -Command "try { Invoke-WebRequest -Uri '%PYURL%' -OutFile '%PYINSTALLER%' -UseBasicParsing } catch { exit 1 }"
+)
+
+if not exist "%PYINSTALLER%" (
+  echo.
+  echo   [WARNING] Could not download the Python installer - no network
+  echo   path worked. Send this window's text to Marc.
+  exit /b 0
+)
+
+echo.
+echo   Installing (this can take a minute; no window will pop up) ...
+"%PYINSTALLER%" /quiet InstallAllUsers=0 PrependPath=1 Include_launcher=1 Include_test=0 SimpleInstall=1
+
+REM The installer process can exit before the files are fully in place
+REM under slow AV scanning, so poll for the interpreter instead of
+REM assuming the process exiting means it's ready.
+set "NEWPY=%LOCALAPPDATA%\Programs\Python\Python312\python.exe"
+set /a WAITED=0
+:bootstrap_wait
+if exist "%NEWPY%" goto :bootstrap_installed
+if %WAITED% GEQ 120 goto :bootstrap_timeout
+ping -n 3 127.0.0.1 >nul
+set /a WAITED+=2
+goto :bootstrap_wait
+
+:bootstrap_timeout
+echo.
+echo   [WARNING] The installer did not finish in time. Send this
+echo   window's text to Marc, or re-run setup.bat once it finishes.
+exit /b 0
+
+:bootstrap_installed
+del "%PYINSTALLER%" >nul 2>&1
+echo   Python %PYVER% installed.
+echo.
+call :find_python
+exit /b 0
+
+:after_python
 
 REM --- 2. Create the virtual environment --------------------------------
 if exist ".venv\Scripts\python.exe" (
@@ -64,11 +182,11 @@ if exist ".venv\Scripts\python.exe" (
 
 set "VENV_PY=%~dp0.venv\Scripts\python.exe"
 
-REM --- 3. Upgrade pip (best effort; ignore failure) ---------------------
+REM --- 3. Upgrade pip, setuptools, and wheel (best effort) --------------
 echo.
-echo Upgrading pip ...
-"%VENV_PY%" -m pip install --upgrade pip >nul 2>&1
-if errorlevel 1 "%VENV_PY%" -m pip install --use-feature=truststore --upgrade pip >nul 2>&1
+echo Upgrading core setup tools (pip, setuptools, wheel) ...
+"%VENV_PY%" -m pip install --upgrade pip setuptools wheel >nul 2>&1
+if errorlevel 1 "%VENV_PY%" -m pip install --use-feature=truststore --upgrade pip setuptools wheel >nul 2>&1
 
 REM --- 4. Install CORE packages (three-tier fallback) ------------------
 REM Installed separately from the Snowflake driver only so the driver gets
@@ -176,6 +294,7 @@ echo       "Run Analytics Writer.bat"
 echo       "Run Audit Report.bat"
 echo ============================================================
 echo.
+popd
 pause
 exit /b 0
 
@@ -198,7 +317,11 @@ echo.
 goto :fail
 
 :nopython
-echo [ERROR] Could not find Python on this computer.
+echo [ERROR] Could not find or install Python on this computer.
+echo.
+echo   An automatic install was attempted and failed - see the messages
+echo   above for why (usually a blocked download). You can install it
+echo   yourself instead:
 echo.
 echo   1. Install Python 3.11 or newer from:
 echo          https://www.python.org/downloads/
@@ -208,6 +331,8 @@ echo      "Add python.exe to PATH" before clicking Install.
 echo.
 echo   3. Then double-click setup.bat again.
 echo.
+echo   If that still doesn't work, copy this window's text and send
+echo   it to Marc.
 goto :fail
 
 :venvfail
@@ -233,5 +358,6 @@ goto :fail
 echo.
 echo Setup did not finish. Read the message above, then close this window.
 echo.
+popd
 pause
 exit /b 1

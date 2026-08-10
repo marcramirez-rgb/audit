@@ -855,6 +855,13 @@ class WriterApp(ctk.CTk):
         ip = self.ip_entry.get().strip()
         user = self.user_entry.get().strip()
         password = self.pass_entry.get().strip()
+        if ip and ":" in ip:
+            # Port is its own field -- a stray "10.23.23.182:" or "10.23.23.182:5010"
+            # in the IP box combines with that field into an invalid "ip::port" URL
+            # (InvalidURL) instead of a clear error, so strip it here.
+            stripped = ip.split(":", 1)[0].strip()
+            self._log(f"[!] IP field had a ':' in it (port is its own field) -- using '{stripped}'.")
+            ip = stripped
         if not (ip and user and password):
             self._log("[!] Enter IP, username, and password first.")
             return None
