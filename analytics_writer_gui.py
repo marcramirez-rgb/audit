@@ -96,6 +96,23 @@ KIND_TO_LABEL = {v: k for k, v in LABEL_TO_KIND.items()}
 ctk.set_appearance_mode("light")
 
 
+def _points_bbox(points):
+    """Bounding box (fx0, fy0, fx1, fy1) of a list of (fx, fy) fraction points."""
+    xs = [p[0] for p in points]
+    ys = [p[1] for p in points]
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def _rect_overlaps(bbox, rect):
+    """True if fraction rect (fx, fy, fw, fh) intersects bbox (fx0, fy0, fx1, fy1).
+    Hikvision rejects the whole push (400 badParameters) if a SizeFilter min/max box
+    sits entirely outside the RuleRegion's own area, even though nothing in the wire
+    format requires the two to relate -- confirmed live against 10.23.23.182:5010 ch2."""
+    bx0, by0, bx1, by1 = bbox
+    rx, ry, rw, rh = rect
+    return bx0 < rx + rw and rx < bx1 and by0 < ry + rh and ry < by1
+
+
 def _bind_wheel(scroll_frame):
     """Forward mouse-wheel events from a CTkScrollableFrame and every child to the
     frame's canvas, so the wheel scrolls even when the pointer is over a child
@@ -1395,6 +1412,16 @@ class WriterApp(ctk.CTk):
             max_size = next((r for (r, l) in self.edit_size if l == "max"), None)
             if bool(min_size) != bool(max_size):
                 return None, "Set BOTH a min and a max size box (or clear sizes)."
+            if min_size and max_size:
+                region_bbox = _points_bbox(points)
+                if not _rect_overlaps(region_bbox, min_size):
+                    return None, ("The min size box doesn't overlap the drawn zone -- this "
+                                  "camera rejects the whole push if a size box sits outside "
+                                  "the zone. Redraw the min box over the zone.")
+                if not _rect_overlaps(region_bbox, max_size):
+                    return None, ("The max size box doesn't overlap the drawn zone -- this "
+                                  "camera rejects the whole push if a size box sits outside "
+                                  "the zone. Redraw the max box over the zone.")
 
         sc = vendor_adapter.Scenario(
             name=name, kind=kind, points=points, classes=classes, duration=duration,
