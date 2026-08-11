@@ -62,6 +62,10 @@ class AxisAdapter:
         multi_class=True, exclusions=True, direction=True, can_delete=True, perspective=True,
         notes="AOA: full config replace -- add/edit/delete all supported.")
 
+    # Movement between the two readings bracketing a capture that means "the camera
+    # moved on us": pan deg, tilt deg, zoom (Axis zoom is a 1..9999 lens position).
+    PTZ_DRIFT_TOLERANCE = (1.0, 1.0, 50.0)
+
     def __init__(self, ip, port, user, password, channel=None, **_):
         # channel selects a physical sensor on a multi-sensor Axis unit (e.g. P3747,
         # verified against a real 10.23.135.24:5010). None (the default, ordinary
@@ -70,11 +74,44 @@ class AxisAdapter:
         self.client = aoa_config.AOAClient(ip, user, password, port, channel_idx=self.device_id)
 
     def fetch_snapshot(self, log=None):
-        # `log` is part of the shared adapter interface (see HikAdapter, which uses it
-        # to narrate PTZ scene repositioning). LVT's Axis units are fixed-mount, so
-        # there is nothing to reposition here -- mirrors the audit engine's no-op
-        # reposition_for_scene hook for Axis.
-        return self.client.fetch_snapshot()
+        """Snapshot at the PRESET the analytics are bound to -- not wherever the
+        dome currently points. LVT's Axis units are Q6135-LE PTZ domes and their AOA
+        scenarios bind to a saved preset (fleet-wide: 143 of 149 scenarios in local
+        backups carry one, usually preset 2 "Scene1"). Zones are drawn on this frame
+        and pushed as fractions of it, so a patrol-position frame would put the
+        pushed polygon in the wrong place on the scene the rule actually evaluates:
+        false alarms or missed intrusions. Goto the preset, wait for the lens to
+        stop, capture, then confirm it didn't move during the capture. Fixed Axis
+        models have no PTZ to query and flow through unchanged."""
+        log = log or (lambda _m: None)
+        handler = self.client._axis
+        session, port = self.client.session, self.client.port
+        camera = self.device_id or 1
+
+        preset = self._analytics_preset()
+        if preset is not None:
+            if handler.goto_preset(session, port, preset, camera=camera):
+                log(f"[*] PTZ moved to AOA preset {preset} and settled.")
+            else:
+                log(f"[!] Could not park the camera at AOA preset {preset} -- it may be "
+                    f"mid-patrol. Zones drawn on this frame may not line up; re-fetch.")
+
+        before = handler.ptz_position(session, port, camera=camera)
+        img = self.client.fetch_snapshot()
+        delta = camera_engine.ptz_delta(before, handler.ptz_position(session, port, camera=camera))
+        if delta and any(d > t for d, t in zip(delta, self.PTZ_DRIFT_TOLERANCE)):
+            log(f"[!] Camera MOVED during capture (pan {delta[0]:.1f}°, tilt {delta[1]:.1f}°, "
+                f"zoom {delta[2]:.0f}) -- likely mid-patrol. Fetch again before drawing.")
+        return img
+
+    def _analytics_preset(self):
+        """PTZ preset this camera's AOA scenarios are bound to, or None when the
+        unit is fixed / nothing is bound. Warns nothing here -- callers log."""
+        try:
+            presets = camera_engine.aoa_scenario_presets(self.client.get_config())
+        except Exception:
+            return None
+        return presets[0] if presets else None
 
     def read_scenarios(self):
         cfg = self.client.get_config()
@@ -166,6 +203,16 @@ class AxisAdapter:
                                                   device_id=self.device_id or 1)
         if excl and sc.kind != "line":
             aoa_config.add_exclude_zones(scenario, excl)
+
+        if orig is None:
+            # New scenario on a PTZ dome: bind it to the same preset the camera's
+            # other scenarios use. A scenario with an empty `presets` list isn't tied
+            # to the guard position, so on a patrolling unit it would be evaluated
+            # against whatever the lens sees. Editing preserves the original binding
+            # via update_scenario_geometry, so this only applies to creates.
+            preset = self._analytics_preset()
+            if preset is not None:
+                scenario["presets"] = [preset]
 
         if not sc.perspective:
             return self.client.apply_scenario(scenario, backup_dir)
@@ -260,18 +307,17 @@ class HikAdapter:
             return tuple(vals)
         return None
 
-    @staticmethod
-    def _ptz_drift(before, after):
+    # Movement between the two readings bracketing a capture that means "the camera
+    # moved on us": pan deg, tilt deg, zoom (Hik reports zoom as a ratio).
+    PTZ_DRIFT_TOLERANCE = (1.0, 1.0, 0.5)
+
+    @classmethod
+    def _ptz_drift(cls, before, after):
         """Human-readable description of camera movement between two _ptz_status
-        readings, or None when it held still (or either reading is unavailable).
-        Pan compares on the shortest 360-degree path."""
-        if not before or not after:
-            return None
-        pan_d = abs((after[0] - before[0] + 180.0) % 360.0 - 180.0)
-        tilt_d = abs(after[1] - before[1])
-        zoom_d = abs(after[2] - before[2])
-        if pan_d > 1.0 or tilt_d > 1.0 or zoom_d > 0.5:
-            return f"pan {pan_d:.1f}°, tilt {tilt_d:.1f}°, zoom {zoom_d:.1f}"
+        readings, or None when it held still (or either reading is unavailable)."""
+        delta = camera_engine.ptz_delta(before, after)
+        if delta and any(d > t for d, t in zip(delta, cls.PTZ_DRIFT_TOLERANCE)):
+            return f"pan {delta[0]:.1f}°, tilt {delta[1]:.1f}°, zoom {delta[2]:.1f}"
         return None
 
     def read_scenarios(self):

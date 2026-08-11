@@ -162,6 +162,33 @@ def _extract_hik_channel_id(behavior_rule_url):
     return candidate if candidate.isdigit() else None
 
 
+def ptz_delta(before, after):
+    """Absolute (pan, tilt, zoom) difference between two (pan, tilt, zoom) readings,
+    pan measured on the shortest 360-degree path. None if either reading is missing.
+    Shared by the audit and the writer to tell 'the camera held still' from 'the
+    camera moved on us'; callers supply their own per-vendor tolerances (Axis zoom
+    is a 1..9999 lens position, Hikvision's is a ratio)."""
+    if not before or not after:
+        return None
+    pan = abs((after[0] - before[0] + 180.0) % 360.0 - 180.0)
+    return (pan, abs(after[1] - before[1]), abs(after[2] - before[2]))
+
+
+def aoa_scenario_presets(config):
+    """PTZ preset ids the scenarios in an AOA getConfiguration payload bind to, most
+    used first. Axis ties each scenario to a saved preset on a PTZ unit, and only a
+    snapshot taken at that preset shares the zones' coordinate space. Non-positive
+    ids are ignored (a real fleet backup carried a bogus -2)."""
+    if not isinstance(config, dict):
+        return []
+    counts = {}
+    for s in config.get("data", {}).get("scenarios", []) or []:
+        for p in s.get("presets") or []:
+            if isinstance(p, int) and p > 0:
+                counts[p] = counts.get(p, 0) + 1
+    return [p for p, _ in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))]
+
+
 def _extract_hik_scene_id(behavior_rule_url):
     """Scene-document id from a concrete behaviorRule URL ('.../behaviorRule/2' ->
     '2'), or None for the bracketed placeholder URL used on a failed fetch. Feeds
@@ -495,6 +522,84 @@ class AxisHandler(CameraHandler):
     def __init__(self, ip, user, password):
         super().__init__(ip, user, password)
         self.fallback_dim = (1280, 720)
+
+    # LVT's Axis units are PTZ domes (Q6135-LE) and their AOA scenarios bind to a
+    # saved preset -- 143 of 149 scenarios across local fleet backups carry one
+    # (mostly preset 2, "Scene1"). A snapshot taken while the dome is off-preset
+    # does NOT share those zones' coordinate space: overlays render misaligned in
+    # reports, and in the writer a zone drawn on such a frame would be pushed
+    # misaligned into the camera. So reposition before any analytics-aligned
+    # capture. Fixed Axis models reject these calls and flow through unchanged.
+    PTZ_SETTLE_TIMEOUT_SECONDS = 10.0
+    PTZ_SETTLE_POLL_SECONDS = 0.5
+    PTZ_STILL_TOLERANCE = (0.5, 0.5, 20.0)  # pan deg, tilt deg, zoom units (1..9999)
+
+    def ptz_position(self, session, port, camera=1):
+        """(pan, tilt, zoom) via VAPIX, or None when the unit has no queryable PTZ
+        (fixed models) or the query fails."""
+        url = f"http://{self.ip}:{port}/axis-cgi/com/ptz.cgi?camera={camera}&query=position"
+        for auth in self.auth_strategies:
+            try:
+                r = session.get(url, auth=auth, timeout=STRICT_TIMEOUT, verify=False)
+            except requests.exceptions.RequestException:
+                return None
+            if r.status_code == 401:
+                continue
+            if r.status_code != 200:
+                return None
+            vals = dict(re.findall(r"^(\w+)=(-?[\d.]+)\s*$", r.text or "", re.M))
+            try:
+                return (float(vals["pan"]), float(vals["tilt"]), float(vals["zoom"]))
+            except (KeyError, ValueError):
+                return None
+        return None
+
+    def goto_preset(self, session, port, preset, camera=1):
+        """Move to a saved server preset and wait until the lens actually stops.
+
+        Polls the position rather than sleeping a fixed interval: a dome that was
+        mid-patrol can still be traveling when a fixed wait expires, and that frame
+        is as wrong as no reposition at all. Returns True once two consecutive
+        readings agree (or the move was accepted but position isn't queryable),
+        False if the goto was rejected or the camera never settled."""
+        url = (f"http://{self.ip}:{port}/axis-cgi/com/ptz.cgi"
+               f"?camera={camera}&gotoserverpresetno={preset}")
+        accepted = False
+        for auth in self.auth_strategies:
+            try:
+                r = session.get(url, auth=auth, timeout=STRICT_TIMEOUT, verify=False)
+            except requests.exceptions.RequestException:
+                return False
+            if r.status_code == 401:
+                continue
+            # VAPIX answers a successful ptz.cgi CONTROL command with 204 No Content
+            # (only queries return 200) -- accept any 2xx or the goto looks rejected.
+            accepted = 200 <= r.status_code < 300
+            break
+        if not accepted:
+            return False
+        deadline = time.time() + self.PTZ_SETTLE_TIMEOUT_SECONDS
+        last = None
+        while time.time() < deadline:
+            time.sleep(self.PTZ_SETTLE_POLL_SECONDS)
+            now = self.ptz_position(session, port, camera)
+            if now is None:
+                return True  # moved, but we can't verify -- don't block the caller
+            delta = ptz_delta(last, now)
+            if delta and all(d <= t for d, t in zip(delta, self.PTZ_STILL_TOLERANCE)):
+                return True
+            last = now
+        return False  # still moving: camera is fighting us, likely an active patrol
+
+    def reposition_for_scene(self, session, port, channel_id, scene_id):
+        """Axis analogue of the Hik scenePtz goto: the 'scene' is the saved PTZ
+        preset an AOA scenario binds to; channel_id is the sensor/camera index."""
+        try:
+            camera = int(channel_id) if channel_id else 1
+            preset = int(scene_id)
+        except (TypeError, ValueError):
+            return False
+        return self.goto_preset(session, port, preset, camera=camera)
 
     def fetch_snapshot(self, session, port, channel_idx=None):
         # channel_idx selects a sensor on multi-sensor Axis units (e.g. P3747) via the
@@ -1347,6 +1452,16 @@ def process_camera_row(args):
                         camera_image.close()
                         camera_image = fresh_img
                         img_w, img_h = camera_image.size
+            elif vendor_label == "Axis" and payload_data is not None:
+                # Same idea for Axis PTZ domes, where the "scene" is the AOA preset.
+                presets = aoa_scenario_presets(payload_data)
+                if presets and handler.reposition_for_scene(sess, port, 1, presets[0]):
+                    results["logs"].append(f"    [+] Repositioned PTZ to AOA preset {presets[0]}, re-fetching snapshot (Port {port}).")
+                    fresh_img, _, _, _ = handler.fetch_snapshot(sess, port)
+                    if fresh_img is not None:
+                        camera_image.close()
+                        camera_image = fresh_img
+                        img_w, img_h = camera_image.size
 
             pos_label = f"{pos} [{vendor_label}]"
 
@@ -1419,6 +1534,20 @@ def process_camera_row(args):
                 img_w, img_h = camera_image.size
 
             payload_data, req_url, err_msg, analytics_auth_rejected = handler.fetch_analytics(sess, port)
+            # AOA scenarios on a PTZ dome bind to a saved preset; the snapshot above
+            # was taken wherever the lens happened to be. Reposition and re-capture
+            # so the rendered overlay matches the zones (the Hik branch below does
+            # the equivalent with its scenePtz scene).
+            if payload_data is not None:
+                presets = aoa_scenario_presets(payload_data)
+                if presets and handler.reposition_for_scene(sess, port, 1, presets[0]):
+                    results["logs"].append(f"    [+] Repositioned PTZ to AOA preset {presets[0]}, re-fetching snapshot (Port {port}).")
+                    fresh_img, _, _, _ = handler.fetch_snapshot(sess, port)
+                    if fresh_img is not None:
+                        if camera_image is not None:
+                            camera_image.close()
+                        camera_image = fresh_img
+                        img_w, img_h = camera_image.size
             if payload_data is not None and camera_image is None:
                 results["logs"].append("    [!] Analytics retrieved but snapshot unavailable; rendering overlay on placeholder canvas.")
         else:
