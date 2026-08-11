@@ -60,6 +60,9 @@ WRITE_ENABLED = True
 
 CANVAS_W, CANVAS_H = 900, 506      # 16:9 drawing surface (startup size; it now follows the window)
 CANVAS_MIN_W, CANVAS_MIN_H = 360, 203  # floor the canvas may shrink to on a small screen
+LOG_H, LOG_MIN_H = 150, 60             # log pane: default height, and floor when space is tight
+WIN_W, WIN_H = 1180, 860           # preferred window size, clamped to the actual screen
+WIN_MIN_W, WIN_MIN_H = 880, 560    # smallest window that still fits sidebar + canvas + log
 BACKUP_DIR = Path(__file__).with_name("aoa_backups")
 HIK_BACKUP_DIR = Path(__file__).with_name("hik_backups")
 
@@ -127,7 +130,12 @@ def _bind_wheel(scroll_frame):
         return "break"
 
     def _bind(widget):
-        widget.bind("<MouseWheel>", _on_wheel)
+        # Some CTk composites (CTkSegmentedButton) raise NotImplementedError on bind();
+        # skip those and keep walking -- their inner tk widgets take the binding instead.
+        try:
+            widget.bind("<MouseWheel>", _on_wheel)
+        except (NotImplementedError, tk.TclError, AttributeError):
+            pass
         for child in widget.winfo_children():
             _bind(child)
 
@@ -432,10 +440,10 @@ class WriterApp(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.title("LiveView Technologies -- Analytics Writer")
-        # Size to the screen instead of demanding a fixed 1180x860: on a 1366x768 laptop
-        # that pushed the canvas and log off the bottom with no way to scroll to them.
-        self._apply_startup_geometry(1180, 860)
-        self.minsize(880, 560)
+        # Size to the screen instead of demanding a fixed 1180x860: on a small or
+        # high-DPI laptop that pushed the canvas and log off the bottom with no way to
+        # scroll to them, so the window had to be maximized to be usable.
+        self._apply_startup_geometry(WIN_W, WIN_H)
         self.configure(fg_color=LVT_WHITE)
 
         self.msg_queue = queue.Queue()
@@ -551,12 +559,29 @@ class WriterApp(ctk.CTk):
 
     # -------------------------------------------------------------- layout
     def _apply_startup_geometry(self, want_w, want_h):
-        """Open at the preferred size, clamped to what the screen can actually show
-        (and centred), so the tool is usable on a laptop without maximizing."""
-        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
-        w = max(880, min(want_w, sw - 80))
-        h = max(560, min(want_h, sh - 120))
-        x, y = max(0, (sw - w) // 2), max(0, (sh - h) // 3)
+        """Open at the preferred size, clamped to what the screen can actually show, with
+        a matching floor, so the tool is usable on a laptop without maximizing.
+
+        Two different unit spaces are in play on a high-DPI display, and mixing them is
+        what produced a window taller than the screen. At 125% on a 1920x1200 panel:
+          - winfo_screenwidth/height report DPI-VIRTUALIZED units (1536x960);
+          - CustomTkinter multiplies whatever geometry()/minsize() are handed by the
+            scaling factor, so a 1180x860 request becomes a 1475x1075 PHYSICAL window;
+          - the +x+y offsets are passed through unscaled, i.e. physical.
+        So: convert the screen to physical, budget there, then divide back out."""
+        try:
+            sf = ctk.ScalingTracker.get_window_scaling(self) or 1.0
+        except Exception:
+            sf = 1.0
+        screen_w = self.winfo_screenwidth() * sf                 # physical pixels
+        screen_h = self.winfo_screenheight() * sf
+        avail_w = (screen_w - 60) / sf   # leave room for borders...
+        avail_h = (screen_h - 100) / sf  # ...and the taskbar
+        w = int(max(WIN_MIN_W, min(want_w, avail_w)))
+        h = int(max(WIN_MIN_H, min(want_h, avail_h)))
+        self.minsize(int(min(WIN_MIN_W, avail_w)), int(min(WIN_MIN_H, avail_h)))
+        x = max(0, int((screen_w - w * sf) / 2))
+        y = max(0, int((screen_h - h * sf) / 3))
         self.geometry(f"{w}x{h}+{x}+{y}")
 
     def _build_header(self):
@@ -579,7 +604,13 @@ class WriterApp(ctk.CTk):
         self._build_canvas_area(body)
 
     def _build_sidebar(self, parent):
-        side = ctk.CTkScrollableFrame(parent, fg_color=LVT_LIGHT, corner_radius=10, width=300)
+        # height= is deliberately SMALL. Without it a CTkScrollableFrame requests the full
+        # height of its contents (~1000px of controls), which becomes the minimum for the
+        # grid row it shares with the canvas -- so the right-hand column was pushed past
+        # the bottom of the window and the log fell off-screen on anything but a big
+        # maximized display. It scrolls internally and expands via sticky="nsew".
+        side = ctk.CTkScrollableFrame(parent, fg_color=LVT_LIGHT, corner_radius=10,
+                                      width=300, height=CANVAS_MIN_H + LOG_MIN_H)
         side.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
 
         def label(txt, pad=(10, 2)):
@@ -784,9 +815,11 @@ class WriterApp(ctk.CTk):
 
         # Canvas over log with a draggable sash: on a short screen the operator can hand
         # the drawing surface the room instead of losing it under a fixed-height log.
-        split = tk.PanedWindow(right, orient="vertical", sashwidth=7, sashrelief="flat",
-                               bg=LVT_WHITE, bd=0, showhandle=False)
+        self.split = split = tk.PanedWindow(right, orient="vertical", sashwidth=7, sashrelief="flat",
+                                            bg=LVT_WHITE, bd=0, showhandle=False)
         split.grid(row=1, column=0, sticky="nsew")
+        self._log_pane_h = LOG_H  # log height the operator last chose (sash drag)
+        self._sash_job = None
 
         # Requested size is the FLOOR the layout may shrink to, not the drawing size --
         # the old 900x506 request is what made the window unshrinkable. The pane hands
@@ -801,9 +834,47 @@ class WriterApp(ctk.CTk):
         self.canvas.bind("<Configure>", self._on_canvas_configure)
 
         self.log_box = ctk.CTkTextbox(split, fg_color=LVT_LOG_BG, text_color=LVT_LOG_TEXT,
-                                      font=ctk.CTkFont(family="Consolas", size=11), wrap="word", height=150)
-        split.add(self.log_box, minsize=60, height=150, stretch="never")
+                                      font=ctk.CTkFont(family="Consolas", size=11), wrap="word", height=LOG_H)
+        split.add(self.log_box, minsize=LOG_MIN_H, height=LOG_H, stretch="never")
         self.log_box.configure(state="disabled")
+        split.bind("<Configure>", self._on_split_configure)
+        split.bind("<ButtonRelease-1>", self._on_sash_release)
+
+    def _on_split_configure(self, _event=None):
+        """A tk.PanedWindow leaves its sash where it was when the container shrinks (and
+        hands every new pixel to the stretch="always" pane when it grows), so the log
+        ends up pinned at its minimum or pushed off the bottom edge -- the very problem
+        this layout work is fixing. Re-place the sash after each resize.
+
+        Deferred to after_idle deliberately: this instance binding fires BEFORE the
+        PanedWindow's own internal re-layout, which would otherwise overwrite the sash
+        position we just set."""
+        if self._sash_job is None:
+            self._sash_job = self.after_idle(self._place_sash)
+
+    def _place_sash(self):
+        self._sash_job = None
+        try:
+            total = self.split.winfo_height()
+            if total <= 1:
+                return
+            sash_w = int(self.split.cget("sashwidth"))
+            log_h = max(LOG_MIN_H, min(self._log_pane_h, total - CANVAS_MIN_H - sash_w))
+            y = max(CANVAS_MIN_H, total - log_h - sash_w)
+            if abs(self.split.sash_coord(0)[1] - y) > 1:
+                self.split.sash_place(0, 0, y)
+        except tk.TclError:
+            pass  # window torn down before the idle callback ran
+
+    def _on_sash_release(self, _event=None):
+        """Remember the log height the operator dragged to, so later resizes preserve it."""
+        try:
+            y = self.split.sash_coord(0)[1]
+        except tk.TclError:
+            return
+        total = self.split.winfo_height()
+        if total > 1:
+            self._log_pane_h = max(LOG_MIN_H, total - y - int(self.split.cget("sashwidth")))
 
     # -------------------------------------------------------------- behavior
     def _log(self, text):
@@ -1051,7 +1122,7 @@ class WriterApp(ctk.CTk):
 
     def _apply_canvas_size(self):
         self._resize_job = None
-        if self._pending_canvas_size is None:
+        if self._pending_canvas_size is None or not self.canvas.winfo_exists():
             return
         old_scale, old_ox, old_oy = self.scale, self.offset_x, self.offset_y
         had_image = self.tk_image is not None

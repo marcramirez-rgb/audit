@@ -36,6 +36,17 @@ LVT_WHITE = "#FFFFFF"
 LVT_LOG_BG = "#0F1117"
 LVT_LOG_TEXT = "#D6EFEF"
 
+WIN_W, WIN_H = 980, 950          # preferred window size, clamped to the actual screen
+WIN_MIN_W, WIN_MIN_H = 820, 730  # smallest window that still fits every stacked section.
+                                 # Measured against the CONTENT-SIZED tabs (Single/CSV),
+                                 # which are taller than the Fleet Picker floor and so set
+                                 # the real minimum; below this the log gets squeezed out.
+PICKER_MIN_H = 200               # Fleet Picker page floor; it grows with the window
+LOG_MIN_H = 100                  # keep some log visible even when space is tight
+
+# Root grid rows, top to bottom.
+ROW_HEADER, ROW_TABS, ROW_CREDS, ROW_CONTROLS, ROW_LOG = range(5)
+
 ctk.set_appearance_mode("light")
 
 
@@ -86,9 +97,18 @@ class App(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.title("LiveView Technologies Camera Analytics")
-        self.geometry("980x950")
-        self.minsize(860, 760)
+        # Size to the screen rather than demanding a fixed 980x950. At 125% display
+        # scaling that request became a 1225x1187 window -- taller than a 1080p screen --
+        # so the log and Start controls sat below the bottom edge until you maximized.
+        self._apply_startup_geometry(WIN_W, WIN_H)
         self.configure(fg_color=LVT_WHITE)
+
+        # Root uses grid (not pack) so the flexible sections are explicit: the Fleet
+        # Picker page and the log share the spare height, everything else keeps its
+        # natural size and can never be squeezed off-screen.
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(ROW_TABS, weight=0)  # raised to 1 on the Fleet Picker tab
+        self.grid_rowconfigure(ROW_LOG, weight=1)
 
         self.msg_queue = queue.Queue()
         self.csv_rows = None
@@ -115,9 +135,36 @@ class App(ctk.CTk):
 
     # ---------------------------------------------------------------- layout
 
+    def _apply_startup_geometry(self, want_w, want_h):
+        """Open at the preferred size, clamped to what the screen can actually show, with
+        a matching floor, so the tool is usable on a laptop without maximizing.
+        (analytics_writer_gui.py carries the same helper -- keep the two in step.)
+
+        Two unit spaces are in play on a high-DPI display, and mixing them is what
+        produced a window taller than the screen. At 125% on a 1920x1200 panel:
+          - winfo_screenwidth/height report DPI-VIRTUALIZED units (1536x960);
+          - CustomTkinter multiplies whatever geometry()/minsize() are handed by the
+            scaling factor, so a 980x950 request becomes a 1225x1187 PHYSICAL window;
+          - the +x+y offsets are passed through unscaled, i.e. physical.
+        So: convert the screen to physical, budget there, then divide back out."""
+        try:
+            sf = ctk.ScalingTracker.get_window_scaling(self) or 1.0
+        except Exception:
+            sf = 1.0
+        screen_w = self.winfo_screenwidth() * sf                 # physical pixels
+        screen_h = self.winfo_screenheight() * sf
+        avail_w = (screen_w - 60) / sf   # leave room for borders...
+        avail_h = (screen_h - 100) / sf  # ...and the taskbar
+        w = int(max(WIN_MIN_W, min(want_w, avail_w)))
+        h = int(max(WIN_MIN_H, min(want_h, avail_h)))
+        self.minsize(int(min(WIN_MIN_W, avail_w)), int(min(WIN_MIN_H, avail_h)))
+        x = max(0, int((screen_w - w * sf) / 2))
+        y = max(0, int((screen_h - h * sf) / 3))
+        self.geometry(f"{w}x{h}+{x}+{y}")
+
     def _build_header(self):
         header = ctk.CTkFrame(self, fg_color=LVT_DARK_TEAL, corner_radius=0, height=72)
-        header.pack(fill="x", side="top")
+        header.grid(row=ROW_HEADER, column=0, sticky="ew")
         header.pack_propagate(False)
 
         ctk.CTkLabel(header, text="LiveView Technologies Camera Analytics", font=ctk.CTkFont(size=22, weight="bold"),
@@ -132,13 +179,21 @@ class App(ctk.CTk):
             segmented_button_unselected_color=LVT_TEAL, segmented_button_unselected_hover_color=LVT_TEAL_HOVER,
             text_color=LVT_WHITE, command=self._on_tab_changed,
         )
-        self.tabview.pack(fill="x", padx=20, pady=(16, 8))
+        self.tabview.grid(row=ROW_TABS, column=0, sticky="nsew", padx=20, pady=(16, 8))
         self.tab_single = self.tabview.add("Single Camera Test")
         self.tab_csv = self.tabview.add("CSV Batch")
         self.tab_picker = self.tabview.add("Fleet Picker")
         self._build_single_tab(self.tab_single)
         self._build_csv_tab(self.tab_csv)
         self._build_picker_tab(self.tab_picker)
+        self._apply_tab_weight()
+
+    def _apply_tab_weight(self):
+        """Only the Fleet Picker page gains anything from extra height (more units on
+        screen), so it is the only tab that shares spare space with the log. The short
+        tabs stay content-sized, which keeps their original look."""
+        picker = self.tabview.get() == "Fleet Picker"
+        self.grid_rowconfigure(ROW_TABS, weight=1 if picker else 0)
 
     def _build_single_tab(self, tab):
         tab.grid_columnconfigure(1, weight=1)
@@ -193,8 +248,12 @@ class App(ctk.CTk):
         # credentials / Start controls (below the tabview) off-screen -- and the
         # inner lists are plain blocks, NOT their own scroll regions, so there is
         # a SINGLE scrollbar for the panel instead of several fighting ones.
-        page = ctk.CTkScrollableFrame(tab, fg_color=LVT_LIGHT, height=430)
-        page.pack(fill="x", expand=False)
+        # height= is the FLOOR this page may shrink to, not its working size -- a fixed
+        # 430 here became a hard minimum for the whole window, so on a short screen the
+        # log and Start controls were pushed off the bottom. It expands past this
+        # whenever the window has the room.
+        page = ctk.CTkScrollableFrame(tab, fg_color=LVT_LIGHT, height=PICKER_MIN_H)
+        page.pack(fill="both", expand=True)
         page.grid_columnconfigure(1, weight=1)
         self.picker_page = page
 
@@ -382,7 +441,12 @@ class App(ctk.CTk):
             return "break"
 
         def _bind(widget):
-            widget.bind("<MouseWheel>", _on_wheel)
+            # Some CTk composites (CTkSegmentedButton) raise NotImplementedError on
+            # bind(); skip those and keep walking rather than taking the app down.
+            try:
+                widget.bind("<MouseWheel>", _on_wheel)
+            except (NotImplementedError, tk.TclError, AttributeError):
+                pass
             for child in widget.winfo_children():
                 _bind(child)
 
@@ -528,7 +592,7 @@ class App(ctk.CTk):
 
     def _build_credentials(self):
         frame = ctk.CTkFrame(self, fg_color="transparent")
-        frame.pack(fill="x", padx=20, pady=8)
+        frame.grid(row=ROW_CREDS, column=0, sticky="ew", padx=20, pady=8)
         frame.grid_columnconfigure((0, 1), weight=1)
 
         self.axis_creds = CredentialBlock(frame, "Axis Credentials")
@@ -539,7 +603,7 @@ class App(ctk.CTk):
 
     def _build_controls(self):
         frame = ctk.CTkFrame(self, fg_color="transparent")
-        frame.pack(fill="x", padx=20, pady=(4, 8))
+        frame.grid(row=ROW_CONTROLS, column=0, sticky="ew", padx=20, pady=(4, 8))
         frame.grid_columnconfigure(0, weight=1)
 
         self.start_button = ctk.CTkButton(frame, text="Start Processing", command=self._start_processing,
@@ -563,18 +627,22 @@ class App(ctk.CTk):
 
     def _build_log(self):
         frame = ctk.CTkFrame(self, fg_color="transparent")
-        frame.pack(fill="both", expand=True, padx=20, pady=(0, 16))
+        frame.grid(row=ROW_LOG, column=0, sticky="nsew", padx=20, pady=(0, 16))
         frame.grid_columnconfigure(0, weight=1)
         frame.grid_rowconfigure(0, weight=1)
 
+        # height= is the floor, not the size: the row has weight so the log takes all
+        # remaining height. The CTkTextbox default (200) would raise the window minimum.
         self.log_box = ctk.CTkTextbox(frame, fg_color=LVT_LOG_BG, text_color=LVT_LOG_TEXT,
-                                       font=ctk.CTkFont(family="Consolas", size=12), wrap="word")
+                                       font=ctk.CTkFont(family="Consolas", size=12), wrap="word",
+                                       height=LOG_MIN_H)
         self.log_box.grid(row=0, column=0, sticky="nsew")
         self.log_box.configure(state="disabled")
 
     # ------------------------------------------------------------- behavior
 
     def _on_tab_changed(self):
+        self._apply_tab_weight()
         if self.tabview.get() == "Fleet Picker":
             self._picker_ensure_loaded()
         self._refresh_credential_requirements()
