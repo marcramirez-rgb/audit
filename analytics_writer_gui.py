@@ -967,8 +967,8 @@ class WriterApp(ctk.CTk):
         if not adapter:
             return
         self._log(f"[*] Fetching snapshot from {adapter.vendor} {self.ip_entry.get().strip()} ...")
-        if adapter.vendor == "Hikvision":
-            self._log("[.] PTZ units are first sent to their analytics scene -- allow ~7s.")
+        self._log("[.] PTZ units are first sent to the position their analytics are "
+                  "bound to (Hik scene / Axis preset) -- allow ~7s.")
 
         def work():
             try:
