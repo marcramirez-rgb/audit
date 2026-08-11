@@ -16,6 +16,8 @@ supports neither).
 
 from dataclasses import dataclass, field
 
+import requests
+
 import aoa_config
 import camera_engine
 import hik_config
@@ -67,7 +69,11 @@ class AxisAdapter:
         self.device_id = int(channel) if channel else None
         self.client = aoa_config.AOAClient(ip, user, password, port, channel_idx=self.device_id)
 
-    def fetch_snapshot(self):
+    def fetch_snapshot(self, log=None):
+        # `log` is part of the shared adapter interface (see HikAdapter, which uses it
+        # to narrate PTZ scene repositioning). LVT's Axis units are fixed-mount, so
+        # there is nothing to reposition here -- mirrors the audit engine's no-op
+        # reposition_for_scene hook for Axis.
         return self.client.fetch_snapshot()
 
     def read_scenarios(self):
@@ -194,14 +200,79 @@ class HikAdapter:
         self.client = hik_config.HikClient(ip, user, password, port, channel=channel)
         self._axis_snap = None  # Hik snapshots come from camera_engine; see fetch_snapshot
 
-    def fetch_snapshot(self):
-        import camera_engine
+    def fetch_snapshot(self, log=None):
+        """Snapshot of the ANALYTICS SCENE view -- not wherever the lens happens to
+        be pointing. PTZ Hik domes patrol: zones are drawn on this frame and their
+        coordinates bind to the rule's scene, so a mid-patrol frame would make the
+        operator draw (and later push) a polygon that is misaligned on the real
+        scene view -- mis-alerts / missed intrusions once the camera returns home.
+        Mirrors the audit engine: goto the rule-bearing scene, let the PTZ settle,
+        capture, then confirm the camera didn't move DURING capture (a patrol tick
+        between goto and the image GET would silently poison the frame). Fixed
+        cameras reject the goto and the position query, and flow through unchanged."""
+        log = log or (lambda _m: None)
         h = camera_engine.HikvisionHandler(self.client.ip, "", "")
         h.auth_strategies = self.client.auth_strategies
+
+        selected = self.client.channel
+        target = (self._first_rule_doc([selected, "1" if selected == "2" else "2"])
+                  or (selected, 1))
+        ch, sid = target
+        if h.reposition_for_scene(self.client.session, self.client.port, ch, sid):
+            log(f"[*] PTZ repositioned to analytics scene {sid} (ch{ch}) and settled.")
+
+        pos_before = self._ptz_status()
         img, url, err, auth_rej = h.fetch_snapshot(self.client.session, self.client.port)
         if img is None:
             raise hik_config.HikError(f"snapshot failed at {url}: {err}")
+        drift = self._ptz_drift(pos_before, self._ptz_status())
+        if drift:
+            log(f"[!] Camera MOVED during capture ({drift}) -- likely mid-patrol. "
+                f"Fetch the snapshot again before drawing, or zones will be misaligned.")
         return img
+
+    def _ptz_status(self):
+        """Current (pan, tilt, zoom) from the PTZ status endpoint, or None when the
+        unit has no queryable PTZ (fixed cameras) or any value is missing. ISAPI
+        reports azimuth/elevation/zoom as value x10."""
+        url = f"http://{self.client.ip}:{self.client.port}/ISAPI/PTZCtrl/channels/1/status"
+        for auth in self.client.auth_strategies:
+            try:
+                r = self.client.session.get(url, auth=auth, timeout=hik_config.NET_TIMEOUT,
+                                            verify=False)
+            except requests.exceptions.RequestException:
+                return None
+            if r.status_code == 401:
+                continue
+            if r.status_code != 200:
+                return None
+            import xml.etree.ElementTree as ET
+            try:
+                root = ET.fromstring(r.text)
+            except ET.ParseError:
+                return None
+            vals = []
+            for tag in ("azimuth", "elevation", "absoluteZoom"):
+                el = root.find(f".//{{*}}{tag}")
+                if el is None or not el.text:
+                    return None
+                vals.append(float(el.text) / 10.0)
+            return tuple(vals)
+        return None
+
+    @staticmethod
+    def _ptz_drift(before, after):
+        """Human-readable description of camera movement between two _ptz_status
+        readings, or None when it held still (or either reading is unavailable).
+        Pan compares on the shortest 360-degree path."""
+        if not before or not after:
+            return None
+        pan_d = abs((after[0] - before[0] + 180.0) % 360.0 - 180.0)
+        tilt_d = abs(after[1] - before[1])
+        zoom_d = abs(after[2] - before[2])
+        if pan_d > 1.0 or tilt_d > 1.0 or zoom_d > 0.5:
+            return f"pan {pan_d:.1f}°, tilt {tilt_d:.1f}°, zoom {zoom_d:.1f}"
+        return None
 
     def read_scenarios(self):
         """Return every rule on the camera: scan BOTH channels and ALL scene docs.
@@ -314,25 +385,35 @@ class HikAdapter:
         self.client.put_behavior_rule(new_xml)
         return backup_path, self.client.get_behavior_rule()
 
+    def _first_rule_doc(self, channels):
+        """First (channel, sid) whose behaviorRule document already carries rules,
+        scanning scene docs 1..MAX_SCENE_DOCS per given channel. None when every
+        document is empty (or a channel is unreadable). Restores the client's
+        channel/sid either way."""
+        orig_ch, orig_sid = self.client.channel, self.client.sid
+        try:
+            for ch in channels:
+                self.client.channel = ch
+                for sid in range(1, hik_config.MAX_SCENE_DOCS + 1):
+                    self.client.sid = sid
+                    try:
+                        count, _, _ = hik_config.rule_summary(self.client.get_behavior_rule())
+                    except Exception:
+                        break
+                    if count:
+                        return ch, sid
+            return None
+        finally:
+            self.client.channel, self.client.sid = orig_ch, orig_sid
+
     def _locate_create_sid(self):
         """Scene document a NEW rule should land in on the currently selected channel:
         the first document that already carries rules -- rules in an inactive scene
         document do nothing, and where the existing rules sit is where the camera's
         active scene lives. Falls back to document 1 (the pre-scene-aware behavior)
         when the whole channel is empty."""
-        original = self.client.sid
-        try:
-            for sid in range(1, hik_config.MAX_SCENE_DOCS + 1):
-                self.client.sid = sid
-                try:
-                    count, _, _ = hik_config.rule_summary(self.client.get_behavior_rule())
-                except Exception:
-                    break
-                if count:
-                    return sid
-            return 1
-        finally:
-            self.client.sid = original
+        found = self._first_rule_doc([self.client.channel])
+        return found[1] if found else 1
 
     @staticmethod
     def _frac_rect_to_hik(rect):

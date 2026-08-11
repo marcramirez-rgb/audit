@@ -58,7 +58,8 @@ PERSP_OUTLINE = "#51CF66"     # Axis perspective calibration bars (green)
 # setConfiguration round-trip + add/verify/restore all proven. Gate is open.
 WRITE_ENABLED = True
 
-CANVAS_W, CANVAS_H = 900, 506  # 16:9 drawing surface
+CANVAS_W, CANVAS_H = 900, 506      # 16:9 drawing surface (startup size; it now follows the window)
+CANVAS_MIN_W, CANVAS_MIN_H = 360, 203  # floor the canvas may shrink to on a small screen
 BACKUP_DIR = Path(__file__).with_name("aoa_backups")
 HIK_BACKUP_DIR = Path(__file__).with_name("hik_backups")
 
@@ -431,8 +432,10 @@ class WriterApp(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.title("LiveView Technologies -- Analytics Writer")
-        self.geometry("1180x860")
-        self.minsize(1040, 760)
+        # Size to the screen instead of demanding a fixed 1180x860: on a 1366x768 laptop
+        # that pushed the canvas and log off the bottom with no way to scroll to them.
+        self._apply_startup_geometry(1180, 860)
+        self.minsize(880, 560)
         self.configure(fg_color=LVT_WHITE)
 
         self.msg_queue = queue.Queue()
@@ -459,6 +462,11 @@ class WriterApp(ctk.CTk):
         self.perspective_bars = []     # editable calibration bars: [{"height":cm, "points":[canvas pts]}]
         self.current_bar = []          # in-progress bar (canvas pts; 2 clicks = 1 bar)
         self.bar_mode = False          # canvas clicks place calibration bars instead of zones
+        # Live canvas size -- the drawing surface follows the window, so scale/offset and
+        # every stored canvas-pixel point are recomputed whenever it changes.
+        self.canvas_w, self.canvas_h = CANVAS_W, CANVAS_H
+        self._resize_job = None
+        self._pending_canvas_size = None
 
         self._build_header()
         self._build_body()
@@ -542,6 +550,15 @@ class WriterApp(ctk.CTk):
         self._on_rule_change()  # refresh loiter/fence frame visibility under new type list
 
     # -------------------------------------------------------------- layout
+    def _apply_startup_geometry(self, want_w, want_h):
+        """Open at the preferred size, clamped to what the screen can actually show
+        (and centred), so the tool is usable on a laptop without maximizing."""
+        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+        w = max(880, min(want_w, sw - 80))
+        h = max(560, min(want_h, sh - 120))
+        x, y = max(0, (sw - w) // 2), max(0, (sh - h) // 3)
+        self.geometry(f"{w}x{h}+{x}+{y}")
+
     def _build_header(self):
         header = ctk.CTkFrame(self, fg_color=LVT_DARK_TEAL, corner_radius=0, height=72)
         header.pack(fill="x", side="top")
@@ -750,6 +767,10 @@ class WriterApp(ctk.CTk):
                          text_color=LVT_TEXT_MUTED, font=ctk.CTkFont(size=10), justify="left").pack(
                 anchor="w", padx=12, pady=(0, 8))
 
+        # The sidebar is taller than most screens; without this the wheel does nothing
+        # unless the pointer happens to sit on the frame's own background.
+        _bind_wheel(side)
+
     def _build_canvas_area(self, parent):
         right = ctk.CTkFrame(parent, fg_color="transparent")
         right.grid(row=0, column=1, sticky="nsew")
@@ -761,17 +782,27 @@ class WriterApp(ctk.CTk):
                                         text_color=LVT_TEXT_MUTED, anchor="w")
         self.coord_label.grid(row=0, column=0, sticky="ew", pady=(0, 6))
 
-        self.canvas = tk.Canvas(right, width=CANVAS_W, height=CANVAS_H, bg="#0B0D12",
+        # Canvas over log with a draggable sash: on a short screen the operator can hand
+        # the drawing surface the room instead of losing it under a fixed-height log.
+        split = tk.PanedWindow(right, orient="vertical", sashwidth=7, sashrelief="flat",
+                               bg=LVT_WHITE, bd=0, showhandle=False)
+        split.grid(row=1, column=0, sticky="nsew")
+
+        # Requested size is the FLOOR the layout may shrink to, not the drawing size --
+        # the old 900x506 request is what made the window unshrinkable. The pane hands
+        # the canvas whatever space is actually left, and <Configure> rescales into it.
+        self.canvas = tk.Canvas(split, width=CANVAS_MIN_W, height=CANVAS_MIN_H, bg="#0B0D12",
                                 highlightthickness=1, highlightbackground=LVT_DARK_TEAL)
-        self.canvas.grid(row=1, column=0, sticky="nw")
+        split.add(self.canvas, minsize=CANVAS_MIN_H, stretch="always")
         self.canvas.bind("<Button-1>", self._on_canvas_click)
         self.canvas.bind("<B1-Motion>", self._on_canvas_drag)
         self.canvas.bind("<ButtonRelease-1>", self._on_canvas_release)
         self.canvas.bind("<Motion>", self._on_canvas_motion)
+        self.canvas.bind("<Configure>", self._on_canvas_configure)
 
-        self.log_box = ctk.CTkTextbox(right, fg_color=LVT_LOG_BG, text_color=LVT_LOG_TEXT,
+        self.log_box = ctk.CTkTextbox(split, fg_color=LVT_LOG_BG, text_color=LVT_LOG_TEXT,
                                       font=ctk.CTkFont(family="Consolas", size=11), wrap="word", height=150)
-        self.log_box.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+        split.add(self.log_box, minsize=60, height=150, stretch="never")
         self.log_box.configure(state="disabled")
 
     # -------------------------------------------------------------- behavior
@@ -936,10 +967,13 @@ class WriterApp(ctk.CTk):
         if not adapter:
             return
         self._log(f"[*] Fetching snapshot from {adapter.vendor} {self.ip_entry.get().strip()} ...")
+        if adapter.vendor == "Hikvision":
+            self._log("[.] PTZ units are first sent to their analytics scene -- allow ~7s.")
 
         def work():
             try:
-                self.msg_queue.put(("snapshot", adapter.fetch_snapshot()))
+                snap_log = lambda m: self.msg_queue.put(("log", m))
+                self.msg_queue.put(("snapshot", adapter.fetch_snapshot(log=snap_log)))
             except Exception as e:
                 self.msg_queue.put(("log", f"[!] Snapshot failed: {e}"))
         self._run_bg(work)
@@ -954,7 +988,8 @@ class WriterApp(ctk.CTk):
         def work():
             try:
                 if need_snap:
-                    self.msg_queue.put(("snapshot", adapter.fetch_snapshot()))
+                    snap_log = lambda m: self.msg_queue.put(("log", m))
+                    self.msg_queue.put(("snapshot", adapter.fetch_snapshot(log=snap_log)))
                 scenarios = adapter.read_scenarios()
                 overlays = []
                 lines = [f"[+] {len(scenarios)} scenario(s) configured:"]
@@ -988,15 +1023,67 @@ class WriterApp(ctk.CTk):
         self._run_bg(work)
 
     # ---- canvas drawing
+    def _fit_image(self):
+        """(Re)fit the snapshot to the CURRENT canvas size: recompute scale/offset and
+        rebuild the display bitmap. Coordinates always normalize against the original
+        full-res image, so refitting never touches what gets written to the camera."""
+        if self.pil_image is None or not self.img_w or not self.img_h:
+            self.scale, self.offset_x, self.offset_y = 1.0, 0, 0
+            self.tk_image = None
+            return
+        cw, ch = max(self.canvas_w, 1), max(self.canvas_h, 1)
+        self.scale = min(cw / self.img_w, ch / self.img_h)
+        disp_w = max(int(self.img_w * self.scale), 1)
+        disp_h = max(int(self.img_h * self.scale), 1)
+        self.offset_x = (cw - disp_w) // 2
+        self.offset_y = (ch - disp_h) // 2
+        self.tk_image = ImageTk.PhotoImage(self.pil_image.resize((disp_w, disp_h), Image.LANCZOS))
+
+    def _on_canvas_configure(self, event):
+        """The canvas now follows the window. Debounce the flood of Configure events a
+        drag produces -- refitting does a LANCZOS resize of the full-res snapshot."""
+        if abs(event.width - self.canvas_w) < 2 and abs(event.height - self.canvas_h) < 2:
+            return
+        self._pending_canvas_size = (event.width, event.height)
+        if self._resize_job is not None:
+            self.after_cancel(self._resize_job)
+        self._resize_job = self.after(90, self._apply_canvas_size)
+
+    def _apply_canvas_size(self):
+        self._resize_job = None
+        if self._pending_canvas_size is None:
+            return
+        old_scale, old_ox, old_oy = self.scale, self.offset_x, self.offset_y
+        had_image = self.tk_image is not None
+        self.canvas_w, self.canvas_h = self._pending_canvas_size
+        self._pending_canvas_size = None
+        self._fit_image()
+        if had_image and old_scale:
+            self._remap_points(old_scale, old_ox, old_oy)
+        self._redraw()
+
+    def _remap_points(self, old_scale, old_ox, old_oy):
+        """In-progress geometry is stored in canvas pixels, so a resize has to move every
+        stored point to the same spot on the newly scaled image. (existing_overlays and
+        edit_size are kept as fractions and follow the new scale on their own.)"""
+        def remap(p):
+            fx = (p[0] - old_ox) / old_scale / self.img_w
+            fy = (p[1] - old_oy) / old_scale / self.img_h
+            return self._frac_to_canvas(fx, fy)
+
+        self.points = [remap(p) for p in self.points]
+        self.exclude_zones = [[remap(p) for p in zone] for zone in self.exclude_zones]
+        self.current_exclude = [remap(p) for p in self.current_exclude]
+        self.current_bar = [remap(p) for p in self.current_bar]
+        for bar in self.perspective_bars:
+            bar["points"] = [remap(p) for p in bar["points"]]
+        if self.size_first is not None:
+            self.size_first = remap(self.size_first)
+
     def _display_image(self, pil_img):
         self.pil_image = pil_img
         self.img_w, self.img_h = pil_img.size
-        self.scale = min(CANVAS_W / self.img_w, CANVAS_H / self.img_h)
-        disp_w, disp_h = int(self.img_w * self.scale), int(self.img_h * self.scale)
-        self.offset_x = (CANVAS_W - disp_w) // 2
-        self.offset_y = (CANVAS_H - disp_h) // 2
-        resized = pil_img.resize((disp_w, disp_h), Image.LANCZOS)
-        self.tk_image = ImageTk.PhotoImage(resized)
+        self._fit_image()
         self.points = []
         self.exclude_zones = []
         self.current_exclude = []

@@ -185,10 +185,10 @@ class CameraHandler:
     def fetch_analytics(self, session, port):
         raise NotImplementedError
 
-    def reposition_for_scene(self, session, port, channel_id, rule_index):
+    def reposition_for_scene(self, session, port, channel_id, scene_id):
         """Optional hook for camera types that need physical repositioning before a
         snapshot will match an analytics rule's coordinate space (e.g. a PTZ camera
-        that binds a rule to a saved pan/tilt/zoom preset). No-op by default --
+        that binds its rules to a saved pan/tilt/zoom scene). No-op by default --
         fixed cameras (and Axis, until proven otherwise) don't need this."""
         return False
 
@@ -213,8 +213,8 @@ class HikvisionHandler(CameraHandler):
     # the rule/live view again -- an observed real value, not a guess.
     PTZ_SETTLE_WAIT_SECONDS = 6.5
 
-    def reposition_for_scene(self, session, port, channel_id, rule_index):
-        goto_url = f"http://{self.ip}:{port}/ISAPI/Intelligent/channels/{channel_id}/scenePtz/{rule_index}/goto"
+    def reposition_for_scene(self, session, port, channel_id, scene_id):
+        goto_url = f"http://{self.ip}:{port}/ISAPI/Intelligent/channels/{channel_id}/scenePtz/{scene_id}/goto"
         for auth in self.auth_strategies:
             try:
                 response = session.put(goto_url, auth=auth, timeout=STRICT_TIMEOUT, verify=False)
