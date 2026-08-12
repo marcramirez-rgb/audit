@@ -223,6 +223,10 @@ Both GUIs can pull the fleet straight from Snowflake so you select
 
 - **Audit Report GUI** — the **Fleet Picker** tab (build a multi-client batch, no CSV).
 - **Analytics Writer GUI** — the **Pick from fleet…** button (fill IP + vendor for one camera).
+  The picker window **stays open after "Use this camera"** and tags that unit
+  "· loaded", so updating a whole location is pick → write → pick the next unit,
+  with no re-searching. Closing it only hides it (your place is kept), and your
+  last Client/Location comes back automatically on the next launch.
 
 **There's nothing to configure — no `.env` file.** LVT's Snowflake
 account/warehouse/role are built into the app, and your login is auto-detected

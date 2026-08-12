@@ -41,3 +41,7 @@ hik_push_debug/
 
 # PTZ drift audit reports (ptz_tester.py output -- real fleet IPs + scene imagery)
 PTZ_*.xlsx
+
+# Fleet Picker convenience prefs (last client/location picked -- client names
+# are fleet data, so never commit)
+fleet_picker_prefs.json

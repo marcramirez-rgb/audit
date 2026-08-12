@@ -10,10 +10,13 @@ Capabilities (schema + write path validated live against AOA API 1.6):
     * Connect + fetch snapshot, read current scenarios (read-only)
     * Overlay existing scenarios on the snapshot in amber
     * Draw intrusion / line-crossing / loitering scenarios + exclusion areas
+    * Grab-and-drag editing: drag a vertex to reshape; drag inside a shape to
+      move the whole thing (zones, exclusions, lines, size boxes, bars)
     * Edit an existing scenario in place (preserves perspective/presets/filters)
     * Auto-backup before every write; one-click restore from backup
 """
 
+import json
 import os
 import queue
 import re
@@ -65,6 +68,9 @@ WIN_W, WIN_H = 1180, 860           # preferred window size, clamped to the actua
 WIN_MIN_W, WIN_MIN_H = 880, 560    # smallest window that still fits sidebar + canvas + log
 BACKUP_DIR = Path(__file__).with_name("aoa_backups")
 HIK_BACKUP_DIR = Path(__file__).with_name("hik_backups")
+# Remembers the last fleet-picker Client/Location between app launches. Client
+# names are fleet data, so the file is gitignored -- never commit it.
+FLEET_PICKER_PREFS = Path(__file__).with_name("fleet_picker_prefs.json")
 
 NEW_SCENARIO = "(new scenario)"
 DIR_L2R = "Left → Right"
@@ -149,6 +155,7 @@ class _FilterList(ctk.CTkFrame):
         self._cap = cap
         self._all = []
         self._selected = None
+        self._marked = set()   # values tagged "· loaded"; survives filtering and set_items
         ctk.CTkLabel(self, text=label, text_color=LVT_TEXT_DARK).pack(anchor="w")
         self._entry = ctk.CTkEntry(self, placeholder_text=placeholder)
         self._entry.pack(fill="x")
@@ -178,6 +185,22 @@ class _FilterList(ctk.CTkFrame):
     def get(self):
         return self._selected
 
+    def select(self, value):
+        """Programmatically pick ``value`` exactly as if it were clicked (fires
+        ``on_choose``). Used to put a prior selection back after a reload.
+        Returns False (and does nothing) if it isn't in the current items."""
+        if value not in self._all:
+            return False
+        self._choose(value)
+        return True
+
+    def mark(self, value):
+        """Tag a value with a lasting "· loaded" suffix -- the picker uses it to
+        show which units were already sent to the writer this session."""
+        self._marked.add(value)
+        if self._all:
+            self._render()
+
     def _placeholder(self, text):
         for c in self._results.winfo_children():
             c.destroy()
@@ -196,7 +219,10 @@ class _FilterList(ctk.CTkFrame):
             return
         for v in shown:
             is_sel = (v == self._selected)
-            ctk.CTkButton(self._results, text=("✓  " + v) if is_sel else v, anchor="w", height=24,
+            text = ("✓  " + v) if is_sel else v
+            if v in self._marked:
+                text += "    · loaded"
+            ctk.CTkButton(self._results, text=text, anchor="w", height=24,
                           fg_color=LVT_DARK_TEAL if is_sel else "transparent",
                           text_color=LVT_WHITE if is_sel else LVT_TEXT_DARK, hover_color=LVT_LIGHT,
                           command=lambda vv=v: self._choose(vv)).pack(fill="x", padx=4, pady=1)
@@ -214,13 +240,51 @@ class _FilterList(ctk.CTkFrame):
         self._on_choose(v)
 
 
+def _load_picker_prefs():
+    """Last Client/Location the operator had picked, saved across app launches
+    (a site visit usually spans several sessions at ONE location). Returns a
+    restore dict for the cascade, or None."""
+    try:
+        data = json.loads(FLEET_PICKER_PREFS.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    client = (data.get("client") or "").strip()
+    if not client:
+        return None
+    location = (data.get("location") or "").strip()
+    return {"client": client, "location": location or None, "tdc": None}
+
+
+def _save_picker_prefs(client, location):
+    """Persist the picker's Client/Location for the next launch. Best-effort:
+    prefs are a convenience and must never break the picker itself."""
+    try:
+        FLEET_PICKER_PREFS.write_text(
+            json.dumps({"client": client or "", "location": location or ""}, indent=2),
+            encoding="utf-8")
+    except OSError:
+        pass
+
+
 class FleetPickerDialog(ctk.CTkToplevel):
-    """Modal Client -> Location -> TDC -> camera picker (v2.0).
+    """Persistent, NON-modal Client -> Location -> TDC -> camera picker (v2.0).
 
     The writer targets one camera at a time, so this resolves a single selected
     camera and hands its IP + vendor back to the sidebar via ``on_select(ip,
     mfg_label)``. The LVT port (5010/5015/5020 = Center/Left/Right) stays on the
     sidebar dropdown -- the catalog can't know which position you're editing.
+
+    Built for the "update a whole location, unit by unit" workflow, one dialog
+    instance lives for the entire app session (WriterApp keeps it):
+
+      * "Use this camera" loads the pick into the writer but the window STAYS
+        OPEN, with the unit it came from tagged "· loaded" -- the next unit at
+        the location is one click away.
+      * Closing (X or the Close button) only hides it; reopening brings back the
+        same cascade, selections, and live Snowflake session instantly.
+      * Reload / source switches re-apply the current selection afterwards, and
+        the last Client/Location is remembered across app launches
+        (FLEET_PICKER_PREFS), so nobody re-searches just to get back to a site.
 
     Each cascade level is a type-to-filter list (client, location, TDC), so it
     scales to the live fleet and scrolls with the mouse wheel. Backed by
@@ -236,16 +300,28 @@ class FleetPickerDialog(ctk.CTkToplevel):
         self.minsize(420, 480)
         self.configure(fg_color=LVT_WHITE)
         self.transient(master)
+        # Hide on X instead of destroying, so state survives to the next open.
+        self.protocol("WM_DELETE_WINDOW", self._hide)
 
         self._q = queue.Queue()
         self.source = None
         self._cam_rows = []          # resolved camera rows for the chosen TDC
         self.cam_choice = tk.StringVar(value="")
+        self._restore = None         # pending {client, location, tdc} to re-apply
 
         self._build()
         self.after(80, self._poll)
         self._reload()
-        self.after(200, self.grab_set)  # after the window is mapped
+
+    # -- lifecycle (the dialog outlives each individual pick) --
+    def _hide(self):
+        self.withdraw()
+
+    def reopen(self):
+        """Bring the (possibly hidden) dialog back exactly as it was left."""
+        self.deiconify()
+        self.lift()
+        self.focus_force()
 
     # -- layout --
     def _build(self):
@@ -270,7 +346,7 @@ class FleetPickerDialog(ctk.CTkToplevel):
         self.use_btn = ctk.CTkButton(btn_row, text="Use this camera", command=self._use, state="disabled",
                                      fg_color=LVT_DARK_TEAL, hover_color=LVT_DARK_TEAL_HOVER)
         self.use_btn.pack(side="left", expand=True, fill="x", padx=(0, 6))
-        ctk.CTkButton(btn_row, text="Cancel", command=self.destroy, fg_color=LVT_TEAL,
+        ctk.CTkButton(btn_row, text="Close", command=self._hide, fg_color=LVT_TEAL,
                       hover_color=LVT_TEAL_HOVER, width=90).pack(side="right")
 
         # Single scroll region for everything between header and buttons.
@@ -330,13 +406,16 @@ class FleetPickerDialog(ctk.CTkToplevel):
             self.source, clients = payload
             self.status.configure(text=f"{self.source.label} — {len(clients)} client(s).", text_color=LVT_DARK_TEAL)
             self.client_list.set_items(clients, "No clients in this source.")
+            self._restore_step("client", self.client_list)
         elif tag == "locations":
             self.location_list.set_items(payload, "No locations for this client.")
             self.tdc_list.reset("Pick a location first.")
             self._cam_placeholder("Pick a unit to list its cameras.")
+            self._restore_step("location", self.location_list)
         elif tag == "units":
             self.tdc_list.set_items(payload, "No units at this location.")
             self._cam_placeholder("Pick a unit to list its cameras.")
+            self._restore_step("tdc", self.tdc_list)
         elif tag == "cameras":
             self._show_cameras(payload)
         elif tag == "error":
@@ -346,7 +425,31 @@ class FleetPickerDialog(ctk.CTkToplevel):
     def _pref(self):
         return {"Auto": "auto", "Live Snowflake": "live", "Cached catalog": "cache"}[self.source_var.get()]
 
+    def _restore_step(self, key, flist):
+        """Re-apply one level of a pending selection restore. Selecting fires the
+        level's ``on_choose``, which loads the next level down -- so the cascade
+        replays itself one payload at a time. Stops cleanly the moment a value
+        is missing from the freshly loaded list (renamed, other source, etc.)."""
+        if not self._restore:
+            return
+        want = self._restore.pop(key, None)
+        if not (want and flist.select(want)):
+            self._restore = None
+
+    def _selection_snapshot(self):
+        """Current cascade picks as a restore dict (None until a client is set)."""
+        client = self.client_list.get()
+        if not client:
+            return None
+        return {"client": client, "location": self.location_list.get(),
+                "tdc": self.tdc_list.get()}
+
     def _reload(self):
+        # Keep the operator's place: re-apply the current picks once the new
+        # source is up -- or, on the first load of the session, the Client/
+        # Location they had last time (saved prefs). Updating a whole location
+        # means coming back here over and over; nobody should re-search for it.
+        self._restore = self._selection_snapshot() or _load_picker_prefs()
         if self.source is not None:
             try:
                 self.source.close()
@@ -358,15 +461,18 @@ class FleetPickerDialog(ctk.CTkToplevel):
         self.tdc_list.reset("Pick a location first.")
         self._cam_placeholder("Loading…")
         self.status.configure(text="Connecting…", text_color=LVT_TEXT_MUTED)
-        self._bg(self._connect_and_clients, "clients")
+        # _pref() reads a tkinter var, so resolve it HERE on the UI thread; the
+        # worker must not touch tkinter ("main thread is not in main loop").
+        self._bg(self._connect_and_clients, "clients", self._pref())
 
-    def _connect_and_clients(self):
-        src = fleet_catalog.build_source(prefer=self._pref())
+    def _connect_and_clients(self, prefer):
+        src = fleet_catalog.build_source(prefer=prefer)
         return (src, src.list_clients())
 
     def _on_client(self, client):
         if not client or self.source is None:
             return
+        _save_picker_prefs(client, None)  # location follows once it's picked
         self.location_list.reset("Loading locations…")
         self.tdc_list.reset("Pick a location first.")
         self._cam_placeholder("Loading locations…")
@@ -376,6 +482,7 @@ class FleetPickerDialog(ctk.CTkToplevel):
         client = self.client_list.get()
         if not location or not client or self.source is None:
             return
+        _save_picker_prefs(client, location)
         self.tdc_list.reset("Loading units…")
         self._cam_placeholder("Loading units…")
         self._bg(self.source.list_units, "units", client, location)
@@ -417,7 +524,15 @@ class FleetPickerDialog(ctk.CTkToplevel):
                 "Use the IP anyway and set the vendor manually?", parent=self):
                 return
         self.on_select(ip, label)
-        self.destroy()
+        # Stay open: when a whole location is being updated unit by unit, the
+        # next pick must be one click away. Tag the unit so the operator can see
+        # which ones were already sent to the writer this session.
+        serial = self.tdc_list.get()
+        if serial:
+            self.tdc_list.mark(serial)
+        self.status.configure(
+            text=f"Loaded {ip} into the writer — pick the next unit here, or Close (your place is kept).",
+            text_color=LVT_DARK_TEAL)
 
 
 class WriterApp(ctk.CTk):
@@ -432,6 +547,7 @@ class WriterApp(ctk.CTk):
 
         self.msg_queue = queue.Queue()
         self.worker = None
+        self._fleet_picker = None      # one persistent FleetPickerDialog per session
 
         # Drawing / image state
         self.pil_image = None          # original full-res PIL image
@@ -440,6 +556,7 @@ class WriterApp(ctk.CTk):
         self.scale = 1.0               # display scale factor
         self.offset_x = self.offset_y = 0
         self.drag_target = None        # vertex being dragged (grab-and-drag), or None
+        self.shape_drag = None         # whole-shape move in progress: {target, press, last, moved}
         self.points = []               # canvas-pixel points for the INCLUDE zone/line
         self.exclude_zones = []        # list of finished exclusion polygons (canvas px)
         self.current_exclude = []      # exclusion polygon currently being drawn
@@ -493,7 +610,12 @@ class WriterApp(ctk.CTk):
         return None if v == "Auto" else v
 
     def _open_fleet_picker(self):
-        FleetPickerDialog(self, self._apply_fleet_pick)
+        # One dialog per session, hidden rather than destroyed on close: its
+        # cascade, "· loaded" tags, and Snowflake session survive between picks.
+        if self._fleet_picker is not None and self._fleet_picker.winfo_exists():
+            self._fleet_picker.reopen()
+        else:
+            self._fleet_picker = FleetPickerDialog(self, self._apply_fleet_pick)
 
     def _apply_fleet_pick(self, ip, mfg_label):
         """Callback from FleetPickerDialog: drop the chosen camera's IP + vendor
@@ -1285,7 +1407,9 @@ class WriterApp(ctk.CTk):
         iy = (cy - self.offset_y) / self.scale
         return ix, iy
 
-    DRAG_RADIUS = 9  # px hit-radius for grabbing a plotted vertex
+    DRAG_RADIUS = 9         # px hit-radius for grabbing a plotted vertex
+    SHAPE_GRAB_PX = 6       # px tolerance for grabbing a shape by its outline
+    MOVE_THRESHOLD_PX = 5   # a press must travel this far to become a shape-move (not a click)
 
     def _find_vertex(self, cx, cy):
         """Return a descriptor for the plotted vertex nearest to (cx, cy) within
@@ -1320,6 +1444,111 @@ class WriterApp(ctk.CTk):
                     return ("size", si, ci)
         return None
 
+    # -- whole-shape grab-and-move ------------------------------------------
+    @staticmethod
+    def _point_in_polygon(cx, cy, pts):
+        """Ray-cast containment test in canvas pixels."""
+        inside = False
+        n = len(pts)
+        for i in range(n):
+            x1, y1 = pts[i]
+            x2, y2 = pts[(i + 1) % n]
+            if (y1 > cy) != (y2 > cy):
+                if cx < (x2 - x1) * (cy - y1) / (y2 - y1) + x1:
+                    inside = not inside
+        return inside
+
+    @staticmethod
+    def _near_segment(cx, cy, a, b, tol):
+        """True if (cx, cy) lies within tol px of segment a-b."""
+        ax, ay = a
+        bx, by = b
+        vx, vy = bx - ax, by - ay
+        l2 = vx * vx + vy * vy
+        t = 0.0 if l2 == 0 else max(0.0, min(1.0, ((cx - ax) * vx + (cy - ay) * vy) / l2))
+        px, py = ax + t * vx, ay + t * vy
+        return (cx - px) ** 2 + (cy - py) ** 2 <= tol * tol
+
+    def _hits_shape(self, cx, cy, pts):
+        """Inside the polygon, or within SHAPE_GRAB_PX of its outline (the
+        outline test is what makes 2-point lines and skinny shapes grabbable)."""
+        if len(pts) < 2:
+            return False
+        if len(pts) >= 3 and self._point_in_polygon(cx, cy, pts):
+            return True
+        segs = range(len(pts)) if len(pts) >= 3 else range(1)
+        return any(self._near_segment(cx, cy, pts[i], pts[(i + 1) % len(pts)], self.SHAPE_GRAB_PX)
+                   for i in segs)
+
+    def _size_box_corners(self, si):
+        fx, fy, fw, fh = self.edit_size[si][0]
+        return [self._frac_to_canvas(cfx, cfy) for (cfx, cfy) in
+                ((fx, fy), (fx + fw, fy), (fx + fw, fy + fh), (fx, fy + fh))]
+
+    def _find_shape(self, cx, cy):
+        """Return a movable-shape descriptor under (cx, cy), or None. Checked
+        front-to-back: exclusions, size boxes, and bars usually sit INSIDE the
+        include zone, so they must win the hit or they could never be moved."""
+        for zi in range(len(self.exclude_zones) - 1, -1, -1):
+            if self._hits_shape(cx, cy, self.exclude_zones[zi]):
+                return ("exclude", zi)
+        for si in range(len(self.edit_size) - 1, -1, -1):
+            if self._hits_shape(cx, cy, self._size_box_corners(si)):
+                return ("size", si)
+        for bi, bar in enumerate(self.perspective_bars):
+            if self._hits_shape(cx, cy, bar["points"][:2]):
+                return ("bar", bi)
+        if self._hits_shape(cx, cy, self.points):
+            return ("points",)
+        return None
+
+    def _shape_canvas_points(self, target):
+        kind = target[0]
+        if kind == "points":
+            return self.points
+        if kind == "exclude":
+            return self.exclude_zones[target[1]]
+        if kind == "bar":
+            return self.perspective_bars[target[1]]["points"]
+        return self._size_box_corners(target[1])  # "size"
+
+    def _clamp_shape_delta(self, target, dx, dy):
+        """Limit a move delta so the ENTIRE shape stays on the displayed image
+        (same rule as the per-vertex clamp, applied to the shape's bbox)."""
+        pts = self._shape_canvas_points(target)
+        xs = [p[0] for p in pts]
+        ys = [p[1] for p in pts]
+        dx = max(self.offset_x - min(xs),
+                 min(dx, self.offset_x + self.img_w * self.scale - max(xs)))
+        dy = max(self.offset_y - min(ys),
+                 min(dy, self.offset_y + self.img_h * self.scale - max(ys)))
+        return dx, dy
+
+    def _translate_shape(self, target, dx, dy):
+        kind = target[0]
+        if kind == "points":
+            self.points = [(x + dx, y + dy) for (x, y) in self.points]
+        elif kind == "exclude":
+            zi = target[1]
+            self.exclude_zones[zi] = [(x + dx, y + dy) for (x, y) in self.exclude_zones[zi]]
+        elif kind == "bar":
+            bar = self.perspective_bars[target[1]]
+            bar["points"] = [(x + dx, y + dy) for (x, y) in bar["points"]]
+        else:  # "size" -- stored as a fraction rect, so shift it in fraction space
+            (fx, fy, fw, fh), lbl = self.edit_size[target[1]]
+            self.edit_size[target[1]] = ((fx + dx / (self.img_w * self.scale),
+                                          fy + dy / (self.img_h * self.scale), fw, fh), lbl)
+
+    def _shape_desc(self, target):
+        kind = target[0]
+        if kind == "points":
+            return "line" if self.rule_var.get() == "Line Crossing" else "include zone"
+        if kind == "exclude":
+            return f"exclusion zone {target[1] + 1}"
+        if kind == "size":
+            return f"{self.edit_size[target[1]][1]} size box"
+        return f"calibration bar {target[1] + 1}"
+
     def _set_vertex(self, target, x, y):
         kind = target[0]
         if kind == "points":
@@ -1342,16 +1571,44 @@ class WriterApp(ctk.CTk):
             self.edit_size[si] = (rect, lbl)
 
     def _on_canvas_drag(self, event):
-        if self.drag_target is None:
+        if self.drag_target is not None:
+            # clamp to the displayed image so a vertex can't be dragged off-frame
+            x = max(self.offset_x, min(self.offset_x + self.img_w * self.scale, event.x))
+            y = max(self.offset_y, min(self.offset_y + self.img_h * self.scale, event.y))
+            self._set_vertex(self.drag_target, x, y)
+            self._redraw()
             return
-        # clamp to the displayed image so a vertex can't be dragged off-frame
-        x = max(self.offset_x, min(self.offset_x + self.img_w * self.scale, event.x))
-        y = max(self.offset_y, min(self.offset_y + self.img_h * self.scale, event.y))
-        self._set_vertex(self.drag_target, x, y)
-        self._redraw()
+        sd = self.shape_drag
+        if sd is None:
+            return
+        if not sd["moved"]:
+            # Not a move until the pointer clearly travels -- below the threshold
+            # this is still just a click that will place a point on release.
+            px, py = sd["press"]
+            if (event.x - px) ** 2 + (event.y - py) ** 2 < self.MOVE_THRESHOLD_PX ** 2:
+                return
+            sd["moved"] = True
+        lx, ly = sd["last"]
+        dx, dy = self._clamp_shape_delta(sd["target"], event.x - lx, event.y - ly)
+        if dx or dy:
+            self._translate_shape(sd["target"], dx, dy)
+            # advance the anchor by the APPLIED delta only, so after hitting the
+            # image edge the shape re-attaches to the cursor without jumping
+            sd["last"] = (lx + dx, ly + dy)
+            self._redraw()
 
     def _on_canvas_release(self, _event):
         self.drag_target = None
+        sd, self.shape_drag = self.shape_drag, None
+        if sd is None:
+            return
+        if sd["moved"]:
+            self._log(f"[.] Moved {self._shape_desc(sd['target'])}.")
+            if sd["target"][0] == "points":
+                self._update_coord_label()
+        else:
+            # The press never became a drag -- deliver the click it always was.
+            self._place_point(*sd["press"])
 
     def _on_canvas_click(self, event):
         if not self.tk_image:
@@ -1370,16 +1627,34 @@ class WriterApp(ctk.CTk):
             else:
                 self.drag_target = target
             return
+        # Whole-shape grab: pressing INSIDE a drawn shape arms a move. Whether it
+        # becomes one is decided by motion -- drag past MOVE_THRESHOLD_PX slides the
+        # whole shape; release without movement falls through to _place_point, so
+        # clicking inside a zone still adds vertices/exclusion points exactly as
+        # before. Skipped while a placement mode is armed (size boxes / bars),
+        # where every click is spoken for.
+        if not (self.size_mode or self.bar_mode):
+            shape = self._find_shape(event.x, event.y)
+            if shape is not None:
+                self.shape_drag = {"target": shape, "press": (event.x, event.y),
+                                   "last": (event.x, event.y), "moved": False}
+                return
+        self._place_point(event.x, event.y)
+
+    def _place_point(self, x, y):
+        """Mode-aware click placement at canvas (x, y). Split out of the click
+        handler because a press on a shape only places its point on RELEASE
+        (once it's clear the press wasn't the start of a shape-move)."""
         # ignore clicks outside the image area
-        ix, iy = self._canvas_to_image_px(event.x, event.y)
+        ix, iy = self._canvas_to_image_px(x, y)
         if not (0 <= ix <= self.img_w and 0 <= iy <= self.img_h):
             return
         if self.size_mode:
             if self.size_first is None:
-                self.size_first = (event.x, event.y)
+                self.size_first = (x, y)
             else:
                 f0 = self._canvas_to_frac(*self.size_first)
-                f1 = self._canvas_to_frac(event.x, event.y)
+                f1 = self._canvas_to_frac(x, y)
                 rect = (min(f0[0], f1[0]), min(f0[1], f1[1]),
                         abs(f1[0] - f0[0]), abs(f1[1] - f0[1]))
                 self.edit_size = [(r, l) for (r, l) in self.edit_size if l != self.size_mode]
@@ -1389,7 +1664,7 @@ class WriterApp(ctk.CTk):
             self._redraw()
             return
         if self.bar_mode:
-            self.current_bar.append((event.x, event.y))
+            self.current_bar.append((x, y))
             if len(self.current_bar) == 2:
                 try:
                     h = int(self.bar_height_var.get().strip())
@@ -1408,20 +1683,27 @@ class WriterApp(ctk.CTk):
             if len(self.exclude_zones) >= aoa_config.MAX_EXCLUDE_ZONES:
                 self._log(f"[!] Max {aoa_config.MAX_EXCLUDE_ZONES} exclusion zones per scenario.")
                 return
-            self.current_exclude.append((event.x, event.y))
+            self.current_exclude.append((x, y))
         else:
             is_line = self.rule_var.get() == "Line Crossing"
             if is_line and len(self.points) >= 2:
                 self.points = []  # start a new line
-            self.points.append((event.x, event.y))
+            self.points.append((x, y))
         self._redraw()
         self._update_coord_label()
 
     def _on_canvas_motion(self, event):
         if not self.tk_image:
             return
-        # cursor hint: show a grab cursor when hovering over a draggable vertex
-        self.canvas.configure(cursor="hand2" if self._find_vertex(event.x, event.y) else "")
+        # cursor hints: grab-hand over a draggable vertex, move-cross over a
+        # shape body (drag inside a shape to slide the whole thing)
+        if self._find_vertex(event.x, event.y):
+            cur = "hand2"
+        elif not (self.size_mode or self.bar_mode) and self._find_shape(event.x, event.y):
+            cur = "fleur"
+        else:
+            cur = ""
+        self.canvas.configure(cursor=cur)
         ix, iy = self._canvas_to_image_px(event.x, event.y)
         if 0 <= ix <= self.img_w and 0 <= iy <= self.img_h:
             fx, fy = self._canvas_to_frac(event.x, event.y)

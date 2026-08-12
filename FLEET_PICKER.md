@@ -12,6 +12,23 @@ in both tools:
   (5010/5015/5020 = Center/Left/Right) yourself, since the catalog doesn't track
   which position you're editing.
 
+  The writer's picker is built for **updating a whole location unit by unit**:
+
+  - **"Use this camera" does NOT close the window.** The camera lands in the
+    writer, the unit gets tagged **"· loaded"** in the list, and the next unit
+    at that location is one click away. The dialog is non-modal — leave it open
+    off to the side while you draw and push.
+  - **Closing it (X / Close) only hides it.** Reopen with "Pick from fleet…"
+    and the same Client/Location/unit cascade — and the live Snowflake session —
+    are exactly as you left them. No reconnect, no re-search.
+  - **Reload keeps your place.** Reloading (or switching Live/Cached source)
+    re-applies your current Client → Location → unit selection after the new
+    data loads.
+  - **Your last Client/Location survives app restarts** (saved to
+    `fleet_picker_prefs.json` next to the app — gitignored, since client names
+    are fleet data). Next launch, the picker walks itself back to that
+    location's unit list; it deliberately does not re-pick the unit.
+
 ## Two data sources
 
 The picker reads from whichever is available (choose **Auto / Live Snowflake /
