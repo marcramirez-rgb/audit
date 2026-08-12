@@ -379,6 +379,125 @@ def patch_rule_geometry(xml_text, rule_name, region_hik, target=None, duration=N
     return None
 
 
+# ------------------------------------------------ outgoing-document validation
+# The firmware rejects an ENTIRE behaviorRule PUT (HTTP 400, statusCode 6 "Invalid XML
+# Content") when a rule's SizeFilter box falls outside that rule's own RuleRegion --
+# confirmed live on 10.23.23.182:5010 ch2. Since PUT re-sends the whole document, ONE
+# bad legacy rule blocks every future write no matter what the user just drew: a box
+# left over from the camera web UI, or a firmware default like
+# MaxObjectSize=(0,1000,1000,1000) whose y span starts at the very bottom edge.
+#
+# The writer's own pre-push check ([analytics_writer_gui.py] _rect_overlaps) can only
+# see the zone being drawn, so the sweep has to happen here, against the exact bytes
+# going out. Repairs are reported to the caller so the GUI can say what it touched --
+# these are rules the user did not author, so silently rewriting them is not on.
+
+COORD_MAX = 1000
+
+
+def _rule_label(ri):
+    rid = (ri.findtext("ns:ruleId", namespaces=NS) or "?").strip()
+    name = (ri.findtext("ns:ruleName", namespaces=NS) or "?").strip()
+    return f"rule {rid} '{name}'"
+
+
+def _region_bbox(ri):
+    """(x0, y0, x1, y1) of a rule's RuleRegion in 0..1000, or None if it has no points."""
+    pts = []
+    for rc in ri.findall(".//ns:RegionCoordinates", NS):
+        x = (rc.findtext("ns:positionX", namespaces=NS) or "").strip()
+        y = (rc.findtext("ns:positionY", namespaces=NS) or "").strip()
+        if x.lstrip("-").isdigit() and y.lstrip("-").isdigit():
+            pts.append((int(x), int(y)))
+    if not pts:
+        return None
+    xs, ys = [p[0] for p in pts], [p[1] for p in pts]
+    return (min(xs), min(ys), max(xs), max(ys))
+
+
+def _clamp_box_into(rect, bbox):
+    """Shrink/move size-filter box `rect` (x, y, w, h) so it sits inside region `bbox`.
+    Returns the corrected tuple, or None if the region is too small to hold a box."""
+    x0, y0, x1, y1 = bbox
+    x, y, w, h = rect
+    span_x, span_y = x1 - x0, y1 - y0
+    if span_x < 1 or span_y < 1:
+        return None
+    w = max(1, min(w, span_x))
+    h = max(1, min(h, span_y))
+    x = min(max(x, x0), x1 - w)
+    y = min(max(y, y0), y1 - h)
+    return (x, y, w, h)
+
+
+def sanitize_document(xml_text):
+    """Vet every rule in an outgoing behaviorRule document and repair what the firmware
+    would reject. Returns (xml, repairs, blockers):
+
+      repairs  -- human-readable notes for problems that were corrected in place
+      blockers -- notes for problems that CANNOT be auto-corrected; the caller should
+                  refuse the push and show these rather than let the camera 400.
+
+    Repairs are conservative: a size box is clamped into its own region (never enlarged
+    past it), and out-of-range coordinates are pulled back to 0..1000. Geometry the user
+    drew is never moved -- only boxes that would already be rejected."""
+    root = ET.fromstring(xml_text)
+    repairs, blockers = [], []
+
+    for ri in root.findall(".//ns:RuleInfo", NS):
+        label = _rule_label(ri)
+
+        # 1. Region coordinates must live in the 0..1000 grid.
+        for rc in ri.findall(".//ns:RegionCoordinates", NS):
+            for tag in ("positionX", "positionY"):
+                el = rc.find(f"ns:{tag}", NS)
+                if el is None or not (el.text or "").strip().lstrip("-").isdigit():
+                    continue
+                v = int(el.text.strip())
+                if not 0 <= v <= COORD_MAX:
+                    el.text = str(max(0, min(COORD_MAX, v)))
+                    repairs.append(f"{label}: {tag} {v} out of 0..{COORD_MAX}, clamped to {el.text}")
+
+        bbox = _region_bbox(ri)
+        rtype = (ri.findtext("ns:ruleType", namespaces=NS) or "").strip()
+        if bbox is None:
+            blockers.append(f"{label}: has no region coordinates")
+            continue
+        n_pts = len(ri.findall(".//ns:RegionCoordinates", NS))
+        if rtype == "region" and n_pts < REGION_MIN_VERTS:
+            blockers.append(f"{label}: region rule has only {n_pts} point(s), needs >= {REGION_MIN_VERTS}")
+        if rtype == "line" and n_pts != LINE_VERTS:
+            blockers.append(f"{label}: line rule has {n_pts} point(s), needs exactly {LINE_VERTS}")
+
+        # 2. Each SizeFilter box must overlap its own region -- the actual 400 cause.
+        sf = ri.find("ns:SizeFilter", NS)
+        if sf is None:
+            continue
+        for tag in ("MaxObjectSize", "MinObjectSize"):
+            box = sf.find(f"ns:{tag}", NS)
+            if box is None:
+                continue
+            vals = {}
+            for k in ("positionX", "positionY", "width", "height"):
+                el = box.find(f"ns:{k}", NS)
+                vals[k] = (el, (el.text or "").strip() if el is not None else "")
+            if not all(v[0] is not None and v[1].lstrip("-").isdigit() for v in vals.values()):
+                continue
+            rect = tuple(int(vals[k][1]) for k in ("positionX", "positionY", "width", "height"))
+            if not rect[2] or not rect[3]:
+                continue  # zero-area placeholder; read path already treats it as absent
+            fixed = _clamp_box_into(rect, bbox)
+            if fixed is None:
+                blockers.append(f"{label}: region is too small to hold a {tag} box")
+                continue
+            if fixed != rect:
+                for k, v in zip(("positionX", "positionY", "width", "height"), fixed):
+                    vals[k][0].text = str(v)
+                repairs.append(f"{label}: {tag} {rect} sat outside its zone {bbox}, moved to {fixed}")
+
+    return _serialize(root), repairs, blockers
+
+
 def _set_rule_id(rule_el, rid):
     el = rule_el.find(f"{{{NS_URI}}}ruleId")
     if el is None:
