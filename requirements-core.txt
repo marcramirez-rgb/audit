@@ -10,7 +10,3 @@ Pillow==12.2.0
 openpyxl==3.1.5
 customtkinter==6.0.0
 python-dotenv==1.2.2
-
-# AI zone suggestion (zone_suggester.py / suggestion_report.py). Needs an
-# ANTHROPIC_API_KEY in the environment or access.env to actually run.
-anthropic==0.120.2

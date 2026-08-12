@@ -17,8 +17,8 @@ echo.
 
 REM --- 0. Fail fast if this folder is nested too deep for Windows -------
 REM Windows caps a full file path at 260 characters. Some packages this app
-REM installs ship very long internal filenames (the anthropic driver has one
-REM ~113 chars below .venv\), so a deep project folder makes pip fail PARTWAY
+REM installs ship very long internal filenames (over 100 chars below
+REM .venv\), so a deep project folder makes pip fail PARTWAY
 REM and leave a half-built .venv. Catch it up front instead. The trick:
 REM %PROJDIR:~140,1% is the single character at position 140 -- it comes back
 REM empty only when the path is 140 chars or shorter.

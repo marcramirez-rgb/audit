@@ -66,22 +66,6 @@ WIN_MIN_W, WIN_MIN_H = 880, 560    # smallest window that still fits sidebar + c
 BACKUP_DIR = Path(__file__).with_name("aoa_backups")
 HIK_BACKUP_DIR = Path(__file__).with_name("hik_backups")
 
-
-def save_snapshot_pair(backup_path, pil_img):
-    """Save the raw snapshot the zone was drawn on next to its config backup, using a
-    matching filename stem (e.g. aoa_backup_..._{ts}.json -> aoa_backup_..._{ts}.jpg).
-
-    This is what turns each write into a retrievable (image, geometry) pair for later
-    ML/eval work -- the geometry already lives in the backup JSON/XML; this adds the
-    frame it was drawn against, which was previously discarded. Best-effort: a save
-    failure must never break a successful camera push, so the caller ignores errors.
-    Returns the image Path on success, or None."""
-    if pil_img is None:
-        return None
-    img_path = Path(backup_path).with_suffix(".jpg")
-    img = pil_img if pil_img.mode in ("RGB", "L") else pil_img.convert("RGB")
-    img.save(img_path, format="JPEG", quality=90)
-    return img_path
 NEW_SCENARIO = "(new scenario)"
 DIR_L2R = "Left → Right"
 DIR_R2L = "Right → Left"
@@ -1659,19 +1643,11 @@ class WriterApp(ctk.CTk):
         self._log(f"[*] Backing up + pushing '{sc.name}' to {adapter.vendor} {ip}:{port} ...")
         backup_dir = HIK_BACKUP_DIR if adapter.vendor == "Hikvision" else BACKUP_DIR
 
-        snapshot_img = self.pil_image  # frame the zone was drawn on; save it beside the backup
-
         def work():
             try:
                 backup_path, _verify = adapter.apply_scenario(sc, backup_dir)
-                try:
-                    pair = save_snapshot_pair(backup_path, snapshot_img)
-                except Exception as e:  # never let a snapshot-save failure fail the push
-                    pair = None
-                    self.msg_queue.put(("log", f"[!] Snapshot pair not saved: {e}"))
                 names = [s.name for s in adapter.read_scenarios()]
-                self.msg_queue.put(("push_done", Path(backup_path).name, names,
-                                    Path(pair).name if pair else None))
+                self.msg_queue.put(("push_done", Path(backup_path).name, names))
             except Exception as e:
                 self.msg_queue.put(("push_err", str(e)))
         self._run_bg(work)
@@ -1766,11 +1742,9 @@ class WriterApp(ctk.CTk):
                         self._log(f"[+] Overlaid {len(overlays)} existing zone(s) in amber. "
                                   f"Pick one from 'Edit existing' to modify it, or draw a new one.")
                 elif msg[0] == "push_done":
-                    _, backup_name, names, pair_name = msg
+                    _, backup_name, names = msg
                     self.push_button.configure(state="normal", text="Push to Camera")
                     self._log(f"[+] Pushed OK. Backup: {backup_name}. Scenarios now: {names}")
-                    if pair_name:
-                        self._log(f"[+] Snapshot saved for ML pair: {pair_name}")
                 elif msg[0] == "push_err":
                     self.push_button.configure(state="normal", text="Push to Camera")
                     self._log(f"[!] Push failed: {msg[1]}")
