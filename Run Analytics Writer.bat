@@ -15,6 +15,22 @@ if not exist "%VENV_PY%" (
   exit /b 1
 )
 
+REM Shipped alongside the app, not installed by setup.bat -- so it goes missing
+REM when someone updates by hand-copying a few files instead of copying the
+REM whole folder. Without this check that shows up as a raw ImportError.
+if not exist "%~dp0ui_theme.py" (
+  echo ============================================================
+  echo   A file this app needs is missing: ui_theme.py
+  echo.
+  echo   This usually means the folder was updated by copying only
+  echo   some of the files. Copy the WHOLE "axis_api_testing"
+  echo   folder over again, then run this once more.
+  echo ============================================================
+  echo.
+  pause
+  exit /b 1
+)
+
 "%VENV_PY%" "%~dp0analytics_writer_gui.py"
 if errorlevel 1 (
   echo.
