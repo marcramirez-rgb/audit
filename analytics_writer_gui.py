@@ -658,6 +658,12 @@ class WriterApp(ctk.CTk):
         self.perspective_bars, self.current_bar = [], []
         self.bar_mode = False
         self.drag_target = self.shape_drag = None
+        # The DRAWING MODE is camera state too. Clearing the geometry but leaving
+        # Exclude armed meant the next camera's include zone was drawn as red
+        # exclusion points -- the drawing looked like it carried over, and the
+        # zone could never be started. Back to Include with the rest of it.
+        if hasattr(self, "mode_var"):
+            self.mode_var.set("Include")
         if hasattr(self, "edit_menu"):
             self.edit_menu.configure(values=[NEW_SCENARIO])
             self.edit_var.set(NEW_SCENARIO)
@@ -962,7 +968,10 @@ class WriterApp(ctk.CTk):
             selected_color=LVT_DARK_TEAL, selected_hover_color=LVT_DARK_TEAL_HOVER,
             unselected_color=LVT_TEAL, unselected_hover_color=LVT_TEAL_HOVER)
         self.mode_toggle.pack(fill="x", padx=12, pady=4)
-        self.mode_hint = ctk.CTkLabel(side, text="Include = detect here (teal). Exclude = ignore here (red).",
+        self.mode_hint = ctk.CTkLabel(side,
+                                      text="Include = detect here (teal). Exclude = ignore here (red).\n"
+                                           "In Exclude the teal zone is locked, so points can land on\n"
+                                           "its corners. Switch back to Include to move it.",
                                       text_color=LVT_TEXT_MUTED, font=ctk.CTkFont(size=10), justify="left")
         self.mode_hint.pack(anchor="w", padx=12)
 
@@ -1445,6 +1454,11 @@ class WriterApp(ctk.CTk):
         self.editing = None
         if hasattr(self, "edit_var"):
             self.edit_var.set(NEW_SCENARIO)
+        # A fresh snapshot wipes the geometry, so the mode goes back with it --
+        # otherwise a re-fetch mid-exclusion leaves Exclude armed over a blank
+        # canvas, where the first thing to draw is the include zone.
+        if hasattr(self, "mode_var"):
+            self.mode_var.set("Include")
         self._mark_loaded()
         self._redraw()
 
@@ -1628,16 +1642,30 @@ class WriterApp(ctk.CTk):
     SHAPE_GRAB_PX = 6       # px tolerance for grabbing a shape by its outline
     MOVE_THRESHOLD_PX = 5   # a press must travel this far to become a shape-move (not a click)
 
+    def _drawing_exclusion(self):
+        """True while the Exclude toggle is armed -- every click is then meant to
+        place an exclusion point, so only exclusion geometry may capture it."""
+        return self.mode_var.get() == "Exclude"
+
     def _find_vertex(self, cx, cy):
         """Return a descriptor for the plotted vertex nearest to (cx, cy) within
         DRAG_RADIUS, or None. Searches include zone/line, exclusion polygons, and
-        perspective-bar endpoints (all canvas-pixel points)."""
+        perspective-bar endpoints (all canvas-pixel points).
+
+        In Exclude mode ONLY exclusion vertices are grabbable. An exclusion is
+        drawn inside the include zone and usually wants to sit exactly on its
+        plot points -- but grabbing those made that impossible: the click started
+        a vertex drag instead of placing a point, so an exclusion corner could
+        never be put on a zone corner (nor on a size-box corner or bar end).
+        Switch back to Include to move the zone itself."""
         r2 = self.DRAG_RADIUS ** 2
         def near(p):
             return (p[0] - cx) ** 2 + (p[1] - cy) ** 2 <= r2
-        for i, p in enumerate(self.points):
-            if near(p):
-                return ("points", i)
+        drawing_exclusion = self._drawing_exclusion()
+        if not drawing_exclusion:
+            for i, p in enumerate(self.points):
+                if near(p):
+                    return ("points", i)
         for zi, zone in enumerate(self.exclude_zones):
             for i, p in enumerate(zone):
                 if near(p):
@@ -1645,6 +1673,8 @@ class WriterApp(ctk.CTk):
         for i, p in enumerate(self.current_exclude):
             if near(p):
                 return ("current_exclude", i)
+        if drawing_exclusion:
+            return None
         for bi, bar in enumerate(self.perspective_bars):
             for i, p in enumerate(bar["points"]):
                 if near(p):
@@ -1709,6 +1739,12 @@ class WriterApp(ctk.CTk):
         for zi in range(len(self.exclude_zones) - 1, -1, -1):
             if self._hits_shape(cx, cy, self.exclude_zones[zi]):
                 return ("exclude", zi)
+        # Same rule as _find_vertex: while drawing an exclusion nothing else is
+        # grabbable. An exclusion is drawn INSIDE the include zone, so every press
+        # lands on the zone's body -- and a hand wobble past MOVE_THRESHOLD_PX slid
+        # the whole zone instead of placing the point.
+        if self._drawing_exclusion():
+            return None
         for si in range(len(self.edit_size) - 1, -1, -1):
             if self._hits_shape(cx, cy, self._size_box_corners(si)):
                 return ("size", si)
@@ -1939,6 +1975,20 @@ class WriterApp(ctk.CTk):
         if self.rule_var.get() == "Line Crossing" and self.mode_var.get() == "Exclude":
             self._log("[!] Exclusion zones aren't used with Line Crossing. Staying in Include mode.")
             self.mode_var.set("Include")
+            return
+        # Leaving Exclude with a half-drawn zone: settle it here instead of letting
+        # it sit as red dots belonging to no zone. 3+ points IS a polygon, so finish
+        # it -- Push already did that silently, this just makes it visible. Fewer
+        # than 3 can't be a zone, so drop them and say so rather than carrying an
+        # invisible half-state into the next thing the operator draws.
+        if not self._drawing_exclusion() and self.current_exclude:
+            if len(self.current_exclude) >= 3:
+                self._finish_exclude()
+            else:
+                n = len(self.current_exclude)
+                self.current_exclude = []
+                self._log(f"[!] Dropped {n} unfinished exclusion point(s) -- a zone needs at least 3.")
+                self._redraw()
 
     def _toggle_bar_mode(self):
         self.bar_mode = not self.bar_mode
