@@ -48,6 +48,12 @@ CAMERA_CONFIGS = [
 # return an empty RuleInfoList).
 MAX_SCENE_DOCS = 8
 
+# Rule-name column text for the two "nothing to list" outcomes. See
+# classify_port_result for which one a port gets and why.
+UNREACHABLE_RULE_NAME = "Camera Unreachable"
+NO_ANALYTICS_RULE_NAME = "No Analytics Configured"
+NO_ANALYTICS_TARGET = "Camera reachable -- 0 analytics rules configured"
+
 
 def get_ptz_endpoint_catalog(ip, port):
     """Return vendor-specific PTZ endpoint examples that the PTZ tooling can probe.
@@ -390,7 +396,7 @@ class HikvisionHandler(CameraHandler):
             rules = []
 
         if not rules:
-            return [{"is_placeholder": True, "name": "No Scenarios Configured", "type": "N/A", "target": "No Analytics Configured", "duration": "N/A", "vertices": []}]
+            return [{"is_placeholder": True, "name": NO_ANALYTICS_RULE_NAME, "type": "None", "target": NO_ANALYTICS_TARGET, "duration": "N/A", "vertices": []}]
 
         parsed_rules = []
         for rule in rules:
@@ -515,7 +521,7 @@ class HikvisionHandler(CameraHandler):
 
         if deduped:
             return deduped
-        return [{"is_placeholder": True, "name": "No Scenarios Configured", "type": "N/A", "target": "No Analytics Configured", "duration": "N/A", "vertices": []}]
+        return [{"is_placeholder": True, "name": NO_ANALYTICS_RULE_NAME, "type": "None", "target": NO_ANALYTICS_TARGET, "duration": "N/A", "vertices": []}]
 
 
 class AxisHandler(CameraHandler):
@@ -810,7 +816,7 @@ class AxisHandler(CameraHandler):
 
         scenarios = json_data.get("data", {}).get("scenarios", [])
         if not scenarios:
-            return [{"is_placeholder": True, "name": "No Scenarios Configured", "type": "N/A", "target": "No Analytics Configured", "duration": "N/A", "vertices": []}]
+            return [{"is_placeholder": True, "name": NO_ANALYTICS_RULE_NAME, "type": "None", "target": NO_ANALYTICS_TARGET, "duration": "N/A", "vertices": []}]
 
         # Perspective calibration bars live at the top level and scenarios reference them
         # by id; index them so each rule can carry its bars into the overlay.
@@ -822,7 +828,7 @@ class AxisHandler(CameraHandler):
         parsed_rules = []
         for scenario in scenarios:
             if scenario.get("is_placeholder"):
-                parsed_rules.append({"is_placeholder": True, "name": "No Scenarios Configured", "type": "N/A", "target": "No Analytics Configured", "duration": "N/A", "vertices": []})
+                parsed_rules.append({"is_placeholder": True, "name": NO_ANALYTICS_RULE_NAME, "type": "None", "target": NO_ANALYTICS_TARGET, "duration": "N/A", "vertices": []})
                 continue
 
             rule_name = scenario.get("name", f"Scenario {scenario.get('id')}")
@@ -903,8 +909,10 @@ class AxisHandler(CameraHandler):
 def _draw_crossing_direction(draw, p0, p1, direction):
     """Draw a perpendicular arrow at a line's midpoint showing which way an object must
     cross to trigger. Matches the analytics writer's convention: relative to p0->p1,
-    'leftToRight' points to the (-dpy, dpx) side, 'rightToLeft' the opposite; 'any'
-    draws a double-headed arrow. Computed in pixel space (perpendicular to the line)."""
+    'leftToRight' points to the (-dpy, dpx) side, 'rightToLeft' the opposite. A
+    bidirectional rule draws a double-headed arrow -- spelled 'any' on this read path
+    (Hik's own directionSensitivity value) and 'both' on the writer's neutral one, so
+    both are accepted. Computed in pixel space (perpendicular to the line)."""
     import math
     x0, y0 = p0
     x1, y1 = p1
@@ -912,7 +920,7 @@ def _draw_crossing_direction(draw, p0, p1, direction):
     length = math.hypot(dpx, dpy) or 1.0
     if str(direction) == "rightToLeft":
         nx, ny = dpy / length, -dpx / length
-    else:  # leftToRight and any
+    else:  # leftToRight, and bidirectional (which gets a head on each end anyway)
         nx, ny = -dpy / length, dpx / length
     mx, my = (x0 + x1) / 2.0, (y0 + y1) / 2.0
     arm = 42
@@ -920,7 +928,7 @@ def _draw_crossing_direction(draw, p0, p1, direction):
     edge = (0, 40, 38, 200)         # dark edge for contrast on any background
     head_len = 20.0                 # length of the triangular head along the shaft
     head_half = 9.0                 # half-width of the head base
-    bidir = (str(direction) == "any")
+    bidir = str(direction) in ("any", "both")
     start = (mx - nx * arm, my - ny * arm) if bidir else (mx, my)
     tip = (mx + nx * arm, my + ny * arm)
 
@@ -1247,34 +1255,53 @@ def create_master_workbook():
     """Build the workbook with just the global 'Missed Cameras' sheet. The analytics
     data is split into one tab per unique location, and those sheets are created on
     demand during the batch run via add_location_sheet() -- so this no longer creates
-    a single 'Camera Analytics' sheet up front."""
+    a single 'Camera Analytics' sheet up front.
+
+    The Missed sheet lists only ports that returned NOTHING (no snapshot and no
+    analytics). Cameras that answered -- including ones with no analytics configured --
+    are reported on their location tab instead; see classify_port_result."""
     wb = openpyxl.Workbook()
     default_ws = wb.active  # openpyxl always seeds one sheet; we don't want it
 
     header_font  = Font(name="Arial", bold=True, color="FFFFFF", size=11)
     failed_fill  = PatternFill("solid", start_color="A61C1C")
     center_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    left_align   = Alignment(horizontal="left", vertical="center", wrap_text=True)
 
     ws_missed = wb.create_sheet(title="Missed Cameras")
     ws_missed.views.sheetView[0].showGridLines = True
 
     ws_missed.merge_cells("A1:G1")
-    ws_missed["A1"] = "Analytics Fetch Exception Audit Log"
+    ws_missed["A1"] = "Unreachable Cameras -- No Snapshot AND No Analytics"
     ws_missed["A1"].font      = Font(name="Arial", bold=True, size=14, color="FFFFFF")
     ws_missed["A1"].fill      = PatternFill("solid", start_color="330000")
     ws_missed["A1"].alignment = center_align
     ws_missed.row_dimensions[1].height = 36
 
+    # Spell the rule out in the sheet itself: without it, an empty tab reads as "no
+    # problems" and a camera missing from it reads as an oversight rather than a
+    # camera that answered and simply has no analytics configured.
+    ws_missed.merge_cells("A2:G2")
+    ws_missed["A2"] = ("Every port here failed BOTH ways -- no snapshot and no successful analytics "
+                       "call -- which points at a unit that is offline or on too poor a connection to "
+                       "complete a request. Cameras that answered are on their location tab, including "
+                       "ones reporting no analytics configured, a failed analytics call, or a missing "
+                       "snapshot alone.")
+    ws_missed["A2"].font      = Font(name="Arial", size=10, italic=True, color="FFFFFF")
+    ws_missed["A2"].fill      = PatternFill("solid", start_color="5A1010")
+    ws_missed["A2"].alignment = left_align
+    ws_missed.row_dimensions[2].height = 44
+
     missed_headers = ["Timestamp", "Client Name", "Location", "Live Unit Serial", "Camera Port", "Target Endpoint", "Failure Reason"]
     for col, h in enumerate(missed_headers, 1):
-        cell = ws_missed.cell(row=2, column=col, value=h)
+        cell = ws_missed.cell(row=3, column=col, value=h)
         cell.font = header_font; cell.fill = failed_fill; cell.alignment = center_align
-    ws_missed.row_dimensions[2].height = 22
-    missed_widths = [22, 22, 24, 22, 15, 65, 45]
+    ws_missed.row_dimensions[3].height = 22
+    missed_widths = [22, 22, 24, 22, 18, 65, 70]
     for i, w in enumerate(missed_widths, 1):
         ws_missed.column_dimensions[get_column_letter(i)].width = w
 
-    ws_missed.freeze_panes = "A3"
+    ws_missed.freeze_panes = "A4"
 
     wb.remove(default_ws)  # safe now that ws_missed exists as the workbook's sheet
     return wb, ws_missed
@@ -1291,6 +1318,72 @@ def dedupe_main_rows(main_rows):
         seen.add(key)
         deduped.append(row)
     return deduped
+
+
+# --- WHAT ONE PORT'S RESULT MEANS FOR THE REPORT ---
+#
+# A port earns a Missed Cameras row ONLY when we got NOTHING back from it: no snapshot
+# AND no successful analytics call. That pairing is the actual signal that the unit is
+# offline or on a link too poor to complete a 200 -- which is what the tab is for.
+#
+# Everything that answered stays on its location tab with the finding spelled out,
+# including the two cases that used to be filed as misses:
+#   * snapshot fine, analytics call failed -- the camera is up, so this is a config or
+#     app problem to chase on the unit, not a lost camera;
+#   * analytics fine, snapshot failed -- the rules are real and are rendered over a
+#     placeholder canvas.
+# A camera that answers "no analytics configured" was never a miss, and still isn't;
+# it now says so in the row rather than only in the run log.
+
+def classify_port_result(snapshot_ok, analytics_ok, snap_err="", analytics_err="",
+                         special_case=False, no_rules=False):
+    """Turn one port's two outcomes into report content.
+
+    Returns a dict with:
+      missed       -- Failure Reason for the Missed Cameras tab, or None to keep this
+                      port off that tab;
+      placeholder  -- (name, type, target) for a stand-in row when there are no real
+                      rules to list, or None when the parsed rules speak for themselves;
+      log          -- the line to print for the operator ("" for the ordinary case).
+    """
+    if not snapshot_ok and not analytics_ok:
+        return {
+            "missed": (f"No snapshot AND no analytics response -- unit is likely offline or "
+                       f"on a connection too poor to complete an API call. "
+                       f"Snapshot: {snap_err or 'failed'} | Analytics: {analytics_err or 'failed'}"),
+            "placeholder": (UNREACHABLE_RULE_NAME, "N/A",
+                            "No snapshot and no analytics -- see Missed Cameras"),
+            "log": ("    [!] Nothing answered on this port -- no snapshot AND no analytics. "
+                    "Logged to Missed Cameras as likely offline/unreachable."),
+        }
+    if not analytics_ok:
+        label = "Non-Standard Analytics App" if special_case else "Analytics Fetch Failed"
+        return {
+            "missed": None,
+            "placeholder": (label, "N/A", "Camera reachable -- analytics call failed"),
+            "log": (f"    [>] Snapshot OK but the analytics call failed ({analytics_err}) -- "
+                    f"the camera answered, so this is reported on its location tab, not as a miss."),
+        }
+    if no_rules:
+        return {
+            "missed": None,
+            "placeholder": (NO_ANALYTICS_RULE_NAME, "None", NO_ANALYTICS_TARGET),
+            "log": "    [>] Port responded with no analytics configured -- reported on the location tab (not a miss).",
+        }
+    if not snapshot_ok:
+        return {
+            "missed": None, "placeholder": None,
+            "log": ("    [>] Analytics read OK but no snapshot -- rules are drawn on a placeholder "
+                    "canvas. The camera answered, so this is not a miss."),
+        }
+    return {"missed": None, "placeholder": None, "log": ""}
+
+
+def _placeholder_rule(placeholder):
+    """The single stand-in row a port gets when there are no real rules to list."""
+    name, rtype, target = placeholder
+    return [{"is_placeholder": True, "name": name, "type": rtype, "target": target,
+             "duration": "N/A", "vertices": []}]
 
 
 # --- MULTI-THREADED WORKER FUNCTION ---
@@ -1333,10 +1426,10 @@ def process_camera_row(args):
         return results
 
     if mfg_class is None:
-        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        results["missed"].append([timestamp, client_name, location, serial, "N/A", "N/A",
-                                   f"Unrecognized MANUFACTURER value: '{raw_mfg}' (must contain 'axis' or 'hik') -- "
-                                   f"analytics skipped, snapshot attempted with both known API formats"])
+        # The Missed row waits until we know whether ANY port gave us a picture. An
+        # unreadable MANUFACTURER value is a CSV problem, not an offline camera, and
+        # the location tab already carries "Unrecognized Manufacturer" on every row.
+        any_snapshot = False
 
         probe_handlers = []
         if user_axis and pass_axis:
@@ -1358,14 +1451,29 @@ def process_camera_row(args):
                     break
             if camera_image is None:
                 results["logs"].append(f"    [!] Warning: Could not fetch snapshot with any known API format. Defaulting to {img_w}x{img_h} canvas.")
+            else:
+                any_snapshot = True
 
             img_buf = render_overlay_image(camera_image, [], 0, img_w, img_h, "")
             add_main_row({
-                "data": [client_name, location, serial, pos, "Unrecognized Manufacturer", "N/A", "Analytics Skipped", "N/A"],
+                "data": [client_name, location, serial, pos, "Unrecognized Manufacturer", "N/A",
+                         f"Analytics skipped -- MANUFACTURER '{raw_mfg}' not recognized", "N/A"],
                 "bg": bg_color, "img": img_buf, "err": ""
             })
             if camera_image is not None:
                 camera_image.close()
+
+        if not any_snapshot:
+            timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            results["missed"].append([timestamp, client_name, location, serial, "N/A", "N/A",
+                                       f"No snapshot on any port and no analytics (MANUFACTURER "
+                                       f"'{raw_mfg}' unrecognized, so analytics was skipped) -- unit "
+                                       f"is likely offline or unreachable. Fix the MANUFACTURER value "
+                                       f"(must contain 'axis' or 'hik') to audit its analytics."])
+        else:
+            results["logs"].append(
+                f"    [>] Snapshots came back, but MANUFACTURER '{raw_mfg}' is unrecognized so analytics "
+                f"was skipped -- reported on the location tab, not as a miss.")
 
         return results
 
@@ -1437,11 +1545,15 @@ def process_camera_row(args):
             if handler is None:
                 timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 reason = " | ".join(probe_errors) if probe_errors else "no credentials provided for either vendor"
+                # Nothing came back at all (no snapshot, and analytics is never
+                # attempted without a resolved vendor) -- a genuine Missed Cameras case.
                 results["missed"].append([timestamp, client_name, location, serial, f"{pos} ({port}) [MIXED]", "N/A",
-                                           f"Neither vendor produced a snapshot on this port -- {reason}"])
+                                           f"No snapshot from either vendor and no analytics -- unit is likely "
+                                           f"offline or unreachable. {reason}"])
                 img_buf = render_overlay_image(None, [], 0, 1280, 720, "")
                 add_main_row({
-                        "data": [client_name, location, serial, pos, "Unresolved Vendor", "N/A", "Neither Vendor Responded", "N/A"],
+                        "data": [client_name, location, serial, pos, UNREACHABLE_RULE_NAME, "N/A",
+                                 "Neither vendor responded -- see Missed Cameras", "N/A"],
                         "bg": bg_color, "img": img_buf, "err": ""
                     })
                 continue
@@ -1479,21 +1591,24 @@ def process_camera_row(args):
 
             if payload_data is None:
                 err_msg = err_msg or "Unauthorized Connection (All auth variations failed)"
-                is_special_case = err_msg.startswith("SPECIAL CASE:")
-                is_no_rules = err_msg.startswith("NO_RULES:")
-                if is_no_rules:
-                    # Camera answered fine but has no analytic zones configured. Not a
-                    # miss -- render the snapshot with a "no scenarios" placeholder.
-                    placeholder_name = "No Scenarios Configured"
-                    results["logs"].append(f"    [>] Port {port} responded with no analytics configured -- logging snapshot only (not a miss).")
-                else:
-                    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                    tag = "[SPECIAL CASE]" if is_special_case else ""
-                    results["missed"].append([timestamp, client_name, location, serial, f"{pos_label} ({port}) {tag}".strip(), req_url, err_msg])
-                    placeholder_name = "Non-Standard Analytics App (See Missed Tab)" if is_special_case else "Analytics Fetch Failed (Check Missed Tab)"
-                rules = [{"is_placeholder": True, "name": placeholder_name, "type": "N/A", "target": "No Analytics Configured", "duration": "N/A", "vertices": []}]
-            else:
-                rules = handler.parse_analytics(payload_data, img_w, img_h)
+            is_special_case = payload_data is None and err_msg.startswith("SPECIAL CASE:")
+            is_no_rules = payload_data is None and err_msg.startswith("NO_RULES:")
+            # camera_image is never None here -- a port that produced no snapshot from
+            # either vendor was already handled (and filed as a miss) further up -- so
+            # this classification only ever decides the location-tab messaging.
+            outcome = classify_port_result(
+                snapshot_ok=camera_image is not None,
+                analytics_ok=payload_data is not None or is_no_rules,
+                snap_err="", analytics_err=err_msg,
+                special_case=is_special_case, no_rules=is_no_rules)
+            if outcome["log"]:
+                results["logs"].append(outcome["log"])
+            if outcome["missed"]:
+                timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                results["missed"].append([timestamp, client_name, location, serial,
+                                          f"{pos_label} ({port})", req_url, outcome["missed"]])
+            rules = (_placeholder_rule(outcome["placeholder"]) if outcome["placeholder"]
+                     else handler.parse_analytics(payload_data, img_w, img_h))
 
             for index, rule in enumerate(rules):
                 try:
@@ -1540,8 +1655,7 @@ def process_camera_row(args):
                     results["logs"].append(f"    [!] Port {port} REJECTED THE LOGIN (HTTP 401) -- wrong Axis username/password for this unit. This is NOT a camera-type/manufacturer problem; re-run with the correct Axis credentials. Defaulting to {img_w}x{img_h} canvas.")
                 else:
                     results["logs"].append(f"    [!] Warning: Failed to fetch stream snapshot ({snap_err}). Defaulting to {img_w}x{img_h} canvas.")
-                timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                results["missed"].append([timestamp, client_name, location, serial, f"{pos} ({port}) [SNAPSHOT]", snap_url, snap_err])
+                # No Missed row yet -- that depends on whether analytics answered below.
             else:
                 img_w, img_h = camera_image.size
 
@@ -1560,8 +1674,8 @@ def process_camera_row(args):
                             camera_image.close()
                         camera_image = fresh_img
                         img_w, img_h = camera_image.size
-            if payload_data is not None and camera_image is None:
-                results["logs"].append("    [!] Analytics retrieved but snapshot unavailable; rendering overlay on placeholder canvas.")
+            # (classify_port_result below logs the analytics-without-snapshot case for
+            # both vendors, so there is no vendor-specific note here.)
         else:
             # --- HIKVISION SPECIFIC: ANALYTICS FIRST ---
             payload_data, req_url, err_msg, analytics_auth_rejected = handler.fetch_analytics(sess, port)
@@ -1581,13 +1695,9 @@ def process_camera_row(args):
                     results["logs"].append(f"    [!] Port {port} REJECTED THE LOGIN (HTTP 401) -- wrong Hikvision username/password for this unit. This is NOT a camera-type/manufacturer problem; re-run with the correct Hikvision credentials. Defaulting to {img_w}x{img_h} canvas.")
                 else:
                     results["logs"].append(f"    [!] Warning: Failed to fetch stream snapshot ({snap_err}). Defaulting to {img_w}x{img_h} canvas.")
-                timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                results["missed"].append([timestamp, client_name, location, serial, f"{pos} ({port}) [SNAPSHOT]", snap_url, snap_err])
+                # No Missed row yet -- that depends on whether analytics answered.
             else:
                 img_w, img_h = camera_image.size
-
-            if payload_data is not None and camera_image is None:
-                results["logs"].append("    [!] Analytics retrieved but snapshot unavailable; rendering overlay on placeholder canvas.")
 
         # --- MULTI-SENSOR AXIS UNIT (e.g. P3747): one row per physical sensor ---
         # Detected generically from the analytics response itself (more than one entry
@@ -1610,33 +1720,38 @@ def process_camera_row(args):
 
                 if sensor_img is None:
                     sensor_img_w, sensor_img_h = handler.fallback_dim
+                    # Not a miss: this whole branch only runs because the analytics read
+                    # SUCCEEDED, so the camera is demonstrably reachable -- one sensor's
+                    # image just didn't come back. The rows below say so.
                     results["logs"].append(f"    [!] Warning: Failed to fetch sensor {device_id} snapshot on Port {port} ({sensor_snap_err}). Defaulting to {sensor_img_w}x{sensor_img_h} canvas.")
-                    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                    results["missed"].append([timestamp, client_name, location, serial, f"{sensor_pos} ({port}) [SNAPSHOT]", sensor_snap_url, sensor_snap_err])
                 else:
                     sensor_img_w, sensor_img_h = sensor_img.size
 
                 all_sensor_rules = handler.parse_analytics(payload_data, sensor_img_w, sensor_img_h)
                 sensor_rules = [r for r in all_sensor_rules if not r.get("is_placeholder") and device_id in r.get("devices", [])]
                 if not sensor_rules:
-                    sensor_rules = [{"is_placeholder": True, "name": "No Scenarios Configured", "type": "N/A",
-                                      "target": "No Analytics Configured", "duration": "N/A", "vertices": []}]
+                    sensor_rules = _placeholder_rule(
+                        (NO_ANALYTICS_RULE_NAME, "None",
+                         f"Camera reachable -- no rules bound to sensor {device_id}"))
 
                 for index, rule in enumerate(sensor_rules):
+                    display_name = rule["name"]
+                    if sensor_img is None and not rule.get("is_placeholder"):
+                        display_name = f"Snapshot Failed: {display_name}"
                     try:
                         img_buf = render_overlay_image(sensor_img, rule["vertices"], index, sensor_img_w, sensor_img_h, rule["type"],
                                                          size_boxes=rule.get("size_boxes"), bars=rule.get("bars"), direction=rule.get("direction"))
                         add_main_row({
-                            "data": [client_name, location, serial, sensor_pos, rule["name"], rule["type"], rule["target"], rule["duration"]],
+                            "data": [client_name, location, serial, sensor_pos, display_name, rule["type"], rule["target"], rule["duration"]],
                             "bg": bg_color, "img": img_buf, "err": ""
                         })
                         if rule.get("is_placeholder"):
-                            results["logs"].append(f"    [+] Logged snapshot row for {sensor_pos} (Port {port}, no rules bound to this sensor)")
+                            results["logs"].append(f"    [+] Logged status row for {sensor_pos} (Port {port}, no rules bound to this sensor)")
                         else:
                             results["logs"].append(f"    [+] Logged metrics for {sensor_pos} (Port {port}) Scenario: {rule['name']} ({rule['duration']}s)")
                     except Exception as e:
                         add_main_row({
-                            "data": [client_name, location, serial, sensor_pos, rule["name"], rule["type"], rule["target"], rule["duration"]],
+                            "data": [client_name, location, serial, sensor_pos, display_name, rule["type"], rule["target"], rule["duration"]],
                             "bg": bg_color, "img": None, "err": f"(Image failed: {e})"
                         })
 
@@ -1654,37 +1769,45 @@ def process_camera_row(args):
 
         if payload_data is None:
             err_msg = err_msg or "Unauthorized Connection (All auth variations failed)"
-            is_special_case = err_msg.startswith("SPECIAL CASE:")
-            is_no_rules = err_msg.startswith("NO_RULES:")
-            if is_no_rules:
-                # Camera answered fine but has no analytic zones configured. Not a
-                # miss -- render the snapshot with a "no scenarios" placeholder.
-                placeholder_name = "No Scenarios Configured"
-                results["logs"].append(f"    [>] Port {port} responded with no analytics configured -- logging snapshot only (not a miss).")
-            else:
-                timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                tag = "[SPECIAL CASE]" if is_special_case else ""
-                results["missed"].append([timestamp, client_name, location, serial, f"{pos} ({port}) {tag}".strip(), req_url, err_msg])
-                placeholder_name = "Non-Standard Analytics App (See Missed Tab)" if is_special_case else "Analytics Fetch Failed (Check Missed Tab)"
-            rules = [{"is_placeholder": True, "name": placeholder_name, "type": "N/A", "target": "No Analytics Configured", "duration": "N/A", "vertices": []}]
-        else:
-            rules = handler.parse_analytics(payload_data, img_w, img_h)
+        is_special_case = payload_data is None and err_msg.startswith("SPECIAL CASE:")
+        is_no_rules = payload_data is None and err_msg.startswith("NO_RULES:")
+        # "No rules" is a 200 from the camera, so it counts as reached.
+        outcome = classify_port_result(
+            snapshot_ok=camera_image is not None,
+            analytics_ok=payload_data is not None or is_no_rules,
+            snap_err=snap_err, analytics_err=err_msg,
+            special_case=is_special_case, no_rules=is_no_rules)
+        if outcome["log"]:
+            results["logs"].append(outcome["log"])
+        if outcome["missed"]:
+            timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            results["missed"].append([timestamp, client_name, location, serial,
+                                      f"{pos} ({port})", req_url or snap_url, outcome["missed"]])
+
+        # A placeholder is returned exactly when there are no real rules to list.
+        rules = (_placeholder_rule(outcome["placeholder"]) if outcome["placeholder"]
+                 else handler.parse_analytics(payload_data, img_w, img_h))
 
         for index, rule in enumerate(rules):
+            display_name = rule["name"]
+            if camera_image is None and not rule.get("is_placeholder"):
+                # The rule is real; only the picture is missing. Say so on the row so
+                # a blank canvas is never read as a blank configuration.
+                display_name = f"Snapshot Failed: {display_name}"
             try:
                 img_buf = render_overlay_image(camera_image, rule["vertices"], index, img_w, img_h, rule["type"],
                                                        size_boxes=rule.get("size_boxes"), bars=rule.get("bars"), direction=rule.get("direction"))
                 add_main_row({
-                    "data": [client_name, location, serial, pos, rule["name"], rule["type"], rule["target"], rule["duration"]],
+                    "data": [client_name, location, serial, pos, display_name, rule["type"], rule["target"], rule["duration"]],
                     "bg": bg_color, "img": img_buf, "err": ""
                 })
                 if rule.get("is_placeholder"):
-                    results["logs"].append(f"    [+] Logged snapshot row for Port {port} (No rules active or fetch failed)")
+                    results["logs"].append(f"    [+] Logged status row for Port {port}: {rule['name']} -- {rule['target']}")
                 else:
                     results["logs"].append(f"    [+] Logged metrics for Port {port} Scenario: {rule['name']} ({rule['duration']}s)")
             except Exception as e:
                 add_main_row({
-                    "data": [client_name, location, serial, pos, rule["name"], rule["type"], rule["target"], rule["duration"]],
+                    "data": [client_name, location, serial, pos, display_name, rule["type"], rule["target"], rule["duration"]],
                     "bg": bg_color, "img": None, "err": f"(Image failed: {e})"
                 })
 
@@ -1721,7 +1844,7 @@ def run_batch(camera_rows, credentials, output_dir, base_filename, log_cb=None, 
     date_suffix = datetime.now().strftime("%Y%m%d_%H%M%S")
     master_report_file = f"{base_filename}_Master_{date_suffix}.xlsx"
 
-    current_missed_row = 3
+    current_missed_row = 4  # title, the "what counts as missed" note, then headers
 
     wb, ws_missed = create_master_workbook()
 

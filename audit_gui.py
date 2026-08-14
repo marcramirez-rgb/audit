@@ -17,6 +17,7 @@ import customtkinter as ctk
 
 import camera_engine
 import fleet_catalog
+import ui_theme
 
 try:
     from dotenv import load_dotenv
@@ -24,17 +25,20 @@ try:
 except ImportError:
     pass
 
-# --- LiveView Technologies brand palette (from CAMERA_CONFIGS in camera_engine.py) ---
-LVT_LIGHT = "#E5F5F5"
-LVT_TEAL = "#00A19A"
-LVT_TEAL_HOVER = "#008680"
-LVT_DARK_TEAL = "#00726E"
-LVT_DARK_TEAL_HOVER = "#005B58"
-LVT_TEXT_DARK = "#1A1D27"
-LVT_TEXT_MUTED = "#6B7A79"
-LVT_WHITE = "#FFFFFF"
-LVT_LOG_BG = "#0F1117"
-LVT_LOG_TEXT = "#D6EFEF"
+# --- LiveView Technologies brand palette (shared with analytics_writer_gui.py) ---
+# Each of these is a (light, dark) pair that CustomTkinter resolves against the
+# current appearance mode, so the widgets below need no per-mode branching.
+LVT_LIGHT = ui_theme.LVT_LIGHT
+LVT_TEAL = ui_theme.LVT_TEAL
+LVT_TEAL_HOVER = ui_theme.LVT_TEAL_HOVER
+LVT_DARK_TEAL = ui_theme.LVT_DARK_TEAL
+LVT_DARK_TEAL_HOVER = ui_theme.LVT_DARK_TEAL_HOVER
+LVT_TEXT_DARK = ui_theme.LVT_TEXT_DARK
+LVT_TEXT_MUTED = ui_theme.LVT_TEXT_MUTED
+LVT_SURFACE = ui_theme.LVT_SURFACE
+LVT_LOG_BG = ui_theme.LVT_LOG_BG
+LVT_LOG_TEXT = ui_theme.LVT_LOG_TEXT
+LVT_WHITE = ui_theme.LVT_WHITE      # literal white: text that sits ON teal, both modes
 
 WIN_W, WIN_H = 980, 950          # preferred window size, clamped to the actual screen
 WIN_MIN_W, WIN_MIN_H = 820, 730  # smallest window that still fits every stacked section.
@@ -47,7 +51,7 @@ LOG_MIN_H = 100                  # keep some log visible even when space is tigh
 # Root grid rows, top to bottom.
 ROW_HEADER, ROW_TABS, ROW_CREDS, ROW_CONTROLS, ROW_LOG = range(5)
 
-ctk.set_appearance_mode("light")
+STARTUP_APPEARANCE = ui_theme.init_appearance()
 
 
 class CredentialBlock(ctk.CTkFrame):
@@ -101,7 +105,7 @@ class App(ctk.CTk):
         # scaling that request became a 1225x1187 window -- taller than a 1080p screen --
         # so the log and Start controls sat below the bottom edge until you maximized.
         self._apply_startup_geometry(WIN_W, WIN_H)
-        self.configure(fg_color=LVT_WHITE)
+        self.configure(fg_color=LVT_SURFACE)
 
         # Root uses grid (not pack) so the flexible sections are explicit: the Fleet
         # Picker page and the log share the spare height, everything else keeps its
@@ -169,8 +173,11 @@ class App(ctk.CTk):
 
         ctk.CTkLabel(header, text="LiveView Technologies Camera Analytics", font=ctk.CTkFont(size=22, weight="bold"),
                      text_color=LVT_WHITE).pack(side="left", padx=24, pady=10)
+        # Fixed on-teal color: the header bar is teal in BOTH appearance modes, so this
+        # subtitle must not follow the light/dark text pair.
         ctk.CTkLabel(header, text="Camera Analytics Report Generator", font=ctk.CTkFont(size=12),
-                     text_color=LVT_LIGHT).pack(side="left", padx=(0, 24), pady=(20, 10))
+                     text_color=ui_theme.LVT_ON_TEAL).pack(side="left", padx=(0, 24), pady=(20, 10))
+        ui_theme.AppearanceToggle(header, STARTUP_APPEARANCE).pack(side="right", padx=16)
 
     def _build_tabs(self):
         self.tabview = ctk.CTkTabview(
@@ -283,7 +290,7 @@ class App(ctk.CTk):
         self.picker_client_search.bind("<KeyRelease>", self._filter_clients)
         self.picker_client_search.configure(state="disabled")
 
-        self.picker_client_results = ctk.CTkFrame(page, fg_color=LVT_WHITE)
+        self.picker_client_results = ctk.CTkFrame(page, fg_color=LVT_SURFACE)
         self.picker_client_results.grid(row=3, column=0, columnspan=2, sticky="ew", padx=4, pady=(0, 6))
         self.picker_client_hint = ctk.CTkLabel(self.picker_client_results, text="Load a source to list clients.",
                                                text_color=LVT_TEXT_MUTED)
@@ -298,7 +305,7 @@ class App(ctk.CTk):
         self.picker_location_search.bind("<KeyRelease>", self._filter_locations)
         self.picker_location_search.configure(state="disabled")
 
-        self.picker_location_results = ctk.CTkFrame(page, fg_color=LVT_WHITE)
+        self.picker_location_results = ctk.CTkFrame(page, fg_color=LVT_SURFACE)
         self.picker_location_results.grid(row=5, column=0, columnspan=2, sticky="ew", padx=4, pady=(0, 6))
         ctk.CTkLabel(self.picker_location_results, text="Pick a client first.",
                      text_color=LVT_TEXT_MUTED).pack(anchor="w", padx=6, pady=6)
@@ -312,7 +319,7 @@ class App(ctk.CTk):
         ctk.CTkButton(unit_header, text="Select all", width=80, command=lambda: self._picker_check_all(True),
                       fg_color=LVT_TEAL, hover_color=LVT_TEAL_HOVER, text_color=LVT_WHITE).pack(side="right")
 
-        self.picker_units_frame = ctk.CTkFrame(page, fg_color=LVT_WHITE)
+        self.picker_units_frame = ctk.CTkFrame(page, fg_color=LVT_SURFACE)
         self.picker_units_frame.grid(row=7, column=0, columnspan=2, sticky="ew", padx=4, pady=(0, 6))
         self.picker_units_empty = ctk.CTkLabel(self.picker_units_frame, text="Pick a client and location to list units.",
                                                text_color=LVT_TEXT_MUTED)
@@ -331,7 +338,7 @@ class App(ctk.CTk):
         ctk.CTkButton(basket_header, text="Clear batch", width=90, command=self._clear_batch,
                       fg_color=LVT_TEAL, hover_color=LVT_TEAL_HOVER, text_color=LVT_WHITE).pack(side="right")
 
-        self.basket_frame = ctk.CTkFrame(page, fg_color=LVT_WHITE)
+        self.basket_frame = ctk.CTkFrame(page, fg_color=LVT_SURFACE)
         self.basket_frame.grid(row=10, column=0, columnspan=2, sticky="ew", padx=4, pady=(0, 10))
         self._refresh_basket_view()
 
@@ -895,7 +902,7 @@ class App(ctk.CTk):
     def _on_picker_error(self, message):
         add_state = "normal" if self.unit_checkboxes else "disabled"
         self.picker_add_btn.configure(text="Add checked units to batch  ↓", state=add_state)
-        self.picker_source_status.configure(text=message.split(chr(10))[0], text_color="#B00020")
+        self.picker_source_status.configure(text=message.split(chr(10))[0], text_color=ui_theme.LVT_ERROR)
         messagebox.showerror("Fleet Picker", message)
 
     def _on_run_complete(self, output_path):

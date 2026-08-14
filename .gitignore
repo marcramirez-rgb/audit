@@ -45,3 +45,6 @@ PTZ_*.xlsx
 # Fleet Picker convenience prefs (last client/location picked -- client names
 # are fleet data, so never commit)
 fleet_picker_prefs.json
+
+# Per-operator UI prefs (Light/Dark choice) -- machine-local, not project config
+ui_prefs.json

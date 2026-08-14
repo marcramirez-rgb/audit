@@ -23,6 +23,18 @@ import camera_engine
 import hik_config
 
 
+@dataclass(frozen=True)
+class AxisLinePair:
+    """native_id for a BIDIRECTIONAL Axis line: the ids of the two one-way fence
+    scenarios that together make the rule.
+
+    Deliberately not a tuple/namedtuple -- the GUI uses `isinstance(native_id, tuple)`
+    to recognise a Hikvision (channel, sid, ruleId) address, and this must not answer
+    to that test."""
+    lr_id: int
+    rl_id: int
+
+
 @dataclass
 class Scenario:
     """Vendor-neutral analytics scenario. Points are [0,1] top-left fractions."""
@@ -31,7 +43,7 @@ class Scenario:
     points: list                    # [(fx, fy), ...]
     classes: tuple = ("human",)     # subset of ("human", "vehicle")
     duration: int = 0               # seconds (loiter / dwell)
-    direction: str = None           # line only: "leftToRight" | "rightToLeft" (Axis)
+    direction: str = None           # line only: "leftToRight" | "rightToLeft" | "both"
     exclusions: list = field(default_factory=list)  # [[(fx,fy),...], ...] (Axis)
     native_id: object = None        # vendor id (AOA scenario id / Hik ruleName), for edit
     min_size: tuple = None          # (fx, fy, fw, fh) fraction rect -- smallest object
@@ -50,6 +62,10 @@ class Capabilities:
     perspective: bool = False       # supports perspective calibration bars
     size_boxes: bool = False        # supports positioned min/max object-size boxes
     intrusion_duration: bool = False  # intrusion rules carry a dwell/duration (Hik durationTime)
+    # True when ONE rule can watch both ways across the line. False means the vendor
+    # only has one-way fences and a bidirectional line costs two scenarios -- the GUI
+    # says so, and caps the name to leave room for the -LR/-RL suffixes.
+    native_bidirectional: bool = False
     notes: str = ""
 
 
@@ -60,7 +76,14 @@ class AxisAdapter:
     capabilities = Capabilities(
         kinds=("intrusion", "line", "loiter"), classes=("human", "vehicle"),
         multi_class=True, exclusions=True, direction=True, can_delete=True, perspective=True,
-        notes="AOA: full config replace -- add/edit/delete all supported.")
+        native_bidirectional=False,
+        notes="AOA: full config replace -- add/edit/delete all supported. A fence is "
+              "one-way, so a bidirectional line is written as a -LR/-RL scenario pair.")
+
+    # Suffixes for the two halves of a bidirectional line. Kept short because AOA caps
+    # scenario names at 15 chars, which is also why the base name is capped at 12.
+    BIDIR_SUFFIX = {"leftToRight": "-LR", "rightToLeft": "-RL"}
+    BIDIR_BASE_MAX = aoa_config.MAX_NAME_LEN - 3
 
     # Movement between the two readings bracketing a capture that means "the camera
     # moved on us": pan deg, tilt deg, zoom (Axis zoom is a 1..9999 lens position).
@@ -152,7 +175,46 @@ class AxisAdapter:
                                 classes=classes or ("human",), duration=dur, direction=direction,
                                 exclusions=excl, native_id=s.get("id"), min_size=min_size,
                                 perspective=persp))
-        return out
+        return self._fold_line_pairs(out)
+
+    @classmethod
+    def _fold_line_pairs(cls, scenarios):
+        """Fold each -LR/-RL fence pair back into ONE bidirectional Scenario.
+
+        A bidirectional line lives on the camera as two one-way scenarios (see
+        _apply_line_pair). Handing those back as two separate rules is exactly the
+        kind of thing that makes an operator misread what's configured, so they are
+        rejoined here: the pair shows up as a single rule named after the shared base,
+        with direction 'both', and edits/pushes go to both halves together.
+
+        Pairing is deliberately strict -- matching base name, identical line, and each
+        half's alarmDirection agreeing with its own suffix. Anything touched in the
+        camera's web UI since (a moved endpoint, a flipped direction) falls out of the
+        match and is shown as the two independent rules it has become, rather than
+        being silently edited as a pair."""
+        by_base = {}   # base name -> {"leftToRight": Scenario, "rightToLeft": Scenario}
+        for s in scenarios:
+            if s.kind != "line" or s.direction not in cls.BIDIR_SUFFIX:
+                continue
+            suffix = cls.BIDIR_SUFFIX[s.direction]
+            if s.name.endswith(suffix) and len(s.name) > len(suffix):
+                by_base.setdefault(s.name[:-len(suffix)], {})[s.direction] = s
+
+        merged, consumed = {}, set()
+        for base, halves in by_base.items():
+            lr, rl = halves.get("leftToRight"), halves.get("rightToLeft")
+            if lr is None or rl is None:
+                continue
+            if _points_equal(lr.points, rl.points):
+                merged[id(lr)] = Scenario(
+                    name=base, kind="line", points=lr.points, classes=lr.classes,
+                    duration=lr.duration, direction="both",
+                    native_id=AxisLinePair(lr.native_id, rl.native_id),
+                    perspective=lr.perspective, min_size=lr.min_size, max_size=lr.max_size)
+                consumed.add(id(rl))
+
+        # Rebuild in read order, with each pair sitting where its -LR half was.
+        return [merged.get(id(s), s) for s in scenarios if id(s) not in consumed]
 
     @staticmethod
     def _axis_min_size(filters):
@@ -177,6 +239,10 @@ class AxisAdapter:
         sc.perspective is set, its calibration bars are written to the top-level
         perspectives and linked to the scenario (updating the existing one when editing)."""
         _require(self.capabilities, sc)
+        # Bidirectional lines (and any edit of one) need two scenarios written together,
+        # so they take their own path.
+        if sc.kind == "line" and (sc.direction == "both" or isinstance(sc.native_id, AxisLinePair)):
+            return self._apply_line_pair(sc, backup_dir)
         verts = self._to_aoa(sc.points)
         excl = [self._to_aoa(z) for z in sc.exclusions] or None
 
@@ -230,6 +296,81 @@ class AxisAdapter:
         self.client.set_config(cfg)
         return backup_path, self.client.get_config()
 
+    # ---- bidirectional line crossing (Axis has no both-ways fence)
+
+    def _apply_line_pair(self, sc, backup_dir):
+        """Write a bidirectional line as the PAIR of one-way fences AOA actually
+        supports -- both halves in a single config write, so the camera never sits in a
+        half-applied state.
+
+        The halves are named <base>-LR and <base>-RL and share one line; read_scenarios
+        folds them back into a single rule, so from the GUI a bidirectional line stays
+        one thing. Both direction changes are handled here too:
+          one-way -> both: the existing scenario becomes the -LR half (keeping its id,
+              presets and filters) and a new -RL half is added;
+          both -> one-way: the surviving half is renamed back to the plain base name
+              and the other is deleted.
+        """
+        base = sc.name
+        if len(base) > self.BIDIR_BASE_MAX:
+            raise ValueError(
+                f"a bidirectional line needs a name of at most {self.BIDIR_BASE_MAX} "
+                f"characters -- it is written as two scenarios, '{base}-LR' and "
+                f"'{base}-RL', and AOA caps a scenario name at {aoa_config.MAX_NAME_LEN}")
+
+        verts = self._to_aoa(sc.points)
+        backup_path, current = self.client.backup_config(backup_dir)
+        existing = {s.get("id"): s for s in current.get("data", {}).get("scenarios", [])}
+
+        # Which camera-side scenario (if any) already backs each direction.
+        if isinstance(sc.native_id, AxisLinePair):
+            ids = {"leftToRight": sc.native_id.lr_id, "rightToLeft": sc.native_id.rl_id}
+        elif isinstance(sc.native_id, int):
+            # Editing a one-way line into a bidirectional one: keep its id for the half
+            # it already points the right way, so presets/filters survive.
+            orig_dir = ((existing.get(sc.native_id, {}).get("triggers") or [{}])[0]
+                        .get("alarmDirection") or "leftToRight")
+            ids = {orig_dir: sc.native_id}
+        else:
+            ids = {}
+
+        wanted = (["leftToRight", "rightToLeft"] if sc.direction == "both" else [sc.direction])
+        drop = [ids[d] for d in ids if d not in wanted and ids[d] in existing]
+
+        # A camera that is already full rejects the whole write, so check before adding.
+        adds = len([d for d in wanted if ids.get(d) not in existing])
+        if aoa_config.scenario_count(current) - len(drop) + adds > aoa_config.MAX_SCENARIOS:
+            raise ValueError(
+                f"this camera already holds {aoa_config.scenario_count(current)} of "
+                f"{aoa_config.MAX_SCENARIOS} scenarios -- a bidirectional line needs two "
+                f"free slots. Remove a scenario, or use a single-direction line.")
+
+        cfg = current
+        for direction in wanted:
+            # A single-direction result drops the suffix entirely: the rule is no longer
+            # half of a pair and shouldn't keep reading like one.
+            name = f"{base}{self.BIDIR_SUFFIX[direction]}" if sc.direction == "both" else base
+            orig = existing.get(ids.get(direction))
+            if orig is not None:
+                scenario = aoa_config.update_scenario_geometry(
+                    orig, verts, sc.classes, None, None, direction)
+                scenario["name"] = name
+            else:
+                scenario = aoa_config.build_line_crossing(
+                    name, verts, classes=sc.classes, alarm_direction=direction,
+                    device_id=self.device_id or 1)
+                preset = self._analytics_preset()
+                if preset is not None:
+                    scenario["presets"] = [preset]
+            aoa_config.validate_scenario(scenario)
+            cfg = aoa_config.insert_or_replace_scenario(cfg, scenario, replace_by_name=True)
+
+        for dead_id in drop:
+            cfg = aoa_config.remove_scenario(cfg, dead_id)
+
+        self.client.set_config(cfg)
+        return backup_path, self.client.get_config()
+
 
 # ---------------------------------------------------------------- Hik
 
@@ -238,7 +379,7 @@ class HikAdapter:
     capabilities = Capabilities(
         kinds=("intrusion", "line"), classes=("human", "vehicle"),
         multi_class=True, exclusions=False, direction=True, can_delete=False,
-        size_boxes=True, intrusion_duration=True,
+        size_boxes=True, intrusion_duration=True, native_bidirectional=True,
         notes="behaviorRule PUT is upsert-only on tested DS-2TD firmware: add/edit "
               "yes, delete no (use web UI). Intrusion (fieldDetection) + line crossing "
               "(lineDetection) supported; loiter/region not yet templated.")
@@ -471,9 +612,23 @@ class HikAdapter:
         return (round(fx * 1000), round((1 - fy - fh) * 1000), round(fw * 1000), round(fh * 1000))
 
 
-# Neutral direction (Axis API values) <-> Hik lineDetection directionSensitivity.
-_NEUTRAL_DIR_TO_HIK = {"leftToRight": "left-right", "rightToLeft": "right-left"}
-_HIK_DIR_TO_NEUTRAL = {"left-right": "leftToRight", "right-left": "rightToLeft"}
+# Neutral direction (Axis API values, plus "both") <-> Hik directionSensitivity.
+# Hikvision has a real both-ways setting ("any"); Axis does not -- see
+# AxisAdapter._apply_line_pair for how "both" is written there.
+_NEUTRAL_DIR_TO_HIK = {"leftToRight": "left-right", "rightToLeft": "right-left",
+                       "both": "any"}
+_HIK_DIR_TO_NEUTRAL = {"left-right": "leftToRight", "right-left": "rightToLeft",
+                       "any": "both"}
+
+VALID_DIRECTIONS = ("leftToRight", "rightToLeft", "both")
+
+
+def _points_equal(a, b, tol=1e-4):
+    """Same polyline, allowing for the rounding each vendor's coordinate space does."""
+    if len(a) != len(b):
+        return False
+    return all(abs(ax - bx) <= tol and abs(ay - by) <= tol
+               for (ax, ay), (bx, by) in zip(a, b))
 
 
 def _classes_to_hik_target(classes):
@@ -530,6 +685,9 @@ def _require(caps, sc):
         raise ValueError("this camera can't target human AND vehicle in one scenario")
     if sc.exclusions and not caps.exclusions:
         raise ValueError("this camera doesn't support exclusion zones")
+    if sc.kind == "line" and sc.direction and sc.direction not in VALID_DIRECTIONS:
+        raise ValueError(f"unknown crossing direction {sc.direction!r} "
+                         f"(expected one of {', '.join(VALID_DIRECTIONS)})")
     bad = [c for c in sc.classes if c not in caps.classes]
     if bad:
         raise ValueError(f"unsupported detection class(es): {bad}")

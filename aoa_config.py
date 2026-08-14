@@ -290,7 +290,15 @@ def build_line_crossing(name, line_norm, classes=("human",), alarm_direction="le
 
     alarm_direction (confirmed live: field `alarmDirection`, values leftToRight/
     rightToLeft, relative to the line's vertex[0]->vertex[1] direction) sets which
-    way across the line fires. Fence is single-direction -- there is no "both"."""
+    way across the line fires.
+
+    A single fence is strictly ONE-WAY: the capabilities dump from a real camera
+    (aoa_probes/..._capabilities.json) gives validAlarmDirections exactly
+    ["leftToRight", "rightToLeft"] with maxNbrInstances 1, so there is no both-ways
+    fence and no second trigger to hold the other direction. Bidirectional line
+    crossing is therefore built from TWO of these scenarios sharing one line --
+    see vendor_adapter.AxisAdapter._apply_line_pair, which also folds the pair back
+    into a single rule when reading."""
     if alarm_direction not in VALID_ALARM_DIRECTIONS:
         raise ValueError(f"alarm_direction must be one of {VALID_ALARM_DIRECTIONS}")
     s = _scenario_skeleton(name, "fence", classes, scenario_id, device_id)
@@ -406,6 +414,24 @@ def insert_or_replace_scenario(config, scenario, replace_by_name=True):
 
     scenarios.append(scenario)
     return new_config
+
+
+def remove_scenario(config, scenario_id):
+    """Return a NEW full config with the scenario carrying `scenario_id` dropped.
+    Does not mutate the input; a missing id is a no-op (the caller's intent -- "this
+    must not be on the camera" -- is already satisfied)."""
+    if not isinstance(config, dict):
+        raise ValueError("config must be the dict returned by get_config()")
+    new_config = json.loads(json.dumps(config))  # deep copy
+    data = new_config.setdefault("data", {})
+    data["scenarios"] = [s for s in data.get("scenarios", []) if s.get("id") != scenario_id]
+    return new_config
+
+
+def scenario_count(config):
+    """How many scenarios the config currently holds (checked against MAX_SCENARIOS
+    before adding, since AOA rejects the whole write once the camera is full)."""
+    return len(config.get("data", {}).get("scenarios", []) if isinstance(config, dict) else [])
 
 
 PERSP_MIN_BARS, PERSP_MAX_BARS = 2, 3

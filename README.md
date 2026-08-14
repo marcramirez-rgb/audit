@@ -76,6 +76,39 @@ Both GUIs call into the same underlying engine (`camera_engine.py`) and produce
 identical reports — pick whichever fits how you work. The GUIs are the ones to
 point non-technical coworkers at.
 
+### Light / dark appearance
+
+Both GUIs carry a **Light / Dark / System** switch in the top-right of the header.
+The choice is saved to `ui_prefs.json` and applies to both tools on the next
+launch; **System** follows the Windows theme, including a change made while the
+tool is open. New installs open in Light, exactly as before.
+
+### Analytics Writer: line crossing direction
+
+The crossing-direction control offers **L → R**, **R → L**, and **Both**. The
+arrow drawn on the snapshot shows which way an object must cross to trigger, and
+becomes double-headed for a bidirectional rule — including for the rules already
+on the camera, drawn in gold.
+
+The two vendors get there differently, and the tool says which before you push:
+
+- **Hikvision** — native. One rule, `directionSensitivity = any`.
+- **Axis** — AOA has **no both-ways fence** (the firmware allows exactly
+  `leftToRight` / `rightToLeft`, one fence per scenario). So *Both* writes **two**
+  scenarios sharing one line, `NAME-LR` and `NAME-RL`, in a single config write.
+  The writer folds that pair back into one entry when it reads the camera, so you
+  edit and re-push it as a single rule. The name is capped at 12 characters to
+  leave room for the suffix, and a bidirectional line uses two of the camera's
+  ten scenario slots. Switching an existing rule between one-way and Both adds or
+  removes the second half for you.
+
+### Analytics Writer: switching cameras
+
+Changing the IP, vendor, port, Hik channel, or Axis sensor clears the previous
+camera's snapshot, gold reference overlays, scenario dropdown and drawing, and
+says so in the log. The label above the canvas names the camera the loaded state
+came from, so a stale view can't be mistaken for the camera you just typed in.
+
 ## How it works
 
 Every camera IP is checked on **3 fixed ports** (`5010`/`5015`/`5020`, mapped
@@ -131,13 +164,31 @@ values goes with it.
 ## Output
 
 Reports land in `~/Downloads/Camera_Reports_Master/`, named
-`<tag or CSV filename>_Master_<timestamp>.xlsx`, with two sheets:
+`<tag or CSV filename>_Master_<timestamp>.xlsx`, with:
 
-- **Camera Analytics** — one row per configured rule (or a placeholder row if
-  a camera has no rules), with the rule's zone drawn over a live snapshot.
-- **Missed Cameras** — every failure: connection errors, timeouts, rejected
-  credentials, or a camera running an analytics engine this tool doesn't
-  support (see Known Limitations).
+- **One tab per location** — one row per configured rule, with the rule's zone
+  drawn over a live snapshot. Ports with nothing to list still get a row saying
+  what happened (see below).
+- **Missed Cameras** (last tab) — only cameras we got **nothing** from.
+
+### What lands on which tab
+
+A port goes to **Missed Cameras** only when **both** halves failed: no snapshot
+**and** no successful analytics call. That pairing is the signal that the unit is
+offline or on a link too poor to complete a request — nothing answered at all.
+
+Anything that answered stays on its location tab, with the finding in the row:
+
+| What happened | Row on the location tab | Missed Cameras? |
+|---|---|---|
+| Rules configured | one row per rule | no |
+| Camera answered, **no analytics configured** | `No Analytics Configured` — *Camera reachable — 0 analytics rules configured* | **no** |
+| Snapshot fine, analytics call failed | `Analytics Fetch Failed` — *Camera reachable — analytics call failed* | **no** |
+| Analytics fine, snapshot failed | the real rules, prefixed `Snapshot Failed:`, drawn on a placeholder canvas | **no** |
+| Nothing came back either way | `Camera Unreachable` — *see Missed Cameras* | **yes** |
+
+So an empty Missed Cameras tab means every camera in the run was reachable — not
+that every camera has analytics.
 
 ### Debug artifacts
 
@@ -162,9 +213,11 @@ environment.
   without also fixing certificate management on the cameras themselves.
 - **AXIS Perimeter Defender** (used on fixed thermal cameras and some center pano cameras
   standard AXIS Object Analytics app) is **detected but not supported** — the
-  tool flags these as `[SPECIAL CASE]` in Missed Cameras rather than pulling
-  real rule data, because Perimeter Defender's configuration is stored in an
-  opaque, undocumented binary format. This is confirmed against a real device.
+  tool flags these on the location tab as `Non-Standard Analytics App` rather
+  than pulling real rule data, because Perimeter Defender's configuration is
+  stored in an opaque, undocumented binary format. This is confirmed against a
+  real device. (These cameras answer, so they are not Missed Cameras; they only
+  land there if the snapshot fails too.)
 - **Hikvision thermal detection is a best-effort heuristic**, not confirmed
   against a real failing device (unlike the Axis case above). It flags model
   numbers containing `2TD` as likely thermal/specialty units. If you hit a
@@ -187,7 +240,8 @@ environment.
 
 | Symptom | Likely cause |
 |---|---|
-| Every camera shows a gray/black thumbnail | Snapshot fetch is failing — check the Missed Cameras tab for the actual error (timeout, 401, etc.), not just the main sheet |
+| Every camera shows a gray/black thumbnail | Snapshot fetch is failing. If the rules still listed, the camera is reachable and the rows are prefixed `Snapshot Failed:` — check the run log for the snapshot error. If the rows say `Camera Unreachable`, the Missed Cameras tab has the full reason |
+| A camera you expected is missing from Missed Cameras | It answered. A camera with no analytics configured is on its location tab as `No Analytics Configured` — Missed Cameras is only for units that returned neither a snapshot nor analytics |
 | Widespread `401 Unauthorized` across many devices | Check you can log into one device's web UI manually with the same credentials. If that works, it's likely an account lockout from a prior bad run, not this run's password |
 | A camera hits the wrong API (e.g. Axis URL for a Hikvision unit) | Check the exact `MANUFACTURER` value in the CSV, and the column header spelling — must be exactly `MANUFACTURER` |
 | `ModuleNotFoundError` on launch | Setup hasn't run on this machine — double-click `setup.bat` and wait for "Setup complete!" |
@@ -211,6 +265,7 @@ environment.
 | `audit_gui.py` | Desktop GUI (CustomTkinter) — the primary way to run this |
 | `combined.py` | Terminal/CLI version, same engine |
 | `camera_engine.py` | All camera-fetching, parsing, and report-generation logic. No UI code. |
+| `ui_theme.py` | Shared brand palette + Light/Dark/System handling for both GUIs |
 | `requirements.txt` | Pinned dependency versions |
 | `.env.example` | Template for an optional `.env`. Not needed normally — camera creds are prompted fresh, and Snowflake config is baked in + auto-detected. Only for overrides (e.g. a non-Entra machine that needs `SNOWFLAKE_USER`) |
 | `fleet_catalog.py` | Snowflake/offline-CSV data layer behind the Fleet Picker (Client → Location → TDC → camera rows) |

@@ -8,8 +8,12 @@ Run with: python analytics_writer_gui.py
 
 Capabilities (schema + write path validated live against AOA API 1.6):
     * Connect + fetch snapshot, read current scenarios (read-only)
-    * Overlay existing scenarios on the snapshot in amber
+    * Overlay existing scenarios on the snapshot in high-contrast gold
     * Draw intrusion / line-crossing / loitering scenarios + exclusion areas
+    * Line crossing one-way OR bidirectional (native on Hikvision; on Axis, whose
+      fence is one-way only, a -LR/-RL scenario pair edited here as a single rule)
+    * Light / dark appearance, remembered between launches
+    * Switching camera clears the previous camera's snapshot, zones and form
     * Grab-and-drag editing: drag a vertex to reshape; drag inside a shape to
       move the whole thing (zones, exclusions, lines, size boxes, bars)
     * Edit an existing scenario in place (preserves perspective/presets/filters)
@@ -31,6 +35,7 @@ from PIL import Image, ImageTk
 import aoa_config
 import vendor_adapter
 import fleet_catalog
+import ui_theme
 
 try:
     from dotenv import load_dotenv
@@ -38,24 +43,37 @@ try:
 except ImportError:
     pass
 
-# --- LiveView Technologies brand palette (lifted from audit_gui.py) ---
-LVT_LIGHT = "#E5F5F5"
-LVT_TEAL = "#00A19A"
-LVT_TEAL_HOVER = "#008680"
-LVT_DARK_TEAL = "#00726E"
-LVT_DARK_TEAL_HOVER = "#005B58"
-LVT_TEXT_DARK = "#1A1D27"
-LVT_TEXT_MUTED = "#6B7A79"
-LVT_WHITE = "#FFFFFF"
-LVT_LOG_BG = "#0F1117"
-LVT_LOG_TEXT = "#D6EFEF"
+# --- LiveView Technologies brand palette (shared with audit_gui.py via ui_theme) ---
+# Each of these is a (light, dark) pair that CustomTkinter resolves against the
+# current appearance mode, so the widgets below need no per-mode branching.
+LVT_LIGHT = ui_theme.LVT_LIGHT
+LVT_TEAL = ui_theme.LVT_TEAL
+LVT_TEAL_HOVER = ui_theme.LVT_TEAL_HOVER
+LVT_DARK_TEAL = ui_theme.LVT_DARK_TEAL
+LVT_DARK_TEAL_HOVER = ui_theme.LVT_DARK_TEAL_HOVER
+LVT_TEXT_DARK = ui_theme.LVT_TEXT_DARK
+LVT_TEXT_MUTED = ui_theme.LVT_TEXT_MUTED
+LVT_SURFACE = ui_theme.LVT_SURFACE
+LVT_LOG_BG = ui_theme.LVT_LOG_BG
+LVT_LOG_TEXT = ui_theme.LVT_LOG_TEXT
+LVT_WHITE = ui_theme.LVT_WHITE      # literal white: marks that sit ON teal, both modes
+
+# Canvas drawing colors. The canvas is a dark photo surface in either appearance
+# mode, so these stay fixed -- only the chrome around it flips.
 ZONE_OUTLINE = "#00E5DA"
 ZONE_FILL = "#009CA1"
 EXCL_OUTLINE = "#FF6B6B"  # exclusion zones drawn in red to read as "ignore here"
 EXCL_FILL = "#E03131"
-EXISTING_OUTLINE = "#F7B500"  # scenarios already on the camera, shown as amber reference
+# What's already on the camera, drawn as a reference under the active drawing. Amber
+# at hairline width used to vanish against a bright or washed-out snapshot, so the
+# overlay is now a vivid gold laid over a dark casing (see _cased_line/_cased_polygon)
+# and its labels sit in a filled chip -- readable over sky, snow, or headlights.
+EXISTING_OUTLINE = "#FFC400"
+EXISTING_CASING = "#141008"   # dark underlay that gives the gold an edge on any scene
+LABEL_PLATE = "#0E1216"       # backing plate behind on-canvas labels
 SIZE_OUTLINE = "#B197FC"      # min/max object-size boxes (purple)
 PERSP_OUTLINE = "#51CF66"     # Axis perspective calibration bars (green)
+CANVAS_BG = "#0B0D12"         # snapshot backdrop
 
 # Write path validated live against 10.23.164.21:5010 (AOA 1.6): admin write confirmed,
 # setConfiguration round-trip + add/verify/restore all proven. Gate is open.
@@ -73,9 +91,10 @@ HIK_BACKUP_DIR = Path(__file__).with_name("hik_backups")
 FLEET_PICKER_PREFS = Path(__file__).with_name("fleet_picker_prefs.json")
 
 NEW_SCENARIO = "(new scenario)"
-DIR_L2R = "Left → Right"
-DIR_R2L = "Right → Left"
-DIR_TO_API = {DIR_L2R: "leftToRight", DIR_R2L: "rightToLeft"}
+DIR_L2R = "L → R"
+DIR_R2L = "R → L"
+DIR_BOTH = "Both"
+DIR_TO_API = {DIR_L2R: "leftToRight", DIR_R2L: "rightToLeft", DIR_BOTH: "both"}
 API_TO_DIR = {v: k for k, v in DIR_TO_API.items()}
 
 # LVT camera position <-> underlying port. The dropdown shows the position;
@@ -87,7 +106,7 @@ PORT_VALUE_TO_LABEL = {v: k for k, v in PORT_LABEL_TO_VALUE.items()}
 LABEL_TO_KIND = {"Intrusion": "intrusion", "Line Crossing": "line", "Loitering": "loiter"}
 KIND_TO_LABEL = {v: k for k, v in LABEL_TO_KIND.items()}
 
-ctk.set_appearance_mode("light")
+STARTUP_APPEARANCE = ui_theme.init_appearance()
 
 
 def _points_bbox(points):
@@ -160,7 +179,7 @@ class _FilterList(ctk.CTkFrame):
         self._entry = ctk.CTkEntry(self, placeholder_text=placeholder)
         self._entry.pack(fill="x")
         self._entry.bind("<KeyRelease>", lambda e: self._render())
-        self._results = ctk.CTkFrame(self, fg_color=LVT_WHITE)
+        self._results = ctk.CTkFrame(self, fg_color=LVT_SURFACE)
         self._results.pack(fill="x", pady=(2, 0))
         self.reset("—")
 
@@ -298,7 +317,7 @@ class FleetPickerDialog(ctk.CTkToplevel):
         self.title("Fleet Picker")
         self.geometry("470x640")
         self.minsize(420, 480)
-        self.configure(fg_color=LVT_WHITE)
+        self.configure(fg_color=LVT_SURFACE)
         self.transient(master)
         # Hide on X instead of destroying, so state survives to the next open.
         self.protocol("WM_DELETE_WINDOW", self._hide)
@@ -350,7 +369,7 @@ class FleetPickerDialog(ctk.CTkToplevel):
                       hover_color=LVT_TEAL_HOVER, width=90).pack(side="right")
 
         # Single scroll region for everything between header and buttons.
-        self.page = ctk.CTkScrollableFrame(self, fg_color=LVT_WHITE)
+        self.page = ctk.CTkScrollableFrame(self, fg_color=LVT_SURFACE)
         self.page.pack(side="top", fill="both", expand=True, padx=8, pady=(0, 4))
 
         # Client is capped (2,000+ clients -> must type). Location/Unit show the
@@ -419,7 +438,7 @@ class FleetPickerDialog(ctk.CTkToplevel):
         elif tag == "cameras":
             self._show_cameras(payload)
         elif tag == "error":
-            self.status.configure(text=payload.split(chr(10))[0], text_color="#B00020")
+            self.status.configure(text=payload.split(chr(10))[0], text_color=ui_theme.LVT_ERROR)
             messagebox.showerror("Fleet Picker", payload, parent=self)
 
     def _pref(self):
@@ -543,7 +562,7 @@ class WriterApp(ctk.CTk):
         # high-DPI laptop that pushed the canvas and log off the bottom with no way to
         # scroll to them, so the window had to be maximized to be usable.
         self._apply_startup_geometry(WIN_W, WIN_H)
-        self.configure(fg_color=LVT_WHITE)
+        self.configure(fg_color=LVT_SURFACE)
 
         self.msg_queue = queue.Queue()
         self.worker = None
@@ -565,6 +584,7 @@ class WriterApp(ctk.CTk):
         self.edit_label_map = {}       # dropdown display label -> Scenario (disambiguates dup names)
         self.editing = None            # native_id being edited, or None = new
         self.adapter = None            # current vendor adapter
+        self._loaded_target = None     # camera the on-screen state came from (see _form_target)
         self.edit_size = []            # [(frac_rect, label)] editable min/max size boxes
         self.size_mode = None          # None | 'min' | 'max' -- clicks draw that size box
         self.size_first = None         # first corner (canvas) while drawing a size box
@@ -581,13 +601,101 @@ class WriterApp(ctk.CTk):
         self._build_body()
         self._prefill_credentials()
         self._on_mfg_change()          # set initial capability gating + channel visibility
+        # The two raw tk widgets (canvas, paned window) aren't CTk-themed, so they have
+        # to be repainted by hand -- including on an OS light/dark switch under "System".
+        ui_theme.on_appearance_change(lambda _mode: self._on_appearance_change(), self)
         self.after(100, self._poll_queue)
+
+    def _on_appearance_change(self, _mode=None):
+        """Repaint what CustomTkinter can't: the raw tk canvas border and the sash."""
+        try:
+            self.canvas.configure(highlightbackground=ui_theme.resolve(LVT_DARK_TEAL))
+            self.split.configure(bg=ui_theme.resolve(LVT_SURFACE))
+        except (tk.TclError, AttributeError):
+            pass  # called before those exist, or after teardown
+
+    # ------------------------------------------------- which camera are we on?
+    #
+    # Everything on the canvas -- snapshot, gold reference overlays, the scenario
+    # dropdown, the scenario being edited -- belongs to ONE camera. Leaving it up
+    # when the form is pointed somewhere else reads as "you are still on the old
+    # camera", and the values from the previous unit look like the new one's config.
+    # So the form's target is tracked, and the moment it stops matching what's
+    # loaded, the loaded state is dropped.
+
+    def _form_target(self):
+        """Identity of the camera the FORM currently points at: vendor, IP, port,
+        and the vendor's sub-selector (Hik channel / Axis sensor)."""
+        ip = self.ip_entry.get().strip().split(":", 1)[0].strip()
+        is_axis = vendor_adapter.camera_engine.classify_manufacturer(self.mfg_var.get()) != "HIKVISION"
+        sub = self._axis_sensor_or_none() if is_axis else self.channel_var.get()
+        return (self.mfg_var.get(), ip, self._port(), sub)
+
+    @staticmethod
+    def _target_label(target):
+        mfg, ip, port, sub = target
+        extra = f" {'sensor' if mfg != 'Hikvision' else 'ch'}{sub}" if sub else ""
+        return f"{mfg} {ip or '(no IP)'}:{port}{extra}"
+
+    def _mark_loaded(self):
+        """Record which camera the currently displayed state came from."""
+        self._loaded_target = self._form_target()
+        self.coord_label.configure(text=f"Loaded from {self._target_label(self._loaded_target)}. "
+                                        f"Click to draw the zone.")
+
+    def _reset_camera_state(self):
+        """Drop everything that belongs to the previously loaded camera."""
+        self._loaded_target = None
+        self.adapter = None
+        self.pil_image = self.tk_image = None
+        self.img_w = self.img_h = 0
+        self.points, self.exclude_zones, self.current_exclude = [], [], []
+        self.existing_overlays, self.existing_scenarios = [], []
+        self.edit_label_map = {}
+        self.editing = None
+        self.edit_size = []
+        self.size_mode = self.size_first = None
+        self.perspective_bars, self.current_bar = [], []
+        self.bar_mode = False
+        self.drag_target = self.shape_drag = None
+        if hasattr(self, "edit_menu"):
+            self.edit_menu.configure(values=[NEW_SCENARIO])
+            self.edit_var.set(NEW_SCENARIO)
+        if hasattr(self, "name_var"):
+            self.name_var.set("")
+        if hasattr(self, "loiter_entry"):
+            self.loiter_entry.delete(0, "end")
+        if hasattr(self, "bar_button"):
+            self.bar_button.configure(text="Draw Bar: OFF")
+        if hasattr(self, "coord_label"):
+            self.coord_label.configure(
+                text="No snapshot loaded. Enter camera details and Fetch Snapshot.")
+        if hasattr(self, "canvas"):
+            self._redraw()
+
+    def _check_target_change(self, *_):
+        """Clear the loaded camera's state as soon as the form points elsewhere.
+
+        Fires on every keystroke in the IP box and on every vendor/port/channel/sensor
+        change, but only does anything while something is actually loaded -- and the
+        reset clears _loaded_target, so it can't fire twice for one switch."""
+        if self._loaded_target is None:
+            return
+        new = self._form_target()
+        if new == self._loaded_target:
+            return
+        old = self._loaded_target
+        self._reset_camera_state()
+        self._log(f"[*] Camera changed ({self._target_label(old)} -> {self._target_label(new)}). "
+                  f"Cleared the previous camera's snapshot, scenarios and drawing -- "
+                  f"Fetch Snapshot / Read Current Config for this one.")
 
     # -------------------------------------------------------------- vendor
     def _caps(self):
         return vendor_adapter.capabilities_for(self.mfg_var.get())
 
     def _on_mfg_change(self, _value=None):
+        self._check_target_change()
         mfg = self.mfg_var.get()
         # Hik needs a fixed channel; Axis instead gets an (optional) sensor picker
         # for multi-sensor units.
@@ -602,8 +710,10 @@ class WriterApp(ctk.CTk):
         self._apply_capabilities()
 
     def _on_axis_sensor_change(self):
+        # A different sensor is a different scene: the snapshot, the zones read back
+        # for it, and anything drawn on top all belong to the old one.
+        self._check_target_change()
         self.adapter = None  # force rebuild so the new sensor takes effect
-        self.tk_image = None  # stale snapshot was from a different sensor
 
     def _axis_sensor_or_none(self):
         v = self.axis_sensor_var.get()
@@ -626,6 +736,7 @@ class WriterApp(ctk.CTk):
         self.ip_entry.delete(0, "end")
         self.ip_entry.insert(0, ip)
         self.adapter = None  # force rebuild against the new IP on next action
+        self._check_target_change()
         self._log(f"[*] Fleet Picker selected {mfg_label or 'camera'} at {ip} "
                   f"(set the port for Center/Left/Right, then Fetch Snapshot).")
 
@@ -696,8 +807,13 @@ class WriterApp(ctk.CTk):
         header.pack_propagate(False)
         ctk.CTkLabel(header, text="Analytics Writer", font=ctk.CTkFont(size=22, weight="bold"),
                      text_color=LVT_WHITE).pack(side="left", padx=24, pady=10)
+        # Fixed on-teal color: the header bar is teal in BOTH appearance modes, so this
+        # subtitle must not follow the light/dark text pair.
         ctk.CTkLabel(header, text="Configure Axis and Hikvision analytics -- one place, no web UI",
-                     font=ctk.CTkFont(size=12), text_color=LVT_LIGHT).pack(side="left", padx=(0, 24), pady=(20, 10))
+                     font=ctk.CTkFont(size=12), text_color=ui_theme.LVT_ON_TEAL).pack(
+            side="left", padx=(0, 24), pady=(20, 10))
+        ui_theme.AppearanceToggle(header, STARTUP_APPEARANCE,
+                                  on_change=self._on_appearance_change).pack(side="right", padx=16)
 
     def _build_body(self):
         body = ctk.CTkFrame(self, fg_color="transparent")
@@ -731,6 +847,8 @@ class WriterApp(ctk.CTk):
 
         self.ip_entry = ctk.CTkEntry(side, placeholder_text="Camera IP e.g. 10.23.66.205")
         self.ip_entry.pack(fill="x", padx=12, pady=4)
+        # Editing the IP means we're no longer looking at the camera on screen.
+        self.ip_entry.bind("<KeyRelease>", self._check_target_change)
 
         # v2.0: pick a camera from the fleet (Client -> Location -> TDC) instead
         # of typing the IP. Fills IP + vendor; port stays on the dropdown below.
@@ -743,6 +861,7 @@ class WriterApp(ctk.CTk):
                      text_color=LVT_TEXT_MUTED, font=ctk.CTkFont(size=10)).pack(anchor="w")
         self.channel_var = tk.StringVar(value="2")
         ctk.CTkOptionMenu(self.channel_frame, values=["1", "2"], variable=self.channel_var,
+                          command=self._check_target_change,
                           fg_color=LVT_TEAL, button_color=LVT_DARK_TEAL,
                           button_hover_color=LVT_DARK_TEAL_HOVER).pack(fill="x")
         # packed/unpacked by _on_mfg_change
@@ -764,6 +883,7 @@ class WriterApp(ctk.CTk):
         ctk.CTkLabel(side, text="Camera position",
                      text_color=LVT_TEXT_MUTED, font=ctk.CTkFont(size=10)).pack(anchor="w", padx=12)
         ctk.CTkOptionMenu(side, values=list(PORT_LABEL_TO_VALUE.keys()), variable=self.port_var,
+                          command=self._check_target_change,
                           fg_color=LVT_TEAL, button_color=LVT_DARK_TEAL,
                           button_hover_color=LVT_DARK_TEAL_HOVER).pack(fill="x", padx=12, pady=4)
 
@@ -823,10 +943,16 @@ class WriterApp(ctk.CTk):
         ctk.CTkLabel(self.fence_frame, text="Crossing direction", text_color=LVT_TEXT_MUTED,
                      font=ctk.CTkFont(size=10)).pack(anchor="w")
         self.dir_var = tk.StringVar(value=DIR_L2R)
-        ctk.CTkSegmentedButton(self.fence_frame, values=[DIR_L2R, DIR_R2L], variable=self.dir_var,
-                               command=lambda _v: self._redraw(), selected_color=LVT_DARK_TEAL,
+        ctk.CTkSegmentedButton(self.fence_frame, values=[DIR_L2R, DIR_R2L, DIR_BOTH],
+                               variable=self.dir_var, command=self._on_direction_change,
+                               selected_color=LVT_DARK_TEAL,
                                selected_hover_color=LVT_DARK_TEAL_HOVER, unselected_color=LVT_TEAL,
                                unselected_hover_color=LVT_TEAL_HOVER).pack(fill="x")
+        # What "Both" costs differs by vendor, and on Axis it changes the name limit --
+        # so the hint is rewritten per vendor/selection rather than being static.
+        self.dir_hint = ctk.CTkLabel(self.fence_frame, text="", text_color=LVT_TEXT_MUTED,
+                                     font=ctk.CTkFont(size=10), justify="left", wraplength=250)
+        self.dir_hint.pack(anchor="w", pady=(2, 0))
         # hidden unless Line Crossing selected
 
         label("Drawing")
@@ -922,7 +1048,7 @@ class WriterApp(ctk.CTk):
         # Canvas over log with a draggable sash: on a short screen the operator can hand
         # the drawing surface the room instead of losing it under a fixed-height log.
         self.split = split = tk.PanedWindow(right, orient="vertical", sashwidth=7, sashrelief="flat",
-                                            bg=LVT_WHITE, bd=0, showhandle=False)
+                                            bg=ui_theme.resolve(LVT_SURFACE), bd=0, showhandle=False)
         split.grid(row=1, column=0, sticky="nsew")
         self._log_pane_h = LOG_H  # log height the operator last chose (sash drag)
         self._sash_job = None
@@ -930,8 +1056,9 @@ class WriterApp(ctk.CTk):
         # Requested size is the FLOOR the layout may shrink to, not the drawing size --
         # the old 900x506 request is what made the window unshrinkable. The pane hands
         # the canvas whatever space is actually left, and <Configure> rescales into it.
-        self.canvas = tk.Canvas(split, width=CANVAS_MIN_W, height=CANVAS_MIN_H, bg="#0B0D12",
-                                highlightthickness=1, highlightbackground=LVT_DARK_TEAL)
+        self.canvas = tk.Canvas(split, width=CANVAS_MIN_W, height=CANVAS_MIN_H, bg=CANVAS_BG,
+                                highlightthickness=1,
+                                highlightbackground=ui_theme.resolve(LVT_DARK_TEAL))
         split.add(self.canvas, minsize=CANVAS_MIN_H, stretch="always")
         self.canvas.bind("<Button-1>", self._on_canvas_click)
         self.canvas.bind("<B1-Motion>", self._on_canvas_drag)
@@ -989,10 +1116,45 @@ class WriterApp(ctk.CTk):
         self.log_box.see("end")
         self.log_box.configure(state="disabled")
 
+    def _max_name_len(self):
+        """Longest scenario name the CURRENT selection can be written with. A
+        bidirectional line on a vendor without a both-ways fence is stored as two
+        scenarios named <base>-LR / <base>-RL, so the base has to leave room for the
+        suffix inside the vendor's own name limit."""
+        if (self.rule_var.get() == "Line Crossing" and self.dir_var.get() == DIR_BOTH
+                and not self._caps().native_bidirectional):
+            return vendor_adapter.AxisAdapter.BIDIR_BASE_MAX
+        return aoa_config.MAX_NAME_LEN
+
     def _limit_name_len(self, *_):
+        cap = self._max_name_len()
         v = self.name_var.get()
-        if len(v) > aoa_config.MAX_NAME_LEN:
-            self.name_var.set(v[:aoa_config.MAX_NAME_LEN])
+        if len(v) > cap:
+            self.name_var.set(v[:cap])
+
+    def _on_direction_change(self, _value=None):
+        self._refresh_direction_hint()
+        self._limit_name_len()   # "Both" can tighten the name cap on the spot
+        self._redraw()
+
+    def _refresh_direction_hint(self):
+        """Explain what the chosen direction means on THIS vendor -- 'Both' is one
+        rule on Hikvision and a two-scenario pair on Axis, and the operator should
+        see that before pushing, not afterwards in the scenario list."""
+        if not hasattr(self, "dir_hint"):
+            return
+        cap = self._max_name_len()
+        self.name_entry.configure(placeholder_text=f"Scenario name (max {cap})")
+        if self.dir_var.get() != DIR_BOTH:
+            self.dir_hint.configure(
+                text="The arrow on the canvas points the way an object must cross to trigger.")
+        elif self._caps().native_bidirectional:
+            self.dir_hint.configure(text="Both ways across the line trigger (one rule).")
+        else:
+            self.dir_hint.configure(
+                text=f"Axis has no both-ways fence, so this writes TWO scenarios sharing "
+                     f"the line -- NAME-LR and NAME-RL. Name is capped at {cap} to fit "
+                     f"the suffix, and both are edited together from here.")
 
     def _wants_duration(self, rule):
         """The dwell/loiter-time field applies to Axis Loitering and (Hik) intrusion,
@@ -1010,6 +1172,8 @@ class WriterApp(ctk.CTk):
             self.fence_frame.pack(fill="x", padx=12, pady=4)
         else:
             self.fence_frame.pack_forget()
+        self._refresh_direction_hint()
+        self._limit_name_len()
         self._clear_points()
 
     def _port(self):
@@ -1070,7 +1234,6 @@ class WriterApp(ctk.CTk):
             return
 
         self.editing = sc.native_id
-        self.name_var.set(sc.name)
         self._set_classes(sc.classes)
         self.rule_var.set(KIND_TO_LABEL.get(sc.kind, "Intrusion"))
 
@@ -1087,6 +1250,11 @@ class WriterApp(ctk.CTk):
             self.fence_frame.pack(fill="x", padx=12, pady=4)
         else:
             self.fence_frame.pack_forget()
+        # Name is set only now: the length cap depends on the rule type and direction
+        # above (a bidirectional Axis line reserves 3 chars for its -LR/-RL suffix),
+        # so setting it first would truncate a perfectly legal 15-char name.
+        self._refresh_direction_hint()
+        self.name_var.set(sc.name)
 
         self.points = [self._frac_to_canvas(fx, fy) for (fx, fy) in sc.points]
         self.exclude_zones = [[self._frac_to_canvas(fx, fy) for (fx, fy) in z] for z in sc.exclusions]
@@ -1108,6 +1276,10 @@ class WriterApp(ctk.CTk):
         self._log(f"[.] Editing '{choice}'. Adjust and Push to update it in place.{msg}")
 
     def _make_adapter(self):
+        # Safety net for any path that changes the target without firing a widget
+        # callback (pasted IP, programmatic set): never act on one camera while the
+        # canvas still shows another's config.
+        self._check_target_change()
         ip = self.ip_entry.get().strip()
         user = self.user_entry.get().strip()
         password = self.pass_entry.get().strip()
@@ -1172,7 +1344,8 @@ class WriterApp(ctk.CTk):
                 lines = [f"[+] {len(scenarios)} scenario(s) configured:"]
                 for s in scenarios:
                     ov_kind = "fence" if s.kind == "line" else "area"
-                    overlays.append({"name": s.name, "kind": ov_kind, "verts": s.points})
+                    overlays.append({"name": s.name, "kind": ov_kind, "verts": s.points,
+                                     "direction": s.direction if s.kind == "line" else None})
                     for ex in s.exclusions:
                         overlays.append({"name": f"{s.name} (exclude)", "kind": "exclude", "verts": ex})
                     if s.min_size:
@@ -1191,7 +1364,8 @@ class WriterApp(ctk.CTk):
                     if isinstance(s.native_id, tuple):
                         ch, sid, rid = s.native_id
                         loc_txt = f" @ch{ch}/s{sid}/r{rid}"
-                    lines.append(f"    '{s.name}'{loc_txt} {s.kind} classes={s.classes}"
+                    dir_txt = f" dir={s.direction}" if s.kind == "line" and s.direction else ""
+                    lines.append(f"    '{s.name}'{loc_txt} {s.kind}{dir_txt} classes={s.classes}"
                                  + (f" dur={s.duration}" if s.duration else "")
                                  + (f" excl={len(s.exclusions)}" if s.exclusions else "") + size_txt)
                 self.msg_queue.put(("overlays", overlays, lines, scenarios))
@@ -1271,6 +1445,7 @@ class WriterApp(ctk.CTk):
         self.editing = None
         if hasattr(self, "edit_var"):
             self.edit_var.set(NEW_SCENARIO)
+        self._mark_loaded()
         self._redraw()
 
     def _frac_to_canvas(self, fx, fy):
@@ -1283,65 +1458,106 @@ class WriterApp(ctk.CTk):
         ix, iy = self._canvas_to_image_px(cx, cy)
         return (max(0.0, min(1.0, ix / self.img_w)), max(0.0, min(1.0, iy / self.img_h)))
 
-    def _draw_fence_arrow(self):
-        """Perpendicular arrow at the line midpoint showing the crossing direction an
-        object must travel to trigger. Computed in AOA normalized space (the authority
-        for leftToRight/rightToLeft, which is relative to vertex[0]->vertex[1]), then
-        mapped to the canvas so it stays correct through the Y-flip."""
-        # Compute in AOA y-up space (the authority for leftToRight/rightToLeft, verified
-        # against the Axis UI) then map back through fractions. Direction is Axis-only.
+    def _draw_fence_arrow(self, p0, p1, direction, color, casing=None):
+        """Perpendicular arrow at the midpoint of the line p0->p1 showing which way an
+        object must cross to trigger -- double-headed when the rule is bidirectional.
+
+        Computed in AOA normalized space (the authority for leftToRight/rightToLeft,
+        which is relative to vertex[0]->vertex[1]), then mapped to the canvas so it
+        stays correct through the Y-flip. `casing` draws a dark backing line first so
+        the arrow survives a bright snapshot."""
         def frac_to_aoa(fx, fy):
             return (2 * fx - 1, 1 - 2 * fy)
 
         def aoa_to_canvas(ax, ay):
             return self._frac_to_canvas((ax + 1) / 2.0, (1 - ay) / 2.0)
 
-        n0 = frac_to_aoa(*self._canvas_to_frac(*self.points[0]))
-        n1 = frac_to_aoa(*self._canvas_to_frac(*self.points[1]))
+        n0 = frac_to_aoa(*self._canvas_to_frac(*p0))
+        n1 = frac_to_aoa(*self._canvas_to_frac(*p1))
         dx, dy = n1[0] - n0[0], n1[1] - n0[1]
         length = (dx * dx + dy * dy) ** 0.5 or 1.0
-        if self._alarm_direction() == "leftToRight":
-            px, py = dy / length, -dx / length
-        else:
+        if direction == "rightToLeft":
             px, py = -dy / length, dx / length
+        else:  # leftToRight, and "both" (which gets a head on each end anyway)
+            px, py = dy / length, -dx / length
         mid = ((n0[0] + n1[0]) / 2.0, (n0[1] + n1[1]) / 2.0)
-        tip = (mid[0] + px * 0.18, mid[1] + py * 0.18)
-        mcx, mcy = aoa_to_canvas(*mid)
+        both = (direction == "both")
+        # A bidirectional shaft straddles the line so each end can carry a head;
+        # a one-way shaft starts ON the line and points the single triggering way.
+        reach = 0.14 if both else 0.18
+        start = (mid[0] - px * reach, mid[1] - py * reach) if both else mid
+        tip = (mid[0] + px * reach, mid[1] + py * reach)
+        scx, scy = aoa_to_canvas(*start)
         tcx, tcy = aoa_to_canvas(*tip)
-        self.canvas.create_line(mcx, mcy, tcx, tcy, fill=ZONE_OUTLINE, width=3,
-                                arrow="last", arrowshape=(14, 16, 6))
+        arrow = "both" if both else "last"
+        if casing:
+            self.canvas.create_line(scx, scy, tcx, tcy, fill=casing, width=7,
+                                    arrow=arrow, arrowshape=(16, 18, 8))
+        self.canvas.create_line(scx, scy, tcx, tcy, fill=color, width=3,
+                                arrow=arrow, arrowshape=(14, 16, 6))
+
+    # ---- high-contrast primitives for the "already on the camera" overlay
+    def _cased_line(self, pts, color, width, dash=None):
+        """A line drawn twice: solid dark casing underneath, the real color on top.
+        A single hairline vanishes wherever the snapshot happens to share its tone --
+        sky, snow, headlights -- and the amber reference overlay was the worst
+        offender. The casing gives it an edge on any scene."""
+        flat = self._flat(pts)
+        self.canvas.create_line(*flat, fill=EXISTING_CASING, width=width + 4)
+        self.canvas.create_line(*flat, fill=color, width=width, dash=dash)
+
+    def _cased_polygon(self, pts, color, width, dash=None):
+        """Polygon outline with the same dark casing treatment as _cased_line."""
+        flat = self._flat(pts)
+        self.canvas.create_polygon(*flat, outline=EXISTING_CASING, fill="", width=width + 4)
+        self.canvas.create_polygon(*flat, outline=color, fill="", width=width, dash=dash)
+
+    def _chip_text(self, x, y, text, color, anchor="sw", size=9):
+        """Label in a filled chip. Plain canvas text in the overlay color was
+        unreadable over a busy scene however bold it was; a solid backing plate is
+        what actually makes a name legible on a live snapshot."""
+        item = self.canvas.create_text(x, y, text=text, fill=color, anchor=anchor,
+                                       font=("Consolas", size, "bold"))
+        box = self.canvas.bbox(item)
+        if box:
+            x0, y0, x1, y1 = box
+            plate = self.canvas.create_rectangle(x0 - 3, y0 - 2, x1 + 3, y1 + 2,
+                                                 fill=LABEL_PLATE, outline=color)
+            self.canvas.tag_lower(plate, item)
 
     def _redraw(self):
         self.canvas.delete("all")
         if self.tk_image:
             self.canvas.create_image(self.offset_x, self.offset_y, anchor="nw", image=self.tk_image)
 
-        # Existing camera scenarios (amber reference), drawn under the active drawing.
+        # Existing camera scenarios (gold reference), drawn under the active drawing.
         for ov in self.existing_overlays:
             if ov["kind"] == "size":
                 fx, fy, fw, fh = ov["rect"]
                 x0, y0 = self._frac_to_canvas(fx, fy)
                 x1, y1 = self._frac_to_canvas(fx + fw, fy + fh)
+                self.canvas.create_rectangle(x0, y0, x1, y1, outline=EXISTING_CASING, width=5)
                 self.canvas.create_rectangle(x0, y0, x1, y1, outline=SIZE_OUTLINE, width=2)
-                self.canvas.create_text(x0 + 2, y0 - 7, text=ov["name"], fill=SIZE_OUTLINE,
-                                        anchor="sw", font=("Consolas", 8))
+                self._chip_text(x0 + 2, y0 - 7, ov["name"], SIZE_OUTLINE, size=8)
                 continue
             if ov["kind"] == "bar":
                 self._draw_bar(ov["verts"], ov["name"])
                 continue
             pts = [self._frac_to_canvas(fx, fy) for (fx, fy) in ov["verts"]]
             if ov["kind"] == "fence" and len(pts) >= 2:
-                self.canvas.create_line(*self._flat(pts), fill=EXISTING_OUTLINE, width=3, dash=(6, 3))
+                self._cased_line(pts, EXISTING_OUTLINE, 4)
+                # Which way the EXISTING rule triggers -- previously invisible, so a
+                # one-way fence looked identical to a bidirectional one on the canvas.
+                if ov.get("direction"):
+                    self._draw_fence_arrow(pts[0], pts[1], ov["direction"], EXISTING_OUTLINE,
+                                           casing=EXISTING_CASING)
             elif ov["kind"] == "exclude" and len(pts) >= 3:
-                self.canvas.create_polygon(*self._flat(pts), outline=EXISTING_OUTLINE, fill="",
-                                           width=2, dash=(2, 2))
+                self._cased_polygon(pts, EXISTING_OUTLINE, 2, dash=(5, 4))
             elif len(pts) >= 3:
-                self.canvas.create_polygon(*self._flat(pts), outline=EXISTING_OUTLINE, fill="",
-                                           width=2, dash=(6, 3))
+                self._cased_polygon(pts, EXISTING_OUTLINE, 3)
             if pts:
                 lx, ly = pts[0]
-                self.canvas.create_text(lx + 4, ly - 8, text=ov["name"], fill=EXISTING_OUTLINE,
-                                        anchor="sw", font=("Consolas", 9, "bold"))
+                self._chip_text(lx + 4, ly - 8, ov["name"], EXISTING_OUTLINE)
 
         is_line = self.rule_var.get() == "Line Crossing"
 
@@ -1349,7 +1565,8 @@ class WriterApp(ctk.CTk):
         if len(self.points) >= 2:
             if is_line:
                 self.canvas.create_line(*self._flat(self.points[:2]), fill=ZONE_OUTLINE, width=3)
-                self._draw_fence_arrow()
+                self._draw_fence_arrow(self.points[0], self.points[1],
+                                       self._alarm_direction(), ZONE_OUTLINE)
             else:
                 self.canvas.create_polygon(*self._flat(self.points), outline=ZONE_OUTLINE,
                                            fill=ZONE_FILL, stipple="gray25", width=2)
@@ -1372,9 +1589,9 @@ class WriterApp(ctk.CTk):
         for (fx, fy, fw, fh), lbl in self.edit_size:
             x0, y0 = self._frac_to_canvas(fx, fy)
             x1, y1 = self._frac_to_canvas(fx + fw, fy + fh)
+            self.canvas.create_rectangle(x0, y0, x1, y1, outline=EXISTING_CASING, width=5)
             self.canvas.create_rectangle(x0, y0, x1, y1, outline=SIZE_OUTLINE, width=2)
-            self.canvas.create_text(x0 + 2, y0 - 7, text=lbl, fill=SIZE_OUTLINE,
-                                    anchor="sw", font=("Consolas", 8, "bold"))
+            self._chip_text(x0 + 2, y0 - 7, lbl, SIZE_OUTLINE, size=8)
 
         # Editable perspective calibration bars (green) + any in-progress bar.
         for bar in self.perspective_bars:
@@ -1391,11 +1608,11 @@ class WriterApp(ctk.CTk):
         """Draw a calibration bar from canvas points: a line with end ticks + height label."""
         if len(pts) < 2:
             return
+        self.canvas.create_line(*self._flat(pts[:2]), fill=EXISTING_CASING, width=7)
         self.canvas.create_line(*self._flat(pts[:2]), fill=PERSP_OUTLINE, width=3)
         for (x, y) in pts[:2]:
             self.canvas.create_line(x - 5, y, x + 5, y, fill=PERSP_OUTLINE, width=2)
-        self.canvas.create_text(pts[0][0] + 6, pts[0][1], text=label, fill=PERSP_OUTLINE,
-                                anchor="w", font=("Consolas", 8, "bold"))
+        self._chip_text(pts[0][0] + 6, pts[0][1], label, PERSP_OUTLINE, anchor="w", size=8)
 
     @staticmethod
     def _flat(points):
@@ -1912,10 +2129,22 @@ class WriterApp(ctk.CTk):
             e_ch, e_sid, e_rid = self.editing
             sensor_txt = f", ch{e_ch} scene {e_sid} rule {e_rid}"
         excl_txt = f"\n{len(sc.exclusions)} exclusion zone(s) included." if sc.exclusions else ""
+        dir_txt = ""
+        if sc.kind == "line":
+            if sc.direction != "both":
+                dir_txt = f"\nDirection: {self.dir_var.get()}."
+            elif self._caps().native_bidirectional:
+                dir_txt = "\nBidirectional: triggers either way across the line."
+            else:
+                # Say it plainly BEFORE the write -- otherwise the scenario list comes
+                # back with two entries and looks like a mistake.
+                dir_txt = (f"\nBidirectional: written as TWO scenarios sharing the line, "
+                           f"'{sc.name}-LR' and '{sc.name}-RL' ({adapter.vendor} has no "
+                           f"both-ways fence). They stay a single rule in this tool.")
         verb = "Update existing scenario" if self.editing is not None else "Push new scenario"
         if not messagebox.askyesno(
             "Confirm live write",
-            f"{verb} '{sc.name}' ({sc.kind}) on {adapter.vendor}\n{ip}:{port}{sensor_txt}?{excl_txt}\n\n"
+            f"{verb} '{sc.name}' ({sc.kind}) on {adapter.vendor}\n{ip}:{port}{sensor_txt}?{dir_txt}{excl_txt}\n\n"
             f"The current config is backed up first, and other scenarios are preserved. "
             f"This changes live camera analytics."):
             self._log("[.] Push cancelled.")
@@ -2021,7 +2250,7 @@ class WriterApp(ctk.CTk):
                     self._redraw()
                     self._log("\n".join(lines))
                     if overlays:
-                        self._log(f"[+] Overlaid {len(overlays)} existing zone(s) in amber. "
+                        self._log(f"[+] Overlaid {len(overlays)} existing zone(s) in gold. "
                                   f"Pick one from 'Edit existing' to modify it, or draw a new one.")
                 elif msg[0] == "push_done":
                     _, backup_name, names = msg
