@@ -812,7 +812,9 @@ class WriterApp(ctk.CTk):
             if WRITE_ENABLED:
                 self.push_button.configure(state="normal", text="Push to Camera")
         if caps.kinds:
-            self._on_rule_change()  # refresh loiter/fence frame visibility under new type list
+            # Frames only -- NOT _on_rule_change, which clears the drawing. This runs
+            # on every adapter build, including the one inside Push.
+            self._refresh_type_frames()
 
     # -------------------------------------------------------------- layout
     def _apply_startup_geometry(self, want_w, want_h):
@@ -1211,7 +1213,11 @@ class WriterApp(ctk.CTk):
         where fieldDetection carries a durationTime."""
         return rule == "Loitering" or (rule == "Intrusion" and self._caps().intrusion_duration)
 
-    def _on_rule_change(self, _value=None):
+    def _refresh_type_frames(self):
+        """Show/hide the type-specific fields for the current rule type WITHOUT
+        touching the drawing. Split out of _on_rule_change because re-gating the UI
+        (which can happen at any time, including on the way into a Push) must never
+        discard what the operator drew -- only an actual rule-type change should."""
         rule = self.rule_var.get()
         if self._wants_duration(rule):
             self.loiter_frame.pack(fill="x", padx=12, pady=4)
@@ -1224,6 +1230,12 @@ class WriterApp(ctk.CTk):
             self.fence_frame.pack_forget()
         self._refresh_direction_hint()
         self._limit_name_len()
+
+    def _on_rule_change(self, _value=None):
+        # A deliberate rule-type change DOES discard the geometry: an area and a
+        # line aren't the same shape, so keeping the old points would silently push
+        # a zone the operator never drew for this type.
+        self._refresh_type_frames()
         self._clear_points()
 
     def _port(self):
@@ -1283,10 +1295,17 @@ class WriterApp(ctk.CTk):
             self._log("[!] Read Current Config first so the snapshot is loaded.")
             return
         if sc.read_only:
-            # Loading it into the editor would promise a Push this camera can't do.
-            self.edit_var.set(NEW_SCENARIO)
-            self._log(f"[!] '{sc.name}' can be viewed but not edited -- "
-                      f"{self._caps().read_only_reason}")
+            # A Perimeter Defender zone can never be modified -- its geometry lives in
+            # an encrypted file only Axis's Setup tool can write. But refusing outright
+            # left the operator at a dead end, so instead COPY its shape into the
+            # editor as the starting point for a brand-new writable rule. The PD
+            # original is untouched and keeps running; this adds a rule beside it.
+            if not self._caps().kinds:
+                self.edit_var.set(NEW_SCENARIO)
+                self._log(f"[!] '{sc.name}' can be viewed but not edited -- "
+                          f"{self._caps().read_only_reason}")
+                return
+            self._load_readonly_as_copy(sc)
             return
 
         self.editing = sc.native_id
@@ -1330,6 +1349,51 @@ class WriterApp(ctk.CTk):
             extras.append(f"{len(self.perspective_bars)} perspective bar(s)")
         msg = (" Showing " + ", ".join(extras) + ".") if extras else ""
         self._log(f"[.] Editing '{choice}'. Adjust and Push to update it in place.{msg}")
+
+    def _load_readonly_as_copy(self, sc):
+        """Seed the editor from a read-only rule so it can be re-created as a
+        writable one on the same camera.
+
+        This is the whole fixed-thermal workflow. The zone a thermal alarms on today
+        belongs to Perimeter Defender and is permanently uneditable, so the useful
+        move is not to block the operator but to hand them its exact shape to adjust
+        and push into a Guard app. Deliberately clears native_id: the result is a NEW
+        rule in a different application, NOT an edit of the PD zone, and the log says
+        so -- a copy that silently read like an in-place edit is exactly how someone
+        ends up believing they moved a zone they did not move."""
+        self.editing = None                       # new rule, not an edit
+        base = re.sub(r"[^A-Za-z0-9_-]+", "-", sc.name.split("/")[-1].strip())[:12].strip("-")
+        self.name_var.set(f"{base or 'zone'}-2" if base else "zone-2")
+
+        label = KIND_TO_LABEL.get(sc.kind, "Intrusion")
+        if label in (self.rule_menu.cget("values") or []):
+            self.rule_var.set(label)
+        if self._wants_duration(self.rule_var.get()):
+            self.loiter_frame.pack(fill="x", padx=12, pady=4)
+            self.loiter_entry.delete(0, "end")
+            self.loiter_entry.insert(0, str(sc.duration or ""))
+        else:
+            self.loiter_frame.pack_forget()
+        if self.rule_var.get() == KIND_TO_LABEL.get("line"):
+            self.fence_frame.pack(fill="x", padx=12, pady=4)
+        else:
+            self.fence_frame.pack_forget()
+        self._refresh_direction_hint()
+
+        self.points = [self._frac_to_canvas(fx, fy) for (fx, fy) in sc.points]
+        self.exclude_zones, self.current_exclude = [], []
+        self.edit_size, self.perspective_bars, self.current_bar = [], [], []
+        self.size_mode = self.size_first = None
+        self.bar_mode = False
+        self.mode_var.set("Include")
+        self._redraw()
+
+        app = {"intrusion": "Motion Guard", "line": "Fence Guard",
+               "loiter": "Loitering Guard"}.get(sc.kind, "a Guard app")
+        self._log(f"[.] Copied '{sc.name}' ({len(sc.points)} points) into the editor as a "
+                  f"NEW rule named '{self.name_var.get()}'.")
+        self._log(f"[.] Perimeter Defender's zone cannot be changed, so Push creates a "
+                  f"separate rule in AXIS {app}. PD keeps running its own zone unchanged.")
 
     def _make_adapter(self):
         # Safety net for any path that changes the target without firing a widget
@@ -2249,9 +2313,20 @@ class WriterApp(ctk.CTk):
                            f"'{sc.name}-LR' and '{sc.name}-RL' ({adapter.vendor} has no "
                            f"both-ways fence). They stay a single rule in this tool.")
         verb = "Update existing scenario" if self.editing is not None else "Push new scenario"
+        # On a fixed thermal the rule goes to a Guard application, NOT to Perimeter
+        # Defender -- and PD's own zone keeps running untouched. Saying so here is
+        # what stops "I edited the zone" from meaning two different things.
+        thermal_txt = ""
+        if hasattr(adapter, "guard"):
+            app_name = {"intrusion": "AXIS Motion Guard", "line": "AXIS Fence Guard",
+                        "loiter": "AXIS Loitering Guard"}.get(sc.kind, "a Guard app")
+            thermal_txt = (f"\n\nThis writes to {app_name} (started if needed). "
+                           f"Perimeter Defender's own zone is NOT modified and keeps "
+                           f"running -- this rule is additional to it.")
         if not messagebox.askyesno(
             "Confirm live write",
-            f"{verb} '{sc.name}' ({sc.kind}) on {adapter.vendor}\n{ip}:{port}{sensor_txt}?{dir_txt}{excl_txt}\n\n"
+            f"{verb} '{sc.name}' ({sc.kind}) on {adapter.vendor}\n{ip}:{port}{sensor_txt}?{dir_txt}{excl_txt}"
+            f"{thermal_txt}\n\n"
             f"The current config is backed up first, and other scenarios are preserved. "
             f"This changes live camera analytics."):
             self._log("[.] Push cancelled.")
@@ -2357,8 +2432,18 @@ class WriterApp(ctk.CTk):
                     self._redraw()
                     self._log("\n".join(lines))
                     if overlays:
-                        self._log(f"[+] Overlaid {len(overlays)} existing zone(s) in gold. "
-                                  f"Pick one from 'Edit existing' to modify it, or draw a new one.")
+                        # On a fixed thermal the existing zones belong to Perimeter
+                        # Defender and can never be edited, so "pick one to modify it"
+                        # would be a lie. Say what picking one actually does there.
+                        locked = [s for s in scenarios if s.read_only]
+                        if locked and self._caps().kinds:
+                            self._log(f"[+] Overlaid {len(overlays)} existing zone(s) in gold. "
+                                      f"{len(locked)} belong to Perimeter Defender and cannot be "
+                                      f"changed -- picking one copies its shape into the editor "
+                                      f"as a NEW rule you can adjust and push to a Guard app.")
+                        else:
+                            self._log(f"[+] Overlaid {len(overlays)} existing zone(s) in gold. "
+                                      f"Pick one from 'Edit existing' to modify it, or draw a new one.")
                 elif msg[0] == "push_done":
                     _, backup_name, names = msg
                     self.push_button.configure(state="normal", text="Push to Camera")
