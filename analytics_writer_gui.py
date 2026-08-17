@@ -2320,9 +2320,15 @@ class WriterApp(ctk.CTk):
         if hasattr(adapter, "guard"):
             app_name = {"intrusion": "AXIS Motion Guard", "line": "AXIS Fence Guard",
                         "loiter": "AXIS Loitering Guard"}.get(sc.kind, "a Guard app")
-            thermal_txt = (f"\n\nThis writes to {app_name} (started if needed). "
-                           f"Perimeter Defender's own zone is NOT modified and keeps "
-                           f"running -- this rule is additional to it.")
+            thermal_txt = (
+                f"\n\nThis writes to {app_name} (started if needed). "
+                f"Perimeter Defender's own zone is NOT modified and keeps running -- "
+                f"this rule is additional to it."
+                f"\n\nHEADS UP: a Guard rule fires an ONVIF EVENT. The unit ingests "
+                f"object-tracking metadata and Perimeter Defender's alarm socket, "
+                f"neither of which carries Guard events -- so this rule will most "
+                f"likely NOT raise an alert in the command center. Confirm with the "
+                f"edge team before relying on it.")
         if not messagebox.askyesno(
             "Confirm live write",
             f"{verb} '{sc.name}' ({sc.kind}) on {adapter.vendor}\n{ip}:{port}{sensor_txt}?{dir_txt}{excl_txt}"
