@@ -25,6 +25,7 @@ Camera_Reports_Master/
 thermal_overlay_test.jpg
 thermal_test_output.jpg
 thermal_zone_readback.jpg
+writer_thermal_demo.png
 replay_hikviz_zone_*.jpg
 debug_overlay_tests/
 
