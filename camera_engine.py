@@ -707,43 +707,30 @@ class AxisHandler(CameraHandler):
         return None, url, "Perimeter Defender metadata stream returned no zone frame"
 
     def _parse_perimeter_defender(self, xml_frame, img_w, img_h):
-        """Turn one Perimeter Defender metadata frame into rule dicts. POINT
-        coordinates are already pixels in the OSD_SIZE space, so we scale by
-        snapshot_size / OSD_SIZE rather than doing a normalized-coordinate map."""
+        """Turn one Perimeter Defender metadata frame into rule dicts.
+
+        The geometry parse lives in pd_config (shared with the analytics writer, so
+        the two tools can never disagree about where a thermal's zone is). It hands
+        back top-left fractions; the audit overlay wants snapshot pixels."""
+        import pd_config
         try:
-            root = ET.fromstring(xml_frame)
-        except ET.ParseError:
+            zones = pd_config.parse_zones(xml_frame)
+        except pd_config.PDError:
             return [{"is_placeholder": True, "name": "Perimeter Defender (unparseable metadata)", "type": "N/A", "target": "No Analytics Configured", "duration": "N/A", "vertices": []}]
 
-        try:
-            ref_w, ref_h = (int(v) for v in root.get("OSD_SIZE", "384x288").lower().split("x"))
-        except (ValueError, AttributeError):
-            ref_w, ref_h = 384, 288
-        if ref_w <= 0 or ref_h <= 0:
-            ref_w, ref_h = 384, 288
-
         rules = []
-        for zone in root.findall(".//ALERT_ZONE_LIST/ZONE"):
-            points = sorted(zone.findall("POINT"), key=lambda p: int(p.get("NUMBER", "0") or "0"))
-            vertices = []
-            for p in points:
-                try:
-                    raw_x = float(p.get("X2D", "0"))
-                    raw_y = float(p.get("Y2D", "0"))
-                except ValueError:
-                    continue
-                px = max(0, min(img_w - 1, int(raw_x / ref_w * img_w)))
-                py = max(0, min(img_h - 1, int(raw_y / ref_h * img_h)))
-                vertices.append((px, py))
+        for zone in zones:
+            vertices = [(max(0, min(img_w - 1, int(fx * img_w))),
+                         max(0, min(img_h - 1, int(fy * img_h))))
+                        for fx, fy in zone["points"]]
             if not vertices:
                 continue
-            zone_name = zone.get("NAME", "zone")
             rules.append({
                 "is_placeholder": False,
-                "name": f"Perimeter Defender: {zone_name}",
+                "name": f"Perimeter Defender: {zone['name']}",
                 # This frame carries zone geometry but not the scenario's configured
-                # type/target/duration (those live in the binary context.knp). Label
-                # generically rather than inventing specifics we didn't observe.
+                # type/target/duration (those live in the encrypted context.knp;
+                # scenarios.xml has the labels -- see pd_config.parse_scenarios_xml).
                 "type": "Perimeter Defender",
                 "target": "Human / Vehicle",
                 "duration": "N/A",

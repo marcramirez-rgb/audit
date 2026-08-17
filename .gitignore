@@ -24,6 +24,7 @@ Camera_Reports_Master/
 # Live-camera test/debug image outputs -- may contain real client scene imagery
 thermal_overlay_test.jpg
 thermal_test_output.jpg
+thermal_zone_readback.jpg
 replay_hikviz_zone_*.jpg
 debug_overlay_tests/
 
@@ -38,6 +39,14 @@ aoa_backups/
 hik_probes/
 hik_backups/
 hik_push_debug/
+
+# Perimeter Defender (Axis fixed thermal) context.knp backups -- the camera's live
+# analytics configuration, pulled by probe_pd.py --backup. Encrypted, but still
+# per-camera fleet data, and each file is ~175KB of binary. Never commit.
+pd_backups/
+
+# Guard app (Motion/Fence/Loitering) profile backups written before each push.
+guard_backups/
 
 # PTZ drift audit reports (ptz_tester.py output -- real fleet IPs + scene imagery)
 PTZ_*.xlsx

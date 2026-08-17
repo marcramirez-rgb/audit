@@ -211,13 +211,38 @@ environment.
   cameras use self-signed certificates over the local network. This is a
   reasonable tradeoff on a trusted internal network, not something to change
   without also fixing certificate management on the cameras themselves.
-- **AXIS Perimeter Defender** (used on fixed thermal cameras and some center pano cameras
-  standard AXIS Object Analytics app) is **detected but not supported** — the
-  tool flags these on the location tab as `Non-Standard Analytics App` rather
-  than pulling real rule data, because Perimeter Defender's configuration is
-  stored in an opaque, undocumented binary format. This is confirmed against a
-  real device. (These cameras answer, so they are not Missed Cameras; they only
-  land there if the snapshot fails too.)
+- **Axis fixed thermals (Q1971-E) split across TWO analytics engines**, and the
+  writer handles both — see `pd_config.py` and `guard_config.py`.
+  - **AXIS Perimeter Defender** holds the zones the camera alarms on today, and
+    **classifies human vs vehicle**. Read-only (details below).
+  - **AXIS Motion / Fence / Loitering Guard** ship preinstalled on the same
+    cameras, are **fully writable** over `control.cgi` (add/edit/delete, verified
+    live end-to-end), but have **no object classification at all** — only size and
+    duration filters. Each is a separate app that must be Running to fire;
+    starting one does *not* stop Perimeter Defender (confirmed).
+  - So on a thermal you choose per rule: classification (PD, hand-configured) or
+    API-managed zones (Guard, unclassified). `AxisThermalAdapter` shows both at
+    once, PD greyed out.
+  - **Classification is itself writable.** PD's detection tuning — including
+    `UseDNNClassifier`, the AI classifier that produces human/vehicle — lives in
+    the ordinary VAPIX parameter tree, not in the encrypted config, so
+    `pd_config.PDClient.set_params()` can manage it with no Axis UI. It drifts:
+    two identical Q1971-E units on ONE LVT unit were found with the classifier on
+    (`:5020`) and off (`:5015`). `probe_pd.py` reports it.
+- **AXIS Perimeter Defender zone geometry** is **readable but not writable**. Both tools pull the real zones — geometry from
+  the app's metadata stream, scenario names/types/dwell times from its
+  `scenarios.xml` — via `pd_config.py`. What is *not* possible is changing a
+  zone from here: Perimeter Defender publishes no scenario/zone configuration
+  endpoint at all (its complete route table is quoted in `pd_config.py`, read
+  off the ACAP's own startup log), and its only configuration file,
+  `context.knp`, is encrypted — measured at 7.9987 bits/byte with no plaintext
+  coordinates, so a replacement cannot be authored. Zones must be changed with
+  **AXIS Perimeter Defender Setup** or ACS. The writer detects these cameras
+  automatically and opens them read-only with that explanation on screen; the
+  audit reports their zones normally. `probe_pd.py --backup` saves `context.knp`,
+  which is the only rollback a Perimeter Defender camera has — take one before
+  anyone reconfigures a thermal. Confirmed live on 10.23.34.243:5015
+  (PD 3.7.0.7430, firmware 11.11.116).
 - **Hikvision thermal detection is a best-effort heuristic**, not confirmed
   against a real failing device (unlike the Axis case above). It flags model
   numbers containing `2TD` as likely thermal/specialty units. If you hit a

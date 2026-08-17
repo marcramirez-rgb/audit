@@ -698,6 +698,14 @@ class WriterApp(ctk.CTk):
 
     # -------------------------------------------------------------- vendor
     def _caps(self):
+        """Capabilities to gate the UI with.
+
+        Prefer the CONNECTED adapter's: "Axis" is two different analytics engines
+        (Object Analytics on visual units, Perimeter Defender on fixed thermals)
+        and only the adapter -- built after probing the camera -- knows which one
+        this is. Falls back to the vendor default before the first connection."""
+        if self.adapter is not None:
+            return self.adapter.capabilities
         return vendor_adapter.capabilities_for(self.mfg_var.get())
 
     def _on_mfg_change(self, _value=None):
@@ -751,13 +759,27 @@ class WriterApp(ctk.CTk):
         caps = self._caps()
         if caps is None:
             return
-        # Scenario types restricted to what the vendor supports.
+        # Scenario types restricted to what the vendor supports. A read-only camera
+        # supports none, so the picker is emptied and disabled rather than left
+        # offering choices that lead to a Push that cannot happen.
         labels = [KIND_TO_LABEL[k] for k in caps.kinds if k in KIND_TO_LABEL]
-        self.rule_menu.configure(values=labels)
-        if self.rule_var.get() not in labels and labels:
-            self.rule_var.set(labels[0])
-        # Vehicle class: only if the vendor supports it.
-        self.class_vehicle.configure(state="normal" if "vehicle" in caps.classes else "disabled")
+        if labels:
+            self.rule_menu.configure(values=labels, state="normal")
+            if self.rule_var.get() not in labels:
+                self.rule_var.set(labels[0])
+        else:
+            self.rule_menu.configure(values=["(read-only camera)"], state="disabled")
+            self.rule_var.set("(read-only camera)")
+        # Detection classes. An EMPTY class list means the engine has no
+        # classification concept at all (the Guard apps detect motion and filter on
+        # size/duration) -- both boxes go dead, because leaving "Human" ticked would
+        # promise a filter the camera will never apply.
+        if caps.classes:
+            self.class_human.configure(state="normal")
+            self.class_vehicle.configure(state="normal" if "vehicle" in caps.classes else "disabled")
+        else:
+            self.class_human.configure(state="disabled")
+            self.class_vehicle.configure(state="disabled")
         # Exclusion controls.
         excl_state = "normal" if caps.exclusions else "disabled"
         self.mode_toggle.configure(state=excl_state)
@@ -778,7 +800,19 @@ class WriterApp(ctk.CTk):
         else:
             self.size_frame.pack_forget()
             self.size_mode = None
-        self._on_rule_change()  # refresh loiter/fence frame visibility under new type list
+        # Read-only cameras (Axis fixed thermal / Perimeter Defender): the tool can
+        # show what is configured but there is no API to change it, so Push is shut
+        # off with the reason next to it rather than left to fail on click.
+        if caps.read_only:
+            self.push_button.configure(state="disabled", text="Push to Camera (not supported)")
+            self.readonly_note.configure(text=caps.read_only_reason)
+            self.readonly_note.pack(anchor="w", padx=12, pady=(0, 8))
+        else:
+            self.readonly_note.pack_forget()
+            if WRITE_ENABLED:
+                self.push_button.configure(state="normal", text="Push to Camera")
+        if caps.kinds:
+            self._on_rule_change()  # refresh loiter/fence frame visibility under new type list
 
     # -------------------------------------------------------------- layout
     def _apply_startup_geometry(self, want_w, want_h):
@@ -1032,6 +1066,13 @@ class WriterApp(ctk.CTk):
                                              fg_color=LVT_TEAL, hover_color=LVT_TEAL_HOVER)
         self.restore_button.pack(fill="x", padx=12, pady=4)
 
+        # Shown only for cameras whose analytics engine has no write API at all
+        # (Axis fixed thermals on Perimeter Defender). A greyed-out Push with no
+        # stated reason reads as a broken tool, so the reason goes on screen.
+        self.readonly_note = ctk.CTkLabel(side, text="", text_color=LVT_TEXT_MUTED,
+                                          font=ctk.CTkFont(size=10), justify="left",
+                                          wraplength=250)
+
         if not WRITE_ENABLED:
             self.push_button.configure(state="disabled", text="Push to Camera (locked)")
             ctk.CTkLabel(side, text="Writing is locked until probe_aoa.py confirms the\n"
@@ -1241,6 +1282,12 @@ class WriterApp(ctk.CTk):
         if not self.tk_image:
             self._log("[!] Read Current Config first so the snapshot is loaded.")
             return
+        if sc.read_only:
+            # Loading it into the editor would promise a Push this camera can't do.
+            self.edit_var.set(NEW_SCENARIO)
+            self._log(f"[!] '{sc.name}' can be viewed but not edited -- "
+                      f"{self._caps().read_only_reason}")
+            return
 
         self.editing = sc.native_id
         self._set_classes(sc.classes)
@@ -1307,10 +1354,14 @@ class WriterApp(ctk.CTk):
         try:
             self.adapter = vendor_adapter.make_adapter(
                 self.mfg_var.get(), ip, self._port(), user, password,
-                channel=channel)
+                channel=channel, log=self._log)
         except Exception as e:
             self._log(f"[!] {e}")
             return None
+        # The adapter is what actually knows the camera's analytics engine (an Axis
+        # fixed thermal runs Perimeter Defender, not Object Analytics), so the UI is
+        # re-gated here rather than only on the vendor dropdown.
+        self._apply_capabilities()
         return self.adapter
 
     def _run_bg(self, fn):
@@ -1374,9 +1425,15 @@ class WriterApp(ctk.CTk):
                         ch, sid, rid = s.native_id
                         loc_txt = f" @ch{ch}/s{sid}/r{rid}"
                     dir_txt = f" dir={s.direction}" if s.kind == "line" and s.direction else ""
-                    lines.append(f"    '{s.name}'{loc_txt} {s.kind}{dir_txt} classes={s.classes}"
+                    # Perimeter Defender carries its own scenario vocabulary
+                    # (intrusion / loitering / zone-crossing / conditional), which is
+                    # richer than the three kinds this tool draws -- show the real one.
+                    detail_txt = f" [{s.detail}]" if s.detail else ""
+                    ro_txt = " (read-only)" if s.read_only else ""
+                    lines.append(f"    '{s.name}'{loc_txt} {s.kind}{detail_txt}{dir_txt} classes={s.classes}"
                                  + (f" dur={s.duration}" if s.duration else "")
-                                 + (f" excl={len(s.exclusions)}" if s.exclusions else "") + size_txt)
+                                 + (f" excl={len(s.exclusions)}" if s.exclusions else "")
+                                 + size_txt + ro_txt)
                 self.msg_queue.put(("overlays", overlays, lines, scenarios))
             except Exception as e:
                 self.msg_queue.put(("log", f"[!] Read failed: {e}"))
