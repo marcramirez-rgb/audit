@@ -1350,6 +1350,39 @@ class WriterApp(ctk.CTk):
         msg = (" Showing " + ", ".join(extras) + ".") if extras else ""
         self._log(f"[.] Editing '{choice}'. Adjust and Push to update it in place.{msg}")
 
+    @staticmethod
+    def _scenario_log_line(s):
+        """One rule's summary line for the log pane.
+
+        Split out of _read_config's worker so it can be tested. It used to be
+        inline in a closure running on a background thread, which is exactly why a
+        crash in it -- unpacking a Hik-shaped native_id out of an Axis Guard rule --
+        reached operators as a bare "Read failed: not enough values to unpack".
+        Every vendor's native_id shape passes through here, so it must never assume
+        one."""
+        # A Hik address is specifically a 3-tuple (channel, scene document, ruleId),
+        # which keeps six same-named rules tellable apart. Match on the LENGTH, not
+        # merely "is a tuple": other vendors carry their own native_id shapes.
+        loc_txt = ""
+        if isinstance(s.native_id, tuple) and len(s.native_id) == 3:
+            ch, sid, rid = s.native_id
+            loc_txt = f" @ch{ch}/s{sid}/r{rid}"
+        elif isinstance(s.native_id, vendor_adapter.GuardRuleId):
+            # Which Guard app holds it -- on one camera an area and a line live in
+            # different applications.
+            loc_txt = f" @{s.native_id.app}/p{s.native_id.uid}"
+
+        size_txt = " size[min/max]" if (s.min_size or s.max_size) else ""
+        dir_txt = f" dir={s.direction}" if s.kind == "line" and s.direction else ""
+        # Perimeter Defender has its own scenario vocabulary (intrusion / loitering /
+        # zone-crossing / conditional), richer than the three kinds this tool draws.
+        detail_txt = f" [{s.detail}]" if s.detail else ""
+        ro_txt = " (read-only)" if s.read_only else ""
+        return (f"    '{s.name}'{loc_txt} {s.kind}{detail_txt}{dir_txt} classes={s.classes}"
+                + (f" dur={s.duration}" if s.duration else "")
+                + (f" excl={len(s.exclusions)}" if s.exclusions else "")
+                + size_txt + ro_txt)
+
     def _load_readonly_as_copy(self, sc):
         """Seed the editor from a read-only rule so it can be re-created as a
         writable one on the same camera.
@@ -1479,25 +1512,7 @@ class WriterApp(ctk.CTk):
                     for bar in (s.perspective or []):
                         overlays.append({"name": f"{bar.get('height')}cm", "kind": "bar",
                                          "verts": bar.get("points", [])})
-                    size_txt = ""
-                    if s.min_size or s.max_size:
-                        size_txt = " size[min/max]"
-                    # Hik rules carry their address (channel/scene doc/ruleId) so six
-                    # same-named rules stay tellable-apart in the log.
-                    loc_txt = ""
-                    if isinstance(s.native_id, tuple):
-                        ch, sid, rid = s.native_id
-                        loc_txt = f" @ch{ch}/s{sid}/r{rid}"
-                    dir_txt = f" dir={s.direction}" if s.kind == "line" and s.direction else ""
-                    # Perimeter Defender carries its own scenario vocabulary
-                    # (intrusion / loitering / zone-crossing / conditional), which is
-                    # richer than the three kinds this tool draws -- show the real one.
-                    detail_txt = f" [{s.detail}]" if s.detail else ""
-                    ro_txt = " (read-only)" if s.read_only else ""
-                    lines.append(f"    '{s.name}'{loc_txt} {s.kind}{detail_txt}{dir_txt} classes={s.classes}"
-                                 + (f" dur={s.duration}" if s.duration else "")
-                                 + (f" excl={len(s.exclusions)}" if s.exclusions else "")
-                                 + size_txt + ro_txt)
+                    lines.append(self._scenario_log_line(s))
                 self.msg_queue.put(("overlays", overlays, lines, scenarios))
             except Exception as e:
                 self.msg_queue.put(("log", f"[!] Read failed: {e}"))
@@ -2294,7 +2309,9 @@ class WriterApp(ctk.CTk):
         sensor_txt = ""
         if adapter.vendor == "Axis" and getattr(adapter, "device_id", None):
             sensor_txt = f", sensor {adapter.device_id}"
-        elif isinstance(self.editing, tuple):
+        elif isinstance(self.editing, vendor_adapter.GuardRuleId):
+            sensor_txt = f", {self.editing.app} profile {self.editing.uid}"
+        elif isinstance(self.editing, tuple) and len(self.editing) == 3:
             # Hik edit: say exactly which rule gets patched -- with six same-named
             # rules on a camera, "RULE1" alone doesn't identify the write target.
             e_ch, e_sid, e_rid = self.editing

@@ -126,6 +126,65 @@ def test_changing_rule_type_still_clears_the_drawing(app):
 
 
 # --------------------------------------------------------------------------- #
+# Reading back rules of every vendor shape
+# --------------------------------------------------------------------------- #
+
+def test_log_line_handles_every_native_id_shape(app):
+    """REGRESSION. Reported from the field as:
+
+        [!] Read failed: not enough values to unpack (expected 3, got 2)
+
+    ...on the first read AFTER a push to a thermal. Pushing starts the owning
+    Guard app, so the next read returns Guard rules -- and this line-builder
+    unpacked any native_id as a Hikvision (channel, scene, rule) triple. Every
+    vendor's shape has to survive it."""
+    shapes = [
+        ("Axis AOA (int)", 3),
+        ("Hik (channel, scene, rule)", ("2", 2, 7)),
+        ("Axis bidirectional line", vendor_adapter.AxisLinePair(4, 5)),
+        ("Axis Guard app", vendor_adapter.GuardRuleId("motionguard", 2)),
+        ("Perimeter Defender (none)", None),
+    ]
+    for label, native in shapes:
+        sc = vendor_adapter.Scenario(
+            name="RULE", kind="intrusion", points=[(0.1, 0.1), (0.9, 0.1), (0.9, 0.9)],
+            classes=("human",), native_id=native)
+        line = app._scenario_log_line(sc)          # must not raise
+        assert "RULE" in line, (label, line)
+    guard = vendor_adapter.Scenario(
+        name="G", kind="intrusion", points=[(0.1, 0.1), (0.9, 0.1), (0.9, 0.9)],
+        classes=(), native_id=vendor_adapter.GuardRuleId("fenceguard", 9))
+    assert "@fenceguard/p9" in app._scenario_log_line(guard), app._scenario_log_line(guard)
+    hik = vendor_adapter.Scenario(
+        name="H", kind="intrusion", points=[(0.1, 0.1), (0.9, 0.1), (0.9, 0.9)],
+        classes=("human",), native_id=("2", 3, 4))
+    assert "@ch2/s3/r4" in app._scenario_log_line(hik), app._scenario_log_line(hik)
+    return f"{len(shapes)} native_id shapes render without unpacking errors"
+
+
+def test_read_after_push_sequence_does_not_crash(app):
+    """The exact field sequence: push starts a Guard app, so the following read
+    returns a mix of PD (read-only, native_id None) and Guard rules."""
+    scenarios = [
+        vendor_adapter.Scenario(name="intrusion-1 / zone-1", kind="intrusion",
+                                points=[(0.1, 0.1), (0.9, 0.1), (0.9, 0.9)],
+                                classes=("human",), duration=15,
+                                read_only=True, detail="intrusion"),
+        vendor_adapter.Scenario(name="NEWZONE", kind="intrusion",
+                                points=[(0.2, 0.2), (0.8, 0.2), (0.8, 0.8)],
+                                classes=(), detail="AXIS motionguard",
+                                native_id=vendor_adapter.GuardRuleId("motionguard", 2)),
+    ]
+    lines = [app._scenario_log_line(s) for s in scenarios]
+    assert "(read-only)" in lines[0], lines[0]
+    assert "@motionguard/p2" in lines[1], lines[1]
+    # And the edit dropdown must build over the mixed list without blowing up.
+    labels = app._build_edit_labels(scenarios)
+    assert len(labels) == 2, labels
+    return "PD + Guard rules read back together cleanly"
+
+
+# --------------------------------------------------------------------------- #
 # Fixed-thermal workflow
 # --------------------------------------------------------------------------- #
 

@@ -37,6 +37,20 @@ class AxisLinePair:
     rl_id: int
 
 
+@dataclass(frozen=True)
+class GuardRuleId:
+    """native_id for a rule in an Axis Guard app: which application holds it, and
+    its uid within that app's config.
+
+    Same reasoning as AxisLinePair above -- this must NOT be a tuple. The GUI
+    treats a tuple native_id as a Hikvision (channel, sid, ruleId) address and
+    unpacks it into three names, so handing it a 2-tuple raised "not enough
+    values to unpack (expected 3, got 2)" on every thermal that had a Guard app
+    running. A distinct type cannot be mistaken for a Hik address."""
+    app: str
+    uid: int
+
+
 @dataclass
 class Scenario:
     """Vendor-neutral analytics scenario. Points are [0,1] top-left fractions."""
@@ -539,7 +553,7 @@ class GuardAdapter:
                 out.append(Scenario(
                     name=p["name"], kind=p["kind"], points=p["points"],
                     classes=(), duration=p["duration"], direction=p["direction"],
-                    exclusions=p["exclusions"], native_id=(app, p["uid"]),
+                    exclusions=p["exclusions"], native_id=GuardRuleId(app, p["uid"]),
                     detail=f"AXIS {app}"))
         return out
 
@@ -562,10 +576,8 @@ class GuardAdapter:
         # Editing keeps the profile's uid so its other settings stay put; a rule
         # whose kind changed moves to a different app and becomes a new profile.
         uid = None
-        if isinstance(sc.native_id, tuple) and len(sc.native_id) == 2:
-            prev_app, prev_uid = sc.native_id
-            if prev_app == app:
-                uid = prev_uid
+        if isinstance(sc.native_id, GuardRuleId) and sc.native_id.app == app:
+            uid = sc.native_id.uid
 
         if sc.kind == "line":
             profile = guard_config.build_fence_profile(
@@ -582,10 +594,10 @@ class GuardAdapter:
         return backup_path, verify
 
     def delete_scenario(self, native_id, backup_dir):
-        """Remove one profile. native_id is the (app, uid) pair read_scenarios gave."""
-        if not (isinstance(native_id, tuple) and len(native_id) == 2):
-            raise ValueError(f"expected an (app, uid) pair, got {native_id!r}")
-        app, uid = native_id
+        """Remove one profile. native_id is the GuardRuleId read_scenarios gave."""
+        if not isinstance(native_id, GuardRuleId):
+            raise ValueError(f"expected a GuardRuleId, got {native_id!r}")
+        app, uid = native_id.app, native_id.uid
         client = self._client(app)
         backup_path, current = client.backup_config(backup_dir)
         client.set_config(guard_config.remove_profile(current, uid))

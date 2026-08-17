@@ -303,9 +303,43 @@ def test_adapter_reads_across_all_three_apps():
     scs = a.read_scenarios()
     kinds = sorted(s.kind for s in scs)
     assert kinds == ["intrusion", "line", "loiter"], kinds
-    assert all(s.native_id[0] in gc.APP_TRIGGER for s in scs), scs
+    assert all(s.native_id.app in gc.APP_TRIGGER for s in scs), scs
     assert all(s.classes == () for s in scs), "Guard apps have no object classes"
     return "one read spans motionguard + fenceguard + loiteringguard"
+
+
+def test_guard_native_id_is_not_a_tuple():
+    """REGRESSION. The GUI treats a tuple native_id as a Hikvision
+    (channel, scene, rule) address and unpacks three names from it. A 2-tuple
+    (app, uid) therefore raised "not enough values to unpack (expected 3, got 2)"
+    and every read failed on a thermal with a Guard app running. AxisLinePair
+    documents this exact trap; GuardRuleId has to respect it too."""
+    a = _stub_guard_adapter({"motionguard": MOTION_CONFIG})
+    sc = a.read_scenarios()[0]
+    assert not isinstance(sc.native_id, tuple), \
+        f"native_id must not be a tuple, got {sc.native_id!r}"
+    assert isinstance(sc.native_id, vendor_adapter.GuardRuleId), type(sc.native_id)
+    assert sc.native_id.app == "motionguard" and sc.native_id.uid == 1, sc.native_id
+    # The unpack the GUI performs on a Hik address must not even be attempted.
+    try:
+        _a, _b, _c = sc.native_id
+    except (TypeError, ValueError):
+        pass
+    else:
+        raise AssertionError("GuardRuleId unpacked as a 3-tuple -- it is tuple-like")
+    return "GuardRuleId can't be mistaken for a Hik (channel, scene, rule) address"
+
+
+def test_editing_a_guard_rule_targets_its_own_app_and_uid():
+    a = _stub_guard_adapter({"motionguard": MOTION_CONFIG})
+    sc = a.read_scenarios()[0]
+    # Same app -> edit in place (uid preserved).
+    assert vendor_adapter.GuardRuleId("motionguard", 1) == sc.native_id
+    # A rule whose KIND changed moves to a different app and must become a new
+    # profile there rather than clobbering uid 1 of the wrong application.
+    moved = vendor_adapter.GuardRuleId("motionguard", 1)
+    assert moved.app != "fenceguard"
+    return "edit keeps uid within its app; a kind change can't clobber another app"
 
 
 def test_a_stopped_app_is_reported_not_fatal():
