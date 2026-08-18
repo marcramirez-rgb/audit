@@ -444,6 +444,71 @@ def test_queued_camera_hint_says_wait_not_click(app):
     return "loading tab says the snapshot is on its way"
 
 
+def test_wrong_vendor_camera_is_auto_corrected(app):
+    """FIELD REPORT (10.23.101.156). The catalog knows a mixed unit's vendors but
+    not which PORT each sits on, so a whole-unit pick can hand a camera the wrong
+    API -- an Axis at 5010 404s on every /ISAPI/ endpoint. A total failure under
+    the assigned vendor must try the other vendor (with ITS credentials) instead
+    of declaring the camera dead."""
+    _reset(app)
+    s = mw.CameraSession("10.9.9.9", "5010", "Hikvision")
+    app.sessions[s.target] = s
+
+    class _AxisOK:
+        vendor = "Axis"
+
+        @staticmethod
+        def fetch_snapshot(log=None):
+            return Image.new("RGB", (640, 480), "#123")
+
+        @staticmethod
+        def read_scenarios():
+            return []
+
+    real_make = mw.vendor_adapter.make_adapter
+    real_env = type(app)._env_credentials
+    calls = {}
+
+    def fake_make(vendor, ip, port, user, password, **kw):
+        calls["vendor"], calls["user"] = vendor, user
+        assert vendor == "Axis", f"fallback must try the OTHER vendor, got {vendor}"
+        return _AxisOK()
+
+    mw.vendor_adapter.make_adapter = fake_make
+    type(app)._env_credentials = staticmethod(lambda vendor: ("axis-user", "axis-pass"))
+    try:
+        ok = app._try_other_vendor(s.target, s, notes=[])
+    finally:
+        mw.vendor_adapter.make_adapter = real_make
+        type(app)._env_credentials = real_env
+
+    assert ok, "a camera answering the other vendor must be recovered"
+    assert s.vendor == "Axis", s.vendor
+    assert calls["user"] == "axis-user", "must use the OTHER vendor's credentials"
+    # The recovery arrives through the normal cam_loaded path.
+    kinds = []
+    while not app.msg_queue.empty():
+        kinds.append(app.msg_queue.get_nowait()[0])
+    assert "cam_loaded" in kinds, kinds
+    return "Hik-assigned Axis camera recovers as Axis, with Axis creds"
+
+
+def test_vendor_fallback_gives_up_without_credentials(app):
+    """No creds for the other vendor -> report, don't guess."""
+    _reset(app)
+    s = mw.CameraSession("10.9.9.8", "5010", "Hikvision")
+    real_env = type(app)._env_credentials
+    type(app)._env_credentials = staticmethod(lambda vendor: (None, None))
+    notes = []
+    try:
+        ok = app._try_other_vendor(s.target, s, notes)
+    finally:
+        type(app)._env_credentials = real_env
+    assert not ok and s.vendor == "Hikvision"
+    assert any("no credentials" in n for n in notes), notes
+    return "missing creds surface in the error note instead of a silent skip"
+
+
 def test_session_geometry_is_fractions_not_pixels(app):
     """Sessions must survive a resize, so nothing may be stored in canvas pixels."""
     _reset(app)

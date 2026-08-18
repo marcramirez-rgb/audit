@@ -370,6 +370,8 @@ class MultiWriterApp(WriterApp):
                     notes.append(f"analytics unreadable: {type(e).__name__}: {e}")
 
                 if img is None and not scenarios:
+                    if self._try_other_vendor(t, s, notes):
+                        return
                     self.msg_queue.put(("cam_error", (t, "; ".join(notes) or "nothing readable")))
                 else:
                     self.msg_queue.put(("cam_loaded", (t, img, scenarios, notes)))
@@ -385,6 +387,43 @@ class MultiWriterApp(WriterApp):
         self._cancel.clear()
         self._set_busy(True)
         self._run_bg(self._with_batch_timeout(work))
+
+    def _try_other_vendor(self, t, s, notes):
+        """Mixed units: the catalog knows a unit's VENDORS but not which PORT each
+        one sits on, so a whole-unit fleet pick can assign the wrong API to one
+        camera -- an Axis at 5010 asked for /ISAPI/... 404s on everything (field
+        report, 10.23.101.156). When a camera fails COMPLETELY under its assigned
+        vendor, try the other one -- with that vendor's own credentials -- before
+        declaring it dead. Runs on the worker thread: no Tk access in here."""
+        other = "Hikvision" if s.vendor.lower().startswith("axis") else "Axis"
+        user, password = self._env_credentials(other)
+        if not (user and password):
+            notes.append(f"{other} not tried (no credentials for it in access.env)")
+            return False
+        try:
+            adapter = vendor_adapter.make_adapter(
+                other, s.ip, s.port, user, password,
+                log=lambda m: self.msg_queue.put(("log", m)))
+        except Exception as e:                                    # noqa: BLE001
+            notes.append(f"{other}: {type(e).__name__}")
+            return False
+        img, scenarios = None, []
+        try:
+            img = self._fetch_snapshot_with_retry(adapter, t, attempts=1)
+        except Exception as e:                                    # noqa: BLE001
+            notes.append(f"{other} snapshot: {type(e).__name__}")
+        try:
+            scenarios = adapter.read_scenarios()
+        except Exception as e:                                    # noqa: BLE001
+            notes.append(f"{other} analytics: {type(e).__name__}")
+        if img is None and not scenarios:
+            return False
+        s.vendor = other
+        self.msg_queue.put(("log", f"[*] {s.label}: vendor auto-corrected to {other} "
+                                   f"-- the picked vendor got no answer, {other} did "
+                                   f"(mixed unit). Pushes to it will use {other}."))
+        self.msg_queue.put(("cam_loaded", (t, img, scenarios, [])))
+        return True
 
     @staticmethod
     def _with_batch_timeout(fn):
@@ -633,8 +672,22 @@ class MultiWriterApp(WriterApp):
             self._log("[.] Multi-camera push cancelled.")
             return
 
+        # Credentials are resolved per CAMERA VENDOR, on the main thread (mfg_var
+        # is Tk state). The entry boxes hold one vendor's pair; on a mixed session
+        # -- possible via vendor auto-correct -- the other vendor's cameras must
+        # be pushed with their own credentials or every one of them 401s.
         user = self.user_entry.get().strip()
         password = self.pass_entry.get().strip()
+        selected = vendor_adapter.camera_engine.classify_manufacturer(self.mfg_var.get())
+        creds = {}
+        for s in pending:
+            if vendor_adapter.camera_engine.classify_manufacturer(s.vendor) == selected \
+                    and user and password:
+                creds[s.target] = (user, password)
+            else:
+                eu, ep = self._env_credentials(s.vendor)
+                creds[s.target] = (eu or user, ep or password)
+
         self.push_all_button.configure(state="disabled", text="Pushing...")
         self._log(f"[*] Pushing {len(pending)} camera(s), one at a time ...")
 
@@ -645,8 +698,9 @@ class MultiWriterApp(WriterApp):
                     results.append((s.target, False, "cancelled before this camera"))
                     continue
                 try:
+                    c_user, c_pass = creds[s.target]
                     adapter = vendor_adapter.make_adapter(
-                        s.vendor, s.ip, s.port, user, password,
+                        s.vendor, s.ip, s.port, c_user, c_pass,
                         channel=s.sensor if s.vendor.lower().startswith("axis") else s.channel)
                     sc = vendor_adapter.Scenario(
                         name=s.name.strip(),

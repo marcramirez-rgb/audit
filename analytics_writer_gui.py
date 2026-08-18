@@ -2486,10 +2486,14 @@ class WriterApp(ctk.CTk):
             pass
         self.after(100, self._poll_queue)
 
-    def _prefill_credentials(self):
-        """Seed user/pass for the selected vendor from env or access.env. Silent if
-        nothing is found. Re-run on manufacturer change."""
-        prefix = "HIK" if vendor_adapter.camera_engine.classify_manufacturer(self.mfg_var.get()) == "HIKVISION" else "AXIS"
+    @staticmethod
+    def _env_credentials(vendor):
+        """(user, password) for a vendor from the environment / access.env, WITHOUT
+        touching the entry widgets. Shared by the prefill below and by the
+        multi-camera writer, which needs the OTHER vendor's credentials mid-batch:
+        on a mixed unit the entry boxes can only ever hold one vendor's pair.
+        Thread-safe (no Tk access), so workers may call it."""
+        prefix = "HIK" if vendor_adapter.camera_engine.classify_manufacturer(vendor) == "HIKVISION" else "AXIS"
         user = os.environ.get(f"{prefix}_USER")
         password = os.environ.get(f"{prefix}_PASS") or os.environ.get(f"{prefix}_PASSWORD")
         env_file = Path(__file__).with_name("access.env")
@@ -2509,6 +2513,12 @@ class WriterApp(ctk.CTk):
                 password = password or env.get(f"{prefix}_PASSWORD") or env.get(f"{prefix}_PASS")
             except OSError:
                 pass
+        return user, password
+
+    def _prefill_credentials(self):
+        """Seed user/pass for the selected vendor from env or access.env. Silent if
+        nothing is found. Re-run on manufacturer change."""
+        user, password = self._env_credentials(self.mfg_var.get())
         self.user_entry.delete(0, "end")
         self.pass_entry.delete(0, "end")
         if user:
