@@ -261,6 +261,49 @@ def test_batch_timeout_is_widened_then_restored(app):
     return f"{original} -> {mw.BATCH_SNAPSHOT_TIMEOUT} during batch, restored after"
 
 
+def test_tab_label_uses_tdc_and_position_when_the_fleet_picker_supplied_it(app):
+    """Operators think in units and positions, not addresses. But a hand-typed IP
+    has no catalog row, so the address has to remain the fallback -- a blank or
+    half-built label would be worse than a technical one."""
+    from_fleet = mw.CameraSession("10.0.0.5", "5015", "Axis",
+                                  fleet={"tdc": "TDC12345", "client": "ACME",
+                                         "location": "Yard 3"})
+    assert from_fleet.position == "Left", from_fleet.position
+    assert from_fleet.label == "TDC12345 - Left", from_fleet.label
+
+    for port, expect in (("5010", "Center"), ("5015", "Left"), ("5020", "Right")):
+        s = mw.CameraSession("10.0.0.5", port, "Axis", fleet={"tdc": "TDC1"})
+        assert s.label == f"TDC1 - {expect}", s.label
+
+    typed = mw.CameraSession("10.0.0.9", "5020", "Axis")
+    assert typed.label == "10.0.0.9:5020", typed.label
+
+    blank = mw.CameraSession("10.0.0.9", "5020", "Axis", fleet={"tdc": ""})
+    assert blank.label == "10.0.0.9:5020", "an empty TDC must fall back, not show nothing"
+
+    odd = mw.CameraSession("10.0.0.9", "8080", "Axis", fleet={"tdc": "TDC7"})
+    assert odd.label == "TDC7 - port 8080", odd.label
+
+    # target stays the address -- it is the key and what the network needs.
+    assert from_fleet.target == "10.0.0.5:5015", from_fleet.target
+    return "TDC + position when known, address when not; target unchanged"
+
+
+def test_fleet_pick_records_the_catalog_row_against_the_ip(app):
+    """The picker had the row all along and threw it away. Verify it lands in
+    fleet_info, and that a pick without a row does not explode."""
+    app.fleet_info.clear()
+    app._apply_fleet_pick("10.1.2.3", "Axis", {
+        "LIVE_UNIT_SERIAL_NM": " TDC99887 ", "CLIENT_NM": "ACME",
+        "LOCATION_NM": "North Lot", "MODEL": "Q6135-LE"})
+    info = app.fleet_info["10.1.2.3"]
+    assert info["tdc"] == "TDC99887", info          # whitespace stripped
+    assert info["location"] == "North Lot", info
+    app._apply_fleet_pick("10.1.2.4", "Axis")       # hand-typed / no row
+    assert "10.1.2.4" not in app.fleet_info
+    return "catalog row stored per IP; a row-less pick is harmless"
+
+
 def test_session_geometry_is_fractions_not_pixels(app):
     """Sessions must survive a resize, so nothing may be stored in canvas pixels."""
     _reset(app)

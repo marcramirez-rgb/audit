@@ -62,8 +62,11 @@ class CameraSession:
     Everything geometric is a [0,1] fraction so it is independent of canvas size
     and directly pushable; nothing here references a Tk widget."""
 
-    def __init__(self, ip, port, vendor, sensor=None, channel=None):
+    def __init__(self, ip, port, vendor, sensor=None, channel=None, fleet=None):
         self.ip, self.port, self.vendor = ip, str(port), vendor
+        # Catalog details for this camera's unit, when it came from the Fleet
+        # Picker. None for a hand-typed IP.
+        self.fleet = fleet or {}
         self.sensor, self.channel = sensor, channel
         self.loaded = False          # usable: we have a snapshot, rules or not
         self.error = None            # nothing at all could be read
@@ -85,7 +88,24 @@ class CameraSession:
 
     @property
     def target(self):
+        """Stable key and the address anything network-facing needs."""
         return f"{self.ip}:{self.port}"
+
+    @property
+    def position(self):
+        """Center / Left / Right -- how the three cameras on a unit are known."""
+        return awg.PORT_VALUE_TO_LABEL.get(self.port, f"port {self.port}")
+
+    @property
+    def label(self):
+        """Operator-facing name: the unit (TDC) and which camera on it.
+
+        An IP is how the tool reaches a camera; a TDC and a position are how a
+        person refers to one. Falls back to the address when the camera did not
+        come from the Fleet Picker, because a hand-typed IP has no catalog entry
+        and a blank label would be worse than a technical one."""
+        tdc = (self.fleet or {}).get("tdc")
+        return f"{tdc} - {self.position}" if tdc else f"{self.target}"
 
     @property
     def dirty(self):
@@ -179,12 +199,13 @@ class MultiWriterApp(WriterApp):
             return
         marks = {"loading": "...", "error": "!", "edited": "*",
                  "warn": "~", "loaded": ""}
+        widest = max((len(s.label) for s in self.sessions.values()), default=12)
         for target, s in self.sessions.items():
             mark = marks[s.status()]
-            label = f"{target}{('  ' + mark) if mark else ''}"
+            label = f"{s.label}{('  ' + mark) if mark else ''}"
             active = target == self.active
             ctk.CTkButton(
-                self.tabs, text=label, width=170, height=28,
+                self.tabs, text=label, width=max(150, min(230, widest * 9 + 34)), height=28,
                 command=lambda t=target: self.switch_to(t),
                 fg_color=LVT_DARK_TEAL if active else LVT_TEAL,
                 hover_color=LVT_DARK_TEAL_HOVER if active else LVT_TEAL_HOVER,
@@ -254,13 +275,15 @@ class MultiWriterApp(WriterApp):
             t = f"{ip}:{port}"
             if t in self.sessions:
                 continue
-            self.sessions[t] = CameraSession(ip, port, vendor, sensor, channel)
+            self.sessions[t] = CameraSession(ip, port, vendor, sensor, channel,
+                                             fleet=self.fleet_info.get(ip))
             new.append(t)
         self._refresh_tabs()
         if not new:
             self._log("[.] Those cameras are already loaded.")
             return
-        self._log(f"[*] Loading {len(new)} camera(s): {', '.join(new)}")
+        self._log("[*] Loading " + str(len(new)) + " camera(s): "
+                  + ", ".join(self.sessions[t].label for t in new))
 
         def work():
             # Concurrent across cameras, because they are separate devices and a
@@ -486,7 +509,7 @@ class MultiWriterApp(WriterApp):
         finally:
             self._switching = False
         self._refresh_tabs()
-        self._log(f"[*] Now editing {target}"
+        self._log(f"[*] Now editing {s.label} ({target})"
                   + (f" -- {len(s.existing_scenarios)} existing rule(s)." if s.loaded else "."))
 
     # ------------------------------------------------------------------ push all
@@ -501,7 +524,7 @@ class MultiWriterApp(WriterApp):
         lines = []
         for s in pending:
             verb = "update" if s.editing is not None else "create"
-            lines.append(f"  {s.target}: {verb} '{s.name}' "
+            lines.append(f"  {s.label} [{s.target}]: {verb} '{s.name}' "
                          f"({awg.LABEL_TO_KIND.get(s.kind_label, 'intrusion')}, "
                          f"{len(s.points)} points)")
         if not awg.messagebox.askyesno(

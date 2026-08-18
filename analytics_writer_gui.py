@@ -542,7 +542,7 @@ class FleetPickerDialog(ctk.CTkToplevel):
                 f"MANUFACTURER '{row.get('MANUFACTURER')}' for {ip} isn't clearly Axis or Hikvision.\n\n"
                 "Use the IP anyway and set the vendor manually?", parent=self):
                 return
-        self.on_select(ip, label)
+        self.on_select(ip, label, row)
         # Stay open: when a whole location is being updated unit by unit, the
         # next pick must be one click away. Tag the unit so the operator can see
         # which ones were already sent to the writer this session.
@@ -585,6 +585,9 @@ class WriterApp(ctk.CTk):
         self.editing = None            # native_id being edited, or None = new
         self.adapter = None            # current vendor adapter
         self._loaded_target = None     # camera the on-screen state came from (see _form_target)
+        # IP -> {tdc, client, location, model} for anything chosen via the Fleet
+        # Picker. Empty for hand-typed IPs, so every consumer must have a fallback.
+        self.fleet_info = {}
         self.edit_size = []            # [(frac_rect, label)] editable min/max size boxes
         self.size_mode = None          # None | 'min' | 'max' -- clicks draw that size box
         self.size_first = None         # first corner (canvas) while drawing a size box
@@ -741,9 +744,22 @@ class WriterApp(ctk.CTk):
         else:
             self._fleet_picker = FleetPickerDialog(self, self._apply_fleet_pick)
 
-    def _apply_fleet_pick(self, ip, mfg_label):
+    def _apply_fleet_pick(self, ip, mfg_label, row=None):
         """Callback from FleetPickerDialog: drop the chosen camera's IP + vendor
-        into the sidebar. Port/channel stay as the operator set them."""
+        into the sidebar. Port/channel stay as the operator set them.
+
+        The catalog row is remembered against the IP so the rest of the tool can
+        name a camera the way an operator thinks of it -- by unit (TDC) and
+        position -- rather than by address. Row is optional: an IP typed by hand
+        has no catalog entry, and must keep working."""
+        if row:
+            serial = (row.get("LIVE_UNIT_SERIAL_NM") or row.get("LIVE_UNIT_SERIAL_NR") or "")
+            self.fleet_info[ip] = {
+                "tdc": serial.strip(),
+                "client": (row.get("CLIENT_NM") or "").strip(),
+                "location": (row.get("LOCATION_NM") or "").strip(),
+                "model": (row.get("MODEL") or "").strip(),
+            }
         if mfg_label and mfg_label != self.mfg_var.get():
             self.mfg_var.set(mfg_label)
             self._on_mfg_change()
