@@ -23,11 +23,12 @@ REM
 REM The list is the writer's full import chain, not just its direct imports:
 REM   analytics_writer_gui -> aoa_config, vendor_adapter, fleet_catalog, ui_theme
 REM   aoa_config           -> camera_engine
-REM   vendor_adapter       -> aoa_config, camera_engine, hik_config
+REM   vendor_adapter       -> aoa_config, camera_engine, hik_config, pd_config
 REM   hik_config           -> camera_engine
+REM   pd_config            -> camera_engine   (Axis fixed thermals / Perimeter Defender)
 REM Deliberately NOT shared with "Run Audit Report.bat": the audit tool needs a
 REM smaller set, and a shared list would block it over a file it never imports.
-set "CORE_FILES=analytics_writer_gui.py ui_theme.py aoa_config.py vendor_adapter.py hik_config.py camera_engine.py fleet_catalog.py"
+set "CORE_FILES=analytics_writer_gui.py ui_theme.py aoa_config.py vendor_adapter.py hik_config.py pd_config.py camera_engine.py fleet_catalog.py"
 
 REM Two passes (flag, then list) so every missing name can be printed without
 REM delayed expansion -- which would eat a "!" in the folder path, and these
