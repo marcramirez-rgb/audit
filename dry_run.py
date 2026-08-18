@@ -122,10 +122,15 @@ def plan_camera(ip, port, user, password, spec):
     return plan
 
 
-def render(plans, spec):
-    print()
-    print("=" * 78)
-    print("DRY RUN -- no camera was written to")
+def render_lines(plans, spec):
+    """The plan as a list of text lines, plus the blocked-rule count.
+
+    Split from printing so the GUI and the CLI show byte-identical reports --
+    two renderers would drift, and the report is the whole product here."""
+    out = []
+    add = out.append
+    add("=" * 78)
+    add("DRY RUN -- no camera was written to")
     scope = []
     if spec["kind"]:
         scope.append(f"kind={spec['kind']}")
@@ -136,37 +141,49 @@ def render(plans, spec):
     change = []
     if spec["duration"] is not None:
         change.append(f"dwell -> {spec['duration']}s")
-    if spec["rename_from"] is not None:
+    if spec["rename_from"]:
         change.append("rename s/" + spec["rename_from"] + "/" + spec["rename_to"] + "/")
     if spec["classes"]:
         change.append(f"classes -> {tuple(spec['classes'])}")
-    print("  match : " + (", ".join(scope) or "every writable rule"))
-    print("  change: " + (", ".join(change) or "(nothing -- read-only preview)"))
-    print("=" * 78)
+    add("  match : " + (", ".join(scope) or "every writable rule"))
+    add("  change: " + (", ".join(change) or "(nothing -- read-only preview)"))
+    add("=" * 78)
 
     total_changes = total_blocks = 0
     for p in plans:
-        print(f"\n### {p.target}")
+        add("")
+        add(f"### {p.target}")
         if p.error:
-            print(f"    SKIP   unreadable -- {p.error}")
+            add(f"    SKIP   unreadable -- {p.error}")
             continue
+        if not p.rows:
+            add("    (no analytics rules configured)")
         for verdict, name, detail in p.rows:
-            print(f"    {verdict} {name:<16} {detail}")
+            add(f"    {verdict} {name:<16} {detail}")
         total_changes += len(p.changes)
         total_blocks += len(p.blocks)
 
     unreadable = [p.target for p in plans if p.error]
     touched = len([p for p in plans if p.changes])
-    print("\n" + "=" * 78)
-    print(f"  {total_changes} rule(s) would change across {touched} camera(s)")
+    add("")
+    add("=" * 78)
+    add(f"  {total_changes} rule(s) would change across {touched} camera(s)")
     if total_blocks:
-        print(f"  {total_blocks} rule(s) BLOCKED -- fix these before pushing")
+        add(f"  {total_blocks} rule(s) BLOCKED -- fix these before pushing")
     if unreadable:
-        print(f"  {len(unreadable)} camera(s) unreadable and excluded: "
-              + ", ".join(unreadable))
-    print("  nothing was written.")
-    print("=" * 78)
-    return total_blocks
+        add(f"  {len(unreadable)} camera(s) unreadable and excluded: "
+            + ", ".join(unreadable))
+    add("  nothing was written.")
+    add("=" * 78)
+    return out, total_blocks
+
+
+def render(plans, spec):
+    lines, blocked = render_lines(plans, spec)
+    print()
+    for line in lines:
+        print(line)
+    return blocked
 
 
 def credentials(vendor, user, password):
