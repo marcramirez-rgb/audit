@@ -25,7 +25,7 @@ whatever the canvas happens to look like at that moment.
 """
 
 import queue
-import threading
+
 import tkinter as tk
 
 import customtkinter as ctk
@@ -91,13 +91,17 @@ class MultiWriterApp(WriterApp):
 
     # ------------------------------------------------------------------ base hooks
 
-    def _check_target_change(self):
+    def _check_target_change(self, *args):
         """The base class wipes the canvas when the IP/port fields change, which is
         right for a single-camera tool. Here a switch is a deliberate, state-saving
-        operation, so the reset is suppressed for the duration of one."""
+        operation, so the reset is suppressed for the duration of one.
+
+        Keeps the base's *args: this is bound to <KeyRelease> on the IP entry and
+        to two option menus, which hand it an event / the chosen value. Narrowing
+        the signature made every keystroke in the IP box raise TypeError."""
         if self._switching:
             return
-        super()._check_target_change()
+        super()._check_target_change(*args)
 
     # ------------------------------------------------------------------ camera bar
 
@@ -108,8 +112,12 @@ class MultiWriterApp(WriterApp):
         top.pack(fill="x", padx=10, pady=(8, 2))
         ctk.CTkLabel(top, text="Cameras in this session", text_color=LVT_TEXT_DARK,
                      font=ctk.CTkFont(size=13, weight="bold")).pack(side="left")
-        ctk.CTkButton(top, text="Load cameras...", width=130, command=self._open_loader,
-                      fg_color=LVT_TEAL, hover_color=LVT_TEAL_HOVER).pack(side="right")
+        self.load_button = ctk.CTkButton(top, text="Load cameras...", width=130,
+                                         command=self._open_loader, fg_color=LVT_TEAL,
+                                         hover_color=LVT_TEAL_HOVER)
+        self.load_button.pack(side="right")
+        ctk.CTkButton(top, text="Retry failed", width=110, command=self.retry_failed,
+                      fg_color=LVT_TEAL, hover_color=LVT_TEAL_HOVER).pack(side="right", padx=6)
         self.push_all_button = ctk.CTkButton(
             top, text="Push ALL edited cameras", width=200, command=self._push_all,
             fg_color=LVT_DARK_TEAL, hover_color=LVT_DARK_TEAL_HOVER,
@@ -230,7 +238,38 @@ class MultiWriterApp(WriterApp):
                     self.msg_queue.put(("cam_loaded", (t, img, scenarios)))
                 except Exception as e:                            # noqa: BLE001
                     self.msg_queue.put(("cam_error", (t, f"{type(e).__name__}: {e}")))
-        threading.Thread(target=work, daemon=True).start()
+            self.msg_queue.put(("bg_idle", None))
+
+        # Through _run_bg, NOT a raw thread. The base class serialises all camera
+        # work behind one worker, and bypassing it let a manual Fetch Snapshot run
+        # at the same time as a multi-load: two PTZ preset moves against one unit
+        # at once, and the snapshot read timed out.
+        self._set_busy(True)
+        self._run_bg(work)
+
+    def _set_busy(self, busy):
+        """Grey the multi-camera buttons while any camera work is in flight, so a
+        second click cannot queue work the base class will just refuse."""
+        state = "disabled" if busy else "normal"
+        for b in (getattr(self, "push_all_button", None), getattr(self, "load_button", None)):
+            if b is not None:
+                b.configure(state=state)
+
+    def retry_failed(self):
+        """Re-load every camera that errored. A ReadTimeout on a PTZ dome that was
+        still settling is worth one more try, and re-typing the whole list is not."""
+        failed = [t for t, s in self.sessions.items() if s.error]
+        if not failed:
+            self._log("[.] No failed cameras to retry.")
+            return
+        for t in failed:
+            self.sessions[t].error = None
+            self.sessions[t].loaded = False
+        targets = [(self.sessions[t].ip, self.sessions[t].port) for t in failed]
+        for t in failed:
+            del self.sessions[t]
+        self._refresh_tabs()
+        self._load_targets(targets)
 
     # ------------------------------------------------------------------ switching
 
@@ -276,6 +315,16 @@ class MultiWriterApp(WriterApp):
             # and would convert against the previous camera's geometry.
             if s.pil_image is not None:
                 self._display_image(s.pil_image)
+            else:
+                # No snapshot for this camera. The canvas MUST be cleared: leaving
+                # the previous camera's image under this tab's name is how someone
+                # draws a zone on the wrong scene.
+                self.pil_image = self.tk_image = None
+                self.img_w = self.img_h = 0
+                self.canvas.delete("all")
+                self.coord_label.configure(
+                    text=f"{s.target}: no snapshot ({s.error or 'not loaded yet'}). "
+                         f"Use Retry failed, or Fetch Snapshot.")
 
             self.existing_scenarios = s.existing_scenarios
             self.existing_overlays = s.existing_overlays
@@ -355,7 +404,8 @@ class MultiWriterApp(WriterApp):
                 except Exception as e:                            # noqa: BLE001
                     results.append((s.target, False, f"{type(e).__name__}: {e}"))
             self.msg_queue.put(("push_all_done", results))
-        threading.Thread(target=work, daemon=True).start()
+        self._set_busy(True)
+        self._run_bg(work)
 
     # ------------------------------------------------------------------ queue
 
@@ -382,11 +432,13 @@ class MultiWriterApp(WriterApp):
                     self.sessions[target].error = err
                     self._log(f"[!] {target}: {err}")
                     self._refresh_tabs()
+                elif kind == "bg_idle":
+                    self._set_busy(False)
                 elif kind == "log":
                     self._log(msg[1])
                 elif kind == "push_all_done":
-                    self.push_all_button.configure(state="normal",
-                                                   text="Push ALL edited cameras")
+                    self._set_busy(False)
+                    self.push_all_button.configure(text="Push ALL edited cameras")
                     ok = [r for r in msg[1] if r[1]]
                     bad = [r for r in msg[1] if not r[1]]
                     self._log(f"[+] Pushed {len(ok)}/{len(msg[1])} camera(s):")
