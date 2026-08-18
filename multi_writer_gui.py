@@ -25,16 +25,35 @@ whatever the canvas happens to look like at that moment.
 """
 
 import queue
+import threading
+import time
+from concurrent import futures
 
 import tkinter as tk
 
 import customtkinter as ctk
 
 import analytics_writer_gui as awg
+import camera_engine
 import vendor_adapter
 from analytics_writer_gui import (LVT_DARK_TEAL, LVT_DARK_TEAL_HOVER, LVT_LIGHT,
                                   LVT_TEAL, LVT_TEAL_HOVER, LVT_TEXT_DARK,
                                   LVT_TEXT_MUTED, WriterApp)
+
+
+#: Snapshot timeouts for a BATCH read. MEASURED, not guessed: AxisHandler tries
+#: GET then POST for EACH of two auth strategies, so an unreachable snapshot costs
+#: FOUR timeouts, not one. A generous 25s read therefore turned a ~20s failure
+#: into ~124s and one bad camera swallowed the whole batch. Keep this modest --
+#: a camera that needs longer is better served by the Retry button than by making
+#: every failure four times as expensive.
+BATCH_SNAPSHOT_TIMEOUT = (4.0, 10.0)
+
+#: Cameras contacted at once. These are DIFFERENT cameras behind one NAT, so
+#: there is no same-device contention -- the collision that caused trouble before
+#: was a manual fetch racing the batch on ONE camera, which the single-flight
+#: worker still prevents. Kept small so a unit's uplink is not saturated.
+BATCH_CONCURRENCY = 3
 
 
 class CameraSession:
@@ -46,8 +65,9 @@ class CameraSession:
     def __init__(self, ip, port, vendor, sensor=None, channel=None):
         self.ip, self.port, self.vendor = ip, str(port), vendor
         self.sensor, self.channel = sensor, channel
-        self.loaded = False          # snapshot + existing rules fetched
-        self.error = None
+        self.loaded = False          # usable: we have a snapshot, rules or not
+        self.error = None            # nothing at all could be read
+        self.analytics_error = None  # snapshot fine, rules could not be read
         self.pil_image = None
         self.existing_scenarios = []
         self.existing_overlays = []
@@ -77,7 +97,9 @@ class CameraSession:
             return "error"
         if not self.loaded:
             return "loading"
-        return "edited" if self.dirty else "loaded"
+        if self.dirty:
+            return "edited"
+        return "warn" if (self.analytics_error or self.pil_image is None) else "loaded"
 
 
 class MultiWriterApp(WriterApp):
@@ -85,6 +107,10 @@ class MultiWriterApp(WriterApp):
         self.sessions = {}           # target -> CameraSession
         self.active = None           # target currently on the canvas
         self._switching = False      # suppress the base class's camera-change reset
+        # Cooperative cancel. An HTTP request already in flight cannot be killed,
+        # so this is checked between cameras and during the retry wait: the camera
+        # being contacted finishes, then the batch stops.
+        self._cancel = threading.Event()
         super().__init__()
         self.title("Multi-Camera Analytics Writer")
         self._build_camera_bar()
@@ -116,8 +142,19 @@ class MultiWriterApp(WriterApp):
                                          command=self._open_loader, fg_color=LVT_TEAL,
                                          hover_color=LVT_TEAL_HOVER)
         self.load_button.pack(side="right")
-        ctk.CTkButton(top, text="Retry failed", width=110, command=self.retry_failed,
-                      fg_color=LVT_TEAL, hover_color=LVT_TEAL_HOVER).pack(side="right", padx=6)
+        self.retry_button = ctk.CTkButton(top, text="Retry failed", width=110,
+                                          command=self.retry_failed, fg_color=LVT_TEAL,
+                                          hover_color=LVT_TEAL_HOVER)
+        self.retry_button.pack(side="right", padx=6)
+        self.clear_button = ctk.CTkButton(top, text="Clear", width=70,
+                                          command=self.clear_all, fg_color=LVT_TEAL,
+                                          hover_color=LVT_TEAL_HOVER)
+        self.clear_button.pack(side="right", padx=(0, 6))
+        # Stays enabled while work runs -- having no way out was the whole problem.
+        self.cancel_button = ctk.CTkButton(top, text="Cancel", width=80,
+                                           command=self.cancel_batch, fg_color=LVT_TEAL,
+                                           hover_color=LVT_TEAL_HOVER)
+        self.cancel_button.pack(side="right", padx=(0, 6))
         self.push_all_button = ctk.CTkButton(
             top, text="Push ALL edited cameras", width=200, command=self._push_all,
             fg_color=LVT_DARK_TEAL, hover_color=LVT_DARK_TEAL_HOVER,
@@ -140,7 +177,8 @@ class MultiWriterApp(WriterApp):
                 text_color=LVT_TEXT_MUTED, font=ctk.CTkFont(size=11))
             self.tab_hint.pack(anchor="w")
             return
-        marks = {"loading": "...", "error": "!", "edited": "*", "loaded": ""}
+        marks = {"loading": "...", "error": "!", "edited": "*",
+                 "warn": "~", "loaded": ""}
         for target, s in self.sessions.items():
             mark = marks[s.status()]
             label = f"{target}{('  ' + mark) if mark else ''}"
@@ -154,7 +192,7 @@ class MultiWriterApp(WriterApp):
             ).pack(side="left", padx=(0, 6))
         edited = [t for t, s in self.sessions.items() if s.dirty]
         ctk.CTkLabel(self.tabs,
-                     text=f"   * = edited ({len(edited)} ready to push)",
+                     text=f"   * edited ({len(edited)} ready to push)   ~ partial   ! failed",
                      text_color=LVT_TEXT_MUTED, font=ctk.CTkFont(size=11)).pack(side="left")
 
     # ------------------------------------------------------------------ loader
@@ -225,35 +263,131 @@ class MultiWriterApp(WriterApp):
         self._log(f"[*] Loading {len(new)} camera(s): {', '.join(new)}")
 
         def work():
-            # Sequential: these cameras lock an account after a few bad auths, and a
-            # parallel burst across a fleet is how one wrong password locks it out.
-            for t in new:
+            # Concurrent across cameras, because they are separate devices and a
+            # single slow or unreachable one used to stall every camera behind it.
+            # Still inside ONE _run_bg worker, so a manual Fetch Snapshot cannot
+            # race the batch on the same camera.
+            def load_one(t):
+                if self._cancel.is_set():
+                    return
                 s = self.sessions[t]
+                channel = s.sensor if s.vendor.lower().startswith("axis") else s.channel
                 try:
                     adapter = vendor_adapter.make_adapter(
-                        s.vendor, s.ip, s.port, user, password,
-                        channel=s.sensor if s.vendor.lower().startswith("axis") else s.channel)
-                    img = adapter.fetch_snapshot(log=lambda m: self.msg_queue.put(("log", m)))
-                    scenarios = adapter.read_scenarios()
-                    self.msg_queue.put(("cam_loaded", (t, img, scenarios)))
+                        s.vendor, s.ip, s.port, user, password, channel=channel)
                 except Exception as e:                            # noqa: BLE001
                     self.msg_queue.put(("cam_error", (t, f"{type(e).__name__}: {e}")))
+                    return
+
+                # Snapshot and analytics are fetched INDEPENDENTLY: a camera with
+                # no analytics app still has a picture worth drawing on, and one
+                # whose snapshot fails may still have rules worth showing.
+                img, scenarios, notes = None, [], []
+                try:
+                    # attempts=1 on the first pass. Retrying here multiplies an
+                    # already four-timeout failure; "Retry failed" exists for that.
+                    img = self._fetch_snapshot_with_retry(adapter, t, attempts=1)
+                except Exception as e:                            # noqa: BLE001
+                    notes.append(f"snapshot failed: {type(e).__name__}: {e}")
+                try:
+                    scenarios = adapter.read_scenarios()
+                except Exception as e:                            # noqa: BLE001
+                    notes.append(f"analytics unreadable: {type(e).__name__}: {e}")
+
+                if img is None and not scenarios:
+                    self.msg_queue.put(("cam_error", (t, "; ".join(notes) or "nothing readable")))
+                else:
+                    self.msg_queue.put(("cam_loaded", (t, img, scenarios, notes)))
+
+            with futures.ThreadPoolExecutor(max_workers=BATCH_CONCURRENCY) as pool:
+                list(pool.map(load_one, new))
             self.msg_queue.put(("bg_idle", None))
 
         # Through _run_bg, NOT a raw thread. The base class serialises all camera
         # work behind one worker, and bypassing it let a manual Fetch Snapshot run
         # at the same time as a multi-load: two PTZ preset moves against one unit
         # at once, and the snapshot read timed out.
+        self._cancel.clear()
         self._set_busy(True)
-        self._run_bg(work)
+        self._run_bg(self._with_batch_timeout(work))
+
+    @staticmethod
+    def _with_batch_timeout(fn):
+        """Run fn with the snapshot timeout widened, then restore it.
+
+        camera_engine.STRICT_TIMEOUT is read at call time inside fetch_snapshot,
+        so raising it here reaches the snapshot without touching the audit tool's
+        own reads. Safe because every camera operation is serialised behind one
+        worker -- nothing else is mid-request while this is swapped."""
+        def wrapped():
+            original = camera_engine.STRICT_TIMEOUT
+            camera_engine.STRICT_TIMEOUT = BATCH_SNAPSHOT_TIMEOUT
+            try:
+                fn()
+            finally:
+                camera_engine.STRICT_TIMEOUT = original
+        return wrapped
+
+    def cancel_batch(self):
+        """Stop after the camera currently being contacted."""
+        if not (self.worker and self.worker.is_alive()):
+            self._log("[.] Nothing running to cancel.")
+            return
+        self._cancel.set()
+        self._log("[*] Cancelling -- finishing the camera in flight, then stopping. "
+                  "A request already sent cannot be interrupted.")
+
+    def clear_all(self):
+        """Empty the session and blank the canvas, so a bad batch can be abandoned
+        without restarting the whole app."""
+        if self.worker and self.worker.is_alive():
+            self._log("[!] Still working -- press Cancel first, then Clear.")
+            return
+        self.sessions.clear()
+        self.active = None
+        self.points, self.exclude_zones, self.current_exclude = [], [], []
+        self.perspective_bars, self.current_bar = [], []
+        self.existing_scenarios, self.existing_overlays = [], []
+        self.edit_label_map = {}
+        self.edit_menu.configure(values=[awg.NEW_SCENARIO])
+        self.edit_var.set(awg.NEW_SCENARIO)
+        self.name_var.set("")
+        self.pil_image = self.tk_image = None
+        self.img_w = self.img_h = 0
+        self.canvas.delete("all")
+        self.coord_label.configure(text="Cleared. Load cameras to start again.")
+        self._refresh_tabs()
+        self._log("[*] Session cleared.")
+
+    def _fetch_snapshot_with_retry(self, adapter, target, attempts=2):
+        """One retry on a timeout. A PTZ dome is sent to its analytics preset
+        before the capture, and a lens still settling can blow the read timeout
+        without anything actually being wrong."""
+        last = None
+        for attempt in range(attempts):
+            try:
+                return adapter.fetch_snapshot(log=lambda m: self.msg_queue.put(("log", m)))
+            except Exception as e:                                # noqa: BLE001
+                last = e
+                if "timeout" not in f"{type(e).__name__}{e}".lower() or attempt == attempts - 1:
+                    raise
+                self.msg_queue.put(("log", f"[.] {target}: snapshot timed out, retrying once "
+                                           f"(the lens may still be settling)."))
+                if self._cancel.wait(2.0):
+                    raise
+        raise last
 
     def _set_busy(self, busy):
         """Grey the multi-camera buttons while any camera work is in flight, so a
         second click cannot queue work the base class will just refuse."""
         state = "disabled" if busy else "normal"
-        for b in (getattr(self, "push_all_button", None), getattr(self, "load_button", None)):
+        for name in ("push_all_button", "load_button", "retry_button", "clear_button"):
+            b = getattr(self, name, None)
             if b is not None:
                 b.configure(state=state)
+        # Cancel is the one control that must stay live while work is running.
+        if getattr(self, "cancel_button", None) is not None:
+            self.cancel_button.configure(state="normal")
 
     def retry_failed(self):
         """Re-load every camera that errored. A ReadTimeout on a PTZ dome that was
@@ -387,6 +521,9 @@ class MultiWriterApp(WriterApp):
         def work():
             results = []
             for s in pending:
+                if self._cancel.is_set():
+                    results.append((s.target, False, "cancelled before this camera"))
+                    continue
                 try:
                     adapter = vendor_adapter.make_adapter(
                         s.vendor, s.ip, s.port, user, password,
@@ -404,8 +541,9 @@ class MultiWriterApp(WriterApp):
                 except Exception as e:                            # noqa: BLE001
                     results.append((s.target, False, f"{type(e).__name__}: {e}"))
             self.msg_queue.put(("push_all_done", results))
+        self._cancel.clear()
         self._set_busy(True)
-        self._run_bg(work)
+        self._run_bg(self._with_batch_timeout(work))
 
     # ------------------------------------------------------------------ queue
 
@@ -415,15 +553,22 @@ class MultiWriterApp(WriterApp):
                 msg = self.msg_queue.get_nowait()
                 kind = msg[0]
                 if kind == "cam_loaded":
-                    target, img, scenarios = msg[1]
+                    target, img, scenarios, notes = msg[1]
                     s = self.sessions[target]
                     s.pil_image, s.existing_scenarios, s.loaded = img, scenarios, True
+                    s.analytics_error = next((n for n in notes if n.startswith("analytics")), None)
+                    for n in notes:
+                        self._log(f"[!] {target}: {n}")
                     s.existing_overlays = [
                         {"name": x.name, "kind": "fence" if x.kind == "line" else "area",
                          "verts": x.points,
                          "direction": x.direction if x.kind == "line" else None}
                         for x in scenarios]
-                    self._log(f"[+] {target}: snapshot + {len(scenarios)} rule(s).")
+                    self._log(f"[+] {target}: "
+                              + ("snapshot " if img is not None else "NO snapshot ")
+                              + f"+ {len(scenarios)} rule(s)."
+                              + ("  Draw and push still work." if img is not None
+                                 and s.analytics_error else ""))
                     if self.active is None:
                         self.switch_to(target)
                     self._refresh_tabs()
@@ -434,6 +579,9 @@ class MultiWriterApp(WriterApp):
                     self._refresh_tabs()
                 elif kind == "bg_idle":
                     self._set_busy(False)
+                    if self._cancel.is_set():
+                        self._log("[*] Batch cancelled. Clear, or Load cameras again.")
+                        self._cancel.clear()
                 elif kind == "log":
                     self._log(msg[1])
                 elif kind == "push_all_done":

@@ -184,6 +184,83 @@ def test_retry_failed_requeues_only_the_broken_cameras(app):
     return "retry re-queues only the failed camera, keeps the loaded one"
 
 
+def test_clear_all_empties_the_session_and_canvas(app):
+    """An escape hatch. Without it a bad batch could only be abandoned by closing
+    the app, which is what an operator hit in the field."""
+    _reset(app)
+    _session(app, "8.8.8.8:5015", "8.8.8.8", "5015", "#bbb")
+    app.switch_to("8.8.8.8:5015")
+    app.name_var.set("GONE")
+    app.points = [app._frac_to_canvas(*p) for p in [(0.2, 0.2), (0.7, 0.2), (0.7, 0.7)]]
+    app.clear_all()
+    assert app.sessions == {} and app.active is None, (app.sessions, app.active)
+    assert app.points == [] and app.tk_image is None
+    assert app.name_var.get() == ""
+    return "clear empties sessions, drawing and canvas"
+
+
+def test_clear_refuses_while_work_is_running(app):
+    """Clearing mid-batch would leave the worker writing into sessions that no
+    longer exist; it says press Cancel first instead."""
+    _reset(app)
+    _session(app, "9.9.9.9:5015", "9.9.9.9", "5015", "#ccc")
+
+    class _Busy:
+        @staticmethod
+        def is_alive():
+            return True
+
+    real, app.worker = app.worker, _Busy()
+    try:
+        app.clear_all()
+    finally:
+        app.worker = real
+    assert "9.9.9.9:5015" in app.sessions, "cleared while busy"
+    return "clear refused while a batch is in flight"
+
+
+def test_cancel_sets_the_flag_only_when_work_is_running(app):
+    _reset(app)
+    app._cancel.clear()
+    app.cancel_batch()                     # nothing running
+    assert not app._cancel.is_set(), "cancelled with no work in flight"
+
+    class _Busy:
+        @staticmethod
+        def is_alive():
+            return True
+
+    real, app.worker = app.worker, _Busy()
+    try:
+        app.cancel_batch()
+        assert app._cancel.is_set(), "cancel did not set the flag"
+    finally:
+        app.worker = real
+        app._cancel.clear()
+    return "cancel is a no-op when idle, sets the flag when busy"
+
+
+def test_batch_timeout_is_widened_then_restored(app):
+    """Snapshots in a batch get a longer timeout than the interactive default,
+    and the original MUST come back even if the work raises."""
+    import camera_engine
+    original = camera_engine.STRICT_TIMEOUT
+    seen = {}
+
+    def boom():
+        seen["during"] = camera_engine.STRICT_TIMEOUT
+        raise RuntimeError("work failed")
+
+    try:
+        mw.MultiWriterApp._with_batch_timeout(boom)()
+    except RuntimeError:
+        pass
+    assert seen["during"] == mw.BATCH_SNAPSHOT_TIMEOUT, seen
+    assert camera_engine.STRICT_TIMEOUT == original, "timeout not restored"
+    assert mw.BATCH_SNAPSHOT_TIMEOUT[1] > original[1], "batch read timeout must be longer"
+    return f"{original} -> {mw.BATCH_SNAPSHOT_TIMEOUT} during batch, restored after"
+
+
 def test_session_geometry_is_fractions_not_pixels(app):
     """Sessions must survive a resize, so nothing may be stored in canvas pixels."""
     _reset(app)

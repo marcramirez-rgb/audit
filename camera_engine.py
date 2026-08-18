@@ -29,6 +29,11 @@ from openpyxl.drawing.spreadsheet_drawing import TwoCellAnchor, AnchorMarker
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 STRICT_TIMEOUT = (3.05, 5.0)
+
+#: Snapshot sizes to try, largest first. A camera on a constrained uplink drops
+#: the connection part way through a big JPEG, so falling back to a smaller frame
+#: is the difference between a usable picture and none at all.
+SNAPSHOT_RESOLUTIONS = ("1280x720", "640x360", "320x180")
 MAX_WORKER_THREADS = 15
 
 THUMB_H = 450
@@ -614,7 +619,41 @@ class AxisHandler(CameraHandler):
         # 2x2 overview of all four, camera=6+ returns HTTP 400. Omitted entirely (None)
         # for single-sensor cameras to keep the exact URL these always used.
         suffix = f"&camera={channel_idx}" if channel_idx is not None else ""
-        img_url = f"http://{self.ip}:{port}/axis-cgi/jpg/image.cgi?resolution=1280x720{suffix}"
+        last_err = "All authentication attempts failed"
+        saw_401 = False
+        saw_other = False
+        img_url = None
+
+        # RESOLUTION LADDER. Many LVT units are on cellular uplinks that cannot
+        # carry a 720p JPEG: measured on 10.23.52.131, 1280x720 died with a
+        # ChunkedEncodingError after 40s while 640x360 returned 38KB in 8.5s.
+        # Analytics JSON is small and sails through, which is why such a camera
+        # reports its rules but never its picture. Step down rather than lose the
+        # snapshot entirely -- zones are stored as fractions of the frame, so a
+        # smaller capture still draws and pushes correctly, just less sharply.
+        for resolution in SNAPSHOT_RESOLUTIONS:
+            img_url = (f"http://{self.ip}:{port}/axis-cgi/jpg/image.cgi"
+                       f"?resolution={resolution}{suffix}")
+            result = self._try_snapshot_url(session, img_url)
+            if result[0] is not None:
+                return result
+            _img, _url, err, was_401, other = result
+            saw_401 = saw_401 or was_401
+            saw_other = saw_other or other
+            last_err = err
+            if was_401 and not other:
+                # Credentials are wrong; a smaller image will not fix that.
+                break
+
+        auth_rejected = saw_401 and not saw_other
+        return None, img_url, last_err, auth_rejected
+
+    def _try_snapshot_url(self, session, img_url):
+        """One resolution, both auth strategies, GET then POST.
+
+        Returns (image, url, None, False) on success, else
+        (None, url, last_err, saw_401, saw_other). Note the failure tuple is
+        longer -- callers unpack it only on the failure path."""
         last_err = "All authentication attempts failed"
         saw_401 = False
         saw_other = False
@@ -647,8 +686,15 @@ class AxisHandler(CameraHandler):
                 saw_other = True
                 last_err = f"POST Error: {type(e).__name__}"
 
-        auth_rejected = saw_401 and not saw_other
-        return None, img_url, last_err, auth_rejected
+            # A TRANSFER failure means the request was accepted and the body broke
+            # or stalled -- the credentials are fine, the image is simply too big
+            # for this link. Trying the other auth strategy just pays the same
+            # timeout again (measured: 187s to reach a working size instead of
+            # ~22s). Bail out so the caller steps down a resolution immediately.
+            if any(k in last_err for k in ("ChunkedEncoding", "Timeout", "ContentDecoding")):
+                return None, img_url, last_err, saw_401, saw_other
+
+        return None, img_url, last_err, saw_401, saw_other
 
     def _detect_active_analytics_app(self, session, port):
         """Called only when the generic Object Analytics endpoint 404s. Checks the
