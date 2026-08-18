@@ -1295,17 +1295,10 @@ class WriterApp(ctk.CTk):
             self._log("[!] Read Current Config first so the snapshot is loaded.")
             return
         if sc.read_only:
-            # A Perimeter Defender zone can never be modified -- its geometry lives in
-            # an encrypted file only Axis's Setup tool can write. But refusing outright
-            # left the operator at a dead end, so instead COPY its shape into the
-            # editor as the starting point for a brand-new writable rule. The PD
-            # original is untouched and keeps running; this adds a rule beside it.
-            if not self._caps().kinds:
-                self.edit_var.set(NEW_SCENARIO)
-                self._log(f"[!] '{sc.name}' can be viewed but not edited -- "
-                          f"{self._caps().read_only_reason}")
-                return
-            self._load_readonly_as_copy(sc)
+            # Loading it into the editor would promise a Push this camera can't do.
+            self.edit_var.set(NEW_SCENARIO)
+            self._log(f"[!] '{sc.name}' can be viewed but not edited -- "
+                      f"{self._caps().read_only_reason}")
             return
 
         self.editing = sc.native_id
@@ -1367,10 +1360,6 @@ class WriterApp(ctk.CTk):
         if isinstance(s.native_id, tuple) and len(s.native_id) == 3:
             ch, sid, rid = s.native_id
             loc_txt = f" @ch{ch}/s{sid}/r{rid}"
-        elif isinstance(s.native_id, vendor_adapter.GuardRuleId):
-            # Which Guard app holds it -- on one camera an area and a line live in
-            # different applications.
-            loc_txt = f" @{s.native_id.app}/p{s.native_id.uid}"
 
         size_txt = " size[min/max]" if (s.min_size or s.max_size) else ""
         dir_txt = f" dir={s.direction}" if s.kind == "line" and s.direction else ""
@@ -1378,59 +1367,11 @@ class WriterApp(ctk.CTk):
         # zone-crossing / conditional), richer than the three kinds this tool draws.
         detail_txt = f" [{s.detail}]" if s.detail else ""
         ro_txt = " (read-only)" if s.read_only else ""
-        # A factory profile is not a configured zone. Saying so stops the near
-        # full-frame default being read as "someone chose to watch everything".
-        if s.is_default:
-            ro_txt += "  <-- APP DEFAULT, covers the whole frame (not configured)"
         return (f"    '{s.name}'{loc_txt} {s.kind}{detail_txt}{dir_txt} classes={s.classes}"
                 + (f" dur={s.duration}" if s.duration else "")
                 + (f" excl={len(s.exclusions)}" if s.exclusions else "")
                 + size_txt + ro_txt)
 
-    def _load_readonly_as_copy(self, sc):
-        """Seed the editor from a read-only rule so it can be re-created as a
-        writable one on the same camera.
-
-        This is the whole fixed-thermal workflow. The zone a thermal alarms on today
-        belongs to Perimeter Defender and is permanently uneditable, so the useful
-        move is not to block the operator but to hand them its exact shape to adjust
-        and push into a Guard app. Deliberately clears native_id: the result is a NEW
-        rule in a different application, NOT an edit of the PD zone, and the log says
-        so -- a copy that silently read like an in-place edit is exactly how someone
-        ends up believing they moved a zone they did not move."""
-        self.editing = None                       # new rule, not an edit
-        base = re.sub(r"[^A-Za-z0-9_-]+", "-", sc.name.split("/")[-1].strip())[:12].strip("-")
-        self.name_var.set(f"{base or 'zone'}-2" if base else "zone-2")
-
-        label = KIND_TO_LABEL.get(sc.kind, "Intrusion")
-        if label in (self.rule_menu.cget("values") or []):
-            self.rule_var.set(label)
-        if self._wants_duration(self.rule_var.get()):
-            self.loiter_frame.pack(fill="x", padx=12, pady=4)
-            self.loiter_entry.delete(0, "end")
-            self.loiter_entry.insert(0, str(sc.duration or ""))
-        else:
-            self.loiter_frame.pack_forget()
-        if self.rule_var.get() == KIND_TO_LABEL.get("line"):
-            self.fence_frame.pack(fill="x", padx=12, pady=4)
-        else:
-            self.fence_frame.pack_forget()
-        self._refresh_direction_hint()
-
-        self.points = [self._frac_to_canvas(fx, fy) for (fx, fy) in sc.points]
-        self.exclude_zones, self.current_exclude = [], []
-        self.edit_size, self.perspective_bars, self.current_bar = [], [], []
-        self.size_mode = self.size_first = None
-        self.bar_mode = False
-        self.mode_var.set("Include")
-        self._redraw()
-
-        app = {"intrusion": "Motion Guard", "line": "Fence Guard",
-               "loiter": "Loitering Guard"}.get(sc.kind, "a Guard app")
-        self._log(f"[.] Copied '{sc.name}' ({len(sc.points)} points) into the editor as a "
-                  f"NEW rule named '{self.name_var.get()}'.")
-        self._log(f"[.] Perimeter Defender's zone cannot be changed, so Push creates a "
-                  f"separate rule in AXIS {app}. PD keeps running its own zone unchanged.")
 
     def _make_adapter(self):
         # Safety net for any path that changes the target without firing a widget
@@ -2313,8 +2254,6 @@ class WriterApp(ctk.CTk):
         sensor_txt = ""
         if adapter.vendor == "Axis" and getattr(adapter, "device_id", None):
             sensor_txt = f", sensor {adapter.device_id}"
-        elif isinstance(self.editing, vendor_adapter.GuardRuleId):
-            sensor_txt = f", {self.editing.app} profile {self.editing.uid}"
         elif isinstance(self.editing, tuple) and len(self.editing) == 3:
             # Hik edit: say exactly which rule gets patched -- with six same-named
             # rules on a camera, "RULE1" alone doesn't identify the write target.
@@ -2334,53 +2273,13 @@ class WriterApp(ctk.CTk):
                            f"'{sc.name}-LR' and '{sc.name}-RL' ({adapter.vendor} has no "
                            f"both-ways fence). They stay a single rule in this tool.")
         verb = "Update existing scenario" if self.editing is not None else "Push new scenario"
-        # On a fixed thermal the rule goes to a Guard application, NOT to Perimeter
-        # Defender -- and PD's own zone keeps running untouched. Saying so here is
-        # what stops "I edited the zone" from meaning two different things.
-        thermal_txt = ""
-        if hasattr(adapter, "guard"):
-            app_name = {"intrusion": "AXIS Motion Guard", "line": "AXIS Fence Guard",
-                        "loiter": "AXIS Loitering Guard"}.get(sc.kind, "a Guard app")
-            thermal_txt = (
-                f"\n\nThis writes to {app_name} (started if needed). "
-                f"Perimeter Defender's own zone is NOT modified and keeps running -- "
-                f"this rule is additional to it."
-                f"\n\nHEADS UP: a Guard rule fires an ONVIF EVENT. The unit ingests "
-                f"object-tracking metadata and Perimeter Defender's alarm socket, "
-                f"neither of which carries Guard events -- so this rule will most "
-                f"likely NOT raise an alert in the command center. Confirm with the "
-                f"edge team before relying on it.")
         if not messagebox.askyesno(
             "Confirm live write",
-            f"{verb} '{sc.name}' ({sc.kind}) on {adapter.vendor}\n{ip}:{port}{sensor_txt}?{dir_txt}{excl_txt}"
-            f"{thermal_txt}\n\n"
+            f"{verb} '{sc.name}' ({sc.kind}) on {adapter.vendor}\n{ip}:{port}{sensor_txt}?{dir_txt}{excl_txt}\n\n"
             f"The current config is backed up first, and other scenarios are preserved. "
             f"This changes live camera analytics."):
             self._log("[.] Push cancelled.")
             return
-
-        # A Guard app ships with a near full-frame factory profile. Leaving it in
-        # place means the app keeps detecting everywhere, so the zone being pushed
-        # here would change nothing. Ask once, at the only moment it matters.
-        drop_defaults = []
-        if hasattr(adapter, "factory_defaults"):
-            try:
-                drop_defaults = adapter.factory_defaults(sc.kind)
-            except Exception:                                     # noqa: BLE001
-                drop_defaults = []
-        if drop_defaults:
-            names = ", ".join(f"{d.app} profile {d.uid}" for d in drop_defaults)
-            if messagebox.askyesno(
-                "Remove the app's default profile?",
-                f"{names} is still the factory default -- a rectangle covering "
-                f"almost the whole frame.\n\nLeaving it means the app detects "
-                f"everywhere and '{sc.name}' will not narrow anything down.\n\n"
-                f"Remove the default profile as part of this push?"):
-                self._log(f"[.] Will also remove the factory default profile(s): {names}")
-            else:
-                drop_defaults = []
-                self._log("[.] Keeping the app's default profile -- it stays active "
-                          "alongside the new rule, so detection remains full-frame.")
 
         self.push_button.configure(state="disabled", text="Pushing...")
         self._log(f"[*] Backing up + pushing '{sc.name}' to {adapter.vendor} {ip}:{port} ...")
@@ -2389,11 +2288,6 @@ class WriterApp(ctk.CTk):
         def work():
             try:
                 backup_path, _verify = adapter.apply_scenario(sc, backup_dir)
-                # Remove the factory default AFTER the new rule lands, never before:
-                # if the push fails, the camera is left exactly as it was rather than
-                # stripped of its only profile.
-                for dflt in drop_defaults:
-                    adapter.delete_scenario(dflt, backup_dir)
                 names = [s.name for s in adapter.read_scenarios()]
                 self.msg_queue.put(("push_done", Path(backup_path).name, names))
             except Exception as e:
@@ -2489,13 +2383,13 @@ class WriterApp(ctk.CTk):
                     if overlays:
                         # On a fixed thermal the existing zones belong to Perimeter
                         # Defender and can never be edited, so "pick one to modify it"
-                        # would be a lie. Say what picking one actually does there.
+                        # would be a lie on a thermal. Say what is actually possible.
                         locked = [s for s in scenarios if s.read_only]
-                        if locked and self._caps().kinds:
+                        if locked:
                             self._log(f"[+] Overlaid {len(overlays)} existing zone(s) in gold. "
                                       f"{len(locked)} belong to Perimeter Defender and cannot be "
-                                      f"changed -- picking one copies its shape into the editor "
-                                      f"as a NEW rule you can adjust and push to a Guard app.")
+                                      f"changed from here -- use AXIS Perimeter Defender Setup "
+                                      f"to edit a fixed thermal's zone.")
                         else:
                             self._log(f"[+] Overlaid {len(overlays)} existing zone(s) in gold. "
                                       f"Pick one from 'Edit existing' to modify it, or draw a new one.")

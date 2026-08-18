@@ -46,8 +46,6 @@ hik_push_debug/
 # per-camera fleet data, and each file is ~175KB of binary. Never commit.
 pd_backups/
 
-# Guard app (Motion/Fence/Loitering) profile backups written before each push.
-guard_backups/
 
 # PTZ drift audit reports (ptz_tester.py output -- real fleet IPs + scene imagery)
 PTZ_*.xlsx

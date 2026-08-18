@@ -20,7 +20,6 @@ import requests
 
 import aoa_config
 import camera_engine
-import guard_config
 import hik_config
 import pd_config
 
@@ -35,20 +34,6 @@ class AxisLinePair:
     to that test."""
     lr_id: int
     rl_id: int
-
-
-@dataclass(frozen=True)
-class GuardRuleId:
-    """native_id for a rule in an Axis Guard app: which application holds it, and
-    its uid within that app's config.
-
-    Same reasoning as AxisLinePair above -- this must NOT be a tuple. The GUI
-    treats a tuple native_id as a Hikvision (channel, sid, ruleId) address and
-    unpacks it into three names, so handing it a 2-tuple raised "not enough
-    values to unpack (expected 3, got 2)" on every thermal that had a Guard app
-    running. A distinct type cannot be mistaken for a Hik address."""
-    app: str
-    uid: int
 
 
 @dataclass
@@ -70,11 +55,6 @@ class Scenario:
     # the editor would imply a Push that cannot work.
     read_only: bool = False
     detail: str = ""                # vendor-specific type text, for display only
-    # True when this rule is the analytics app's UNTOUCHED factory profile rather
-    # than something a person configured. Axis Guard apps each ship one, covering
-    # ~97% of the frame -- see guard_config.is_factory_default for why that has to
-    # be visible instead of quietly drawn as if it were a real zone.
-    is_default: bool = False
 
 
 @dataclass
@@ -478,235 +458,6 @@ class PDWriteUnsupported(RuntimeError):
     Perimeter Defender camera. Carries the operator-facing explanation."""
 
 
-class GuardAdapter:
-    """Axis fixed thermals via the preinstalled Guard apps -- the WRITABLE path.
-
-    Perimeter Defender can be read but never written (pd_config explains why). The
-    same cameras ship with Motion / Fence / Loitering Guard, which do expose a real
-    configuration API, so this adapter is how a thermal's analytics actually get
-    changed from this tool.
-
-    One difference from every other adapter here: a rule's KIND selects which
-    application it lives in, so this class fans out over three separate configs
-    rather than one. It also has to care whether each app is running -- a profile
-    inside a stopped app is inert."""
-
-    vendor = "Axis (Guard apps)"
-    capabilities = Capabilities(
-        kinds=("intrusion", "line", "loiter"),
-        # These apps predate AOA's classifier: they detect motion and filter on
-        # size/duration, with no human-vs-vehicle concept. Advertising an empty
-        # class list is what stops the GUI offering a choice that does nothing.
-        classes=(), multi_class=False,
-        exclusions=True, direction=True, can_delete=True,
-        # Fence Guard takes alarmDirection 'both' in ONE profile, so unlike AOA
-        # there is no -LR/-RL pair to synthesize.
-        native_bidirectional=True,
-        notes="Motion/Fence/Loitering Guard: add, edit and delete all supported. "
-              "No object classification -- size and duration filters only. Each "
-              "rule type is a separate application and must be Running to fire.")
-
-    def __init__(self, ip, port, user, password, channel=None, **_):
-        self.ip, self.port = ip, str(port)
-        self.user, self.password = user, password
-        self.device_id = int(channel) if channel else None
-        self._clients = {}
-
-    def _client(self, app):
-        if app not in self._clients:
-            self._clients[app] = guard_config.GuardClient(
-                self.ip, self.user, self.password, self.port, app)
-        return self._clients[app]
-
-    def _client_for_kind(self, kind):
-        app = guard_config.KIND_TO_APP.get(kind)
-        if app is None:
-            raise ValueError(f"no Guard application implements {kind!r} rules")
-        return self._client(app)
-
-    def fetch_snapshot(self, log=None):
-        """Plain VAPIX snapshot -- these are FIXED units, so there is no preset to
-        park at and nothing can drift between reading rules and taking the frame."""
-        log = log or (lambda _m: None)
-        return self._client("motionguard").fetch_snapshot(channel_idx=self.device_id)
-
-    def app_states(self):
-        """{app: 'Running'|'Stopped'|None} for all three, so callers can say which
-        rule types are live rather than guessing."""
-        return {app: self._client(app).app_status() for app in guard_config.APP_TRIGGER}
-
-    def read_scenarios(self, log=None):
-        """Every profile across all three apps.
-
-        Deliberately does NOT start anything: reading must never change the
-        camera. A stopped app is reported and skipped -- its profiles are
-        unreadable AND inert, so there is nothing to show for it."""
-        log = log or (lambda _m: None)
-        out = []
-        for app in ("motionguard", "fenceguard", "loiteringguard"):
-            client = self._client(app)
-            try:
-                cfg = client.get_config()
-            except guard_config.GuardAppStopped:
-                log(f"[.] AXIS {app} is not running -- no {guard_config.APP_TO_KIND[app]} "
-                    f"rules are active on this camera.")
-                continue
-            except guard_config.GuardError as e:
-                log(f"[!] {app}: {e}")
-                continue
-            # Capabilities carry each trigger's defaultInstance, which is the only
-            # reliable way to tell a factory profile from a drawn one.
-            try:
-                caps = client.get_capabilities()
-            except guard_config.GuardError:
-                caps = None
-            for p in guard_config.parse_profiles(cfg, app, capabilities=caps):
-                if p["is_default"]:
-                    log(f"[!] AXIS {app} still holds its FACTORY DEFAULT profile "
-                        f"'{p['name']}', which covers almost the whole frame. While "
-                        f"that app runs it detects everywhere, so any zone drawn in "
-                        f"it has no effect until this profile is removed.")
-                out.append(Scenario(
-                    name=p["name"], kind=p["kind"], points=p["points"],
-                    classes=(), duration=p["duration"], direction=p["direction"],
-                    exclusions=p["exclusions"], native_id=GuardRuleId(app, p["uid"]),
-                    detail=f"AXIS {app}", is_default=p["is_default"]))
-        return out
-
-    def apply_scenario(self, sc, backup_dir):
-        """Create or edit one profile in whichever app owns its kind.
-
-        Starts that application if it is stopped -- a profile in a stopped app
-        never fires, so pushing one without starting it would look like success
-        and detect nothing. Confirmed live that starting a Guard app leaves
-        Perimeter Defender running, so this does not take existing analytics down."""
-        _require(self.capabilities, sc)
-        client = self._client_for_kind(sc.kind)
-        app = client.app
-
-        pts = guard_config.frac_to_guard(sc.points)
-        excl = [guard_config.frac_to_guard(z) for z in sc.exclusions] or None
-        if excl and app not in guard_config.APPS_WITH_EXCLUSIONS:
-            raise ValueError(f"AXIS {app} (line crossing) does not support exclusion zones")
-
-        # Editing keeps the profile's uid so its other settings stay put; a rule
-        # whose kind changed moves to a different app and becomes a new profile.
-        uid = None
-        if isinstance(sc.native_id, GuardRuleId) and sc.native_id.app == app:
-            uid = sc.native_id.uid
-
-        if sc.kind == "line":
-            profile = guard_config.build_fence_profile(
-                sc.name, pts, uid=uid, alarm_direction=sc.direction or "leftToRight")
-        elif sc.kind == "loiter":
-            profile = guard_config.build_loiter_profile(
-                sc.name, pts, sc.duration or 1, uid=uid, exclusions=excl)
-        else:
-            profile = guard_config.build_area_profile(
-                sc.name, pts, uid=uid, exclusions=excl)
-
-        backup_path, verify, started = client.apply_profile(profile, backup_dir)
-        self._last_started = started
-        return backup_path, verify
-
-    def factory_defaults(self, kind=None):
-        """GuardRuleIds of untouched factory profiles, optionally only in the app
-        that owns `kind`. Reading needs the app running, so a stopped app reports
-        nothing -- which is correct: a stopped app detects nothing either."""
-        apps = [guard_config.KIND_TO_APP[kind]] if kind else list(guard_config.APP_TRIGGER)
-        found = []
-        for app in apps:
-            client = self._client(app)
-            try:
-                cfg = client.get_config()
-                caps = client.get_capabilities()
-            except guard_config.GuardError:
-                continue
-            for p in guard_config.parse_profiles(cfg, app, capabilities=caps):
-                if p["is_default"]:
-                    found.append(GuardRuleId(app, p["uid"]))
-        return found
-
-    def delete_scenario(self, native_id, backup_dir):
-        """Remove one profile. native_id is the GuardRuleId read_scenarios gave."""
-        if not isinstance(native_id, GuardRuleId):
-            raise ValueError(f"expected a GuardRuleId, got {native_id!r}")
-        app, uid = native_id.app, native_id.uid
-        client = self._client(app)
-        backup_path, current = client.backup_config(backup_dir)
-        client.set_config(guard_config.remove_profile(current, uid))
-        return backup_path, client.get_config()
-
-
-class AxisThermalAdapter:
-    """An Axis fixed thermal, as it actually is: TWO analytics engines at once.
-
-    Perimeter Defender holds the zones the camera is really alarming on today and
-    cannot be written. The preinstalled Guard apps can be written but start out
-    stopped. Showing only one of them would mislead an operator either way -- hide
-    PD and the camera looks unconfigured; hide Guard and the camera looks
-    unwritable. So this reads both and writes through Guard.
-
-    PD rules come back flagged read_only so the GUI won't offer them for editing;
-    Guard profiles come back editable."""
-
-    vendor = "Axis thermal"
-
-    _guard = GuardAdapter.capabilities
-    capabilities = Capabilities(
-        kinds=_guard.kinds, classes=_guard.classes, multi_class=_guard.multi_class,
-        exclusions=_guard.exclusions, direction=_guard.direction,
-        can_delete=_guard.can_delete, native_bidirectional=_guard.native_bidirectional,
-        notes="Fixed thermal. Perimeter Defender zones are shown READ-ONLY (no "
-              "config API; encrypted config file). New/edited rules are written to "
-              "the preinstalled Motion/Fence/Loitering Guard apps, which have no "
-              "object classification and must be Running to fire. Perimeter "
-              "Defender keeps running alongside them.")
-
-    def __init__(self, ip, port, user, password, channel=None, **_):
-        self.pd = PerimeterDefenderAdapter(ip, port, user, password, channel=channel)
-        self.guard = GuardAdapter(ip, port, user, password, channel=channel)
-
-    def fetch_snapshot(self, log=None):
-        return self.pd.fetch_snapshot(log=log)
-
-    def app_states(self):
-        return self.guard.app_states()
-
-    def backup(self, backup_dir):
-        """Back up Perimeter Defender's config blob -- the camera's only rollback."""
-        return self.pd.backup(backup_dir)
-
-    def read_scenarios(self, log=None):
-        log = log or (lambda _m: None)
-        out = []
-        try:
-            pd_rules = self.pd.read_scenarios()
-            out.extend(pd_rules)
-            if pd_rules:
-                log(f"[.] {len(pd_rules)} Perimeter Defender zone(s) -- shown read-only; "
-                    f"PD has no configuration API.")
-        except pd_config.PDError as e:
-            log(f"[!] Perimeter Defender read failed: {e}")
-        out.extend(self.guard.read_scenarios(log=log))
-        return out
-
-    def apply_scenario(self, sc, backup_dir):
-        # A Perimeter Defender rule loaded from this camera can be redrawn, but it
-        # cannot be pushed BACK to PD. Refuse rather than quietly writing a copy of
-        # it into a Guard app, which would leave two rules where the operator
-        # expected one edit.
-        if sc.read_only:
-            raise PDWriteUnsupported(PerimeterDefenderAdapter.capabilities.read_only_reason)
-        return self.guard.apply_scenario(sc, backup_dir)
-
-    def delete_scenario(self, native_id, backup_dir):
-        return self.guard.delete_scenario(native_id, backup_dir)
-
-    def factory_defaults(self, kind=None):
-        return self.guard.factory_defaults(kind)
-
-
 # ---------------------------------------------------------------- Hik
 
 class HikAdapter:
@@ -1025,11 +776,10 @@ def _require(caps, sc):
         raise ValueError(f"unknown crossing direction {sc.direction!r} "
                          f"(expected one of {', '.join(VALID_DIRECTIONS)})")
     # An empty class list means the vendor has NO object-classification concept at
-    # all (the Guard apps detect motion and filter on size/duration). That is not
-    # the same as "these classes are unsupported": there is nothing to validate,
-    # and whatever the GUI's checkboxes happen to say is irrelevant to the write.
-    # Both class checks live under this guard -- "can't target human AND vehicle"
-    # is just as meaningless on an engine that has neither.
+    # all. That is not the same as "these classes are unsupported": there is
+    # nothing to validate, and whatever the GUI's checkboxes say is irrelevant to
+    # the write. Both class checks sit under this guard -- "can't target human AND
+    # vehicle" is just as meaningless on an engine that has neither.
     if caps.classes:
         if len(sc.classes) > 1 and not caps.multi_class:
             raise ValueError("this camera can't target human AND vehicle in one scenario")
@@ -1050,9 +800,7 @@ def make_adapter(vendor, ip, port, user, password, channel=None, log=None):
     v = camera_engine.classify_manufacturer(vendor)
     if v == "AXIS":
         if _is_perimeter_defender_camera(ip, port, user, password, log):
-            # A fixed thermal is BOTH engines at once: read Perimeter Defender's
-            # live zones, write through the preinstalled Guard apps.
-            return AxisThermalAdapter(ip, port, user, password, channel=channel)
+            return PerimeterDefenderAdapter(ip, port, user, password, channel=channel)
         return AxisAdapter(ip, port, user, password, channel=channel)
     if v == "HIKVISION":
         return HikAdapter(ip, port, user, password, channel=int(channel) if channel else 2)
@@ -1089,8 +837,9 @@ def _is_perimeter_defender_camera(ip, port, user, password, log):
             if pd_config.is_perimeter_defender(running):
                 is_pd = True
                 log(f"[*] {ip}:{port} is a fixed thermal running {', '.join(running)} "
-                    f"(no Object Analytics). Its Perimeter Defender zones are shown "
-                    f"read-only; new rules are written to the Guard apps.")
+                    f"(no Object Analytics) -- opening read-only. Its zones can be "
+                    f"read and backed up here, but only AXIS Perimeter Defender Setup "
+                    f"can change them.")
             elif running:
                 log(f"[!] {ip}:{port} has no Object Analytics app. Running analytics: "
                     f"{', '.join(running)}.")

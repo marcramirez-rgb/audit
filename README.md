@@ -211,24 +211,21 @@ environment.
   cameras use self-signed certificates over the local network. This is a
   reasonable tradeoff on a trusted internal network, not something to change
   without also fixing certificate management on the cameras themselves.
-- **Axis fixed thermals (Q1971-E) split across TWO analytics engines**, and the
-  writer handles both — see `pd_config.py` and `guard_config.py`.
-  - **AXIS Perimeter Defender** holds the zones the camera alarms on today, and
-    **classifies human vs vehicle**. Read-only (details below).
-  - **AXIS Motion / Fence / Loitering Guard** ship preinstalled on the same
-    cameras, are **fully writable** over `control.cgi` (add/edit/delete, verified
-    live end-to-end), but have **no object classification at all** — only size and
-    duration filters. Each is a separate app that must be Running to fire;
-    starting one does *not* stop Perimeter Defender (confirmed).
-  - So on a thermal you choose per rule: classification (PD, hand-configured) or
-    API-managed zones (Guard, unclassified). `AxisThermalAdapter` shows both at
-    once, PD greyed out.
-  - **Classification is itself writable.** PD's detection tuning — including
-    `UseDNNClassifier`, the AI classifier that produces human/vehicle — lives in
-    the ordinary VAPIX parameter tree, not in the encrypted config, so
-    `pd_config.PDClient.set_params()` can manage it with no Axis UI. It drifts:
-    two identical Q1971-E units on ONE LVT unit were found with the classifier on
-    (`:5020`) and off (`:5015`). `probe_pd.py` reports it.
+- **Axis fixed thermals (Q1971-E) are READ-ONLY in these tools.** They run AXIS
+  Perimeter Defender, which has no zone-configuration API, so a thermal's
+  detection zone can only be changed with the **AXIS Perimeter Defender Setup**
+  desktop application (or ACS) -- not from the camera's web UI either, whose PD
+  page is only a log viewer. What the API *can* do on these cameras:
+  read zones/scenarios/dwell times, back up and restore `context.knp`, and write
+  PD's detection TUNING parameters (`UseDNNClassifier`, sensitivity, min/max
+  object size, out-of-field filter) via `param.cgi`. That changes *what* PD
+  alarms on, never *where*. See `pd_config.py`.
+  The preinstalled Motion/Fence/Loitering Guard apps do expose a writable API,
+  and support for them was built and then removed deliberately: their rules are
+  invisible to PD Setup, they carry no object classification, and the unit
+  ingests object-tracking metadata plus PD's alarm socket rather than Guard's
+  ONVIF events -- so a Guard rule would detect but never alert. See the git
+  history if that tradeoff ever changes.
 - **AXIS Perimeter Defender zone geometry** is **readable but not writable**. Both tools pull the real zones — geometry from
   the app's metadata stream, scenario names/types/dwell times from its
   `scenarios.xml` — via `pd_config.py`. What is *not* possible is changing a
