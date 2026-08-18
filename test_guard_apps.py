@@ -13,6 +13,7 @@ Run:  .venv\\Scripts\\python.exe test_guard_apps.py
 
 from __future__ import annotations
 
+import json
 import sys
 
 import guard_config as gc
@@ -67,6 +68,14 @@ LOITER_CONFIG = {
         }],
         "configurationStatus": 0,
     }
+}
+
+
+#: The out-of-box trigger geometry each app advertises, captured from the camera.
+DEFAULT_INSTANCE = {
+    "motionguard": [[-0.97, -0.97], [-0.97, 0.97], [0.97, 0.97], [0.97, -0.97]],
+    "loiteringguard": [[-0.97, -0.97], [-0.97, 0.97], [0.97, 0.97], [0.97, -0.97]],
+    "fenceguard": [[0.0, -0.7], [0.0, 0.7]],
 }
 
 
@@ -293,6 +302,12 @@ def _stub_guard_adapter(configs):
                 raise gc.GuardAppStopped(f"{self.app} not running")
             return cfg
 
+        def get_capabilities(self):
+            # Real defaultInstance values, so is_default reflects the camera.
+            return {"data": {"triggers": [
+                {"type": gc.APP_TRIGGER[self.app],
+                 "defaultInstance": DEFAULT_INSTANCE[self.app]}]}}
+
     a._client = lambda app: _C(app)
     return a
 
@@ -368,6 +383,11 @@ def test_reading_never_starts_an_application():
                 raise gc.GuardAppStopped("stopped")
             return MOTION_CONFIG
 
+        def get_capabilities(self):
+            return {"data": {"triggers": [
+                {"type": gc.APP_TRIGGER[self.app],
+                 "defaultInstance": DEFAULT_INSTANCE[self.app]}]}}
+
         def start_app(self, **_):
             started.append(self.app)
             return True
@@ -376,6 +396,47 @@ def test_reading_never_starts_an_application():
     a.read_scenarios()
     assert started == [], f"read_scenarios started {started}"
     return "read path never calls start_app"
+
+
+def test_factory_default_profile_is_recognised():
+    """"Profile 1" ships inside every Guard app and is byte-identical to the
+    capability's defaultInstance -- a rectangle over ~97% of the frame. It must be
+    told apart from a drawn zone, because leaving it active means the app detects
+    everywhere and any zone beside it narrows nothing."""
+    caps = {"data": {"triggers": [{"type": "includeArea",
+                                   "defaultInstance": [[-0.97, -0.97], [-0.97, 0.97],
+                                                       [0.97, 0.97], [0.97, -0.97]]}]}}
+    profile = MOTION_CONFIG["data"]["profiles"][0]
+    assert gc.is_factory_default(profile, caps), "the shipped Profile 1 is the default"
+
+    drawn = json.loads(json.dumps(profile))
+    drawn["triggers"][0]["data"] = [[-0.5, -0.5], [0.5, -0.5], [0.5, 0.5]]
+    assert not gc.is_factory_default(drawn, caps), "a redrawn area is NOT a default"
+    return "default recognised by geometry; a redrawn area is not"
+
+
+def test_default_detection_ignores_the_profile_name():
+    """Matched on geometry, not name: renaming the default still leaves a
+    full-frame profile, and keeping the name after redrawing is a real zone."""
+    caps = {"data": {"triggers": [{"type": "includeArea",
+                                   "defaultInstance": [[-0.97, -0.97], [-0.97, 0.97],
+                                                       [0.97, 0.97], [0.97, -0.97]]}]}}
+    renamed = json.loads(json.dumps(MOTION_CONFIG["data"]["profiles"][0]))
+    renamed["name"] = "Perimeter"
+    assert gc.is_factory_default(renamed, caps), "renaming does not make it configured"
+    return "rename does not hide a full-frame default"
+
+
+def test_parse_profiles_flags_defaults_only_when_capabilities_given():
+    caps = {"data": {"triggers": [{"type": "includeArea",
+                                   "defaultInstance": [[-0.97, -0.97], [-0.97, 0.97],
+                                                       [0.97, 0.97], [0.97, -0.97]]}]}}
+    with_caps = gc.parse_profiles(MOTION_CONFIG, "motionguard", capabilities=caps)
+    assert with_caps[0]["is_default"] is True, with_caps
+    # Without capabilities there is nothing to compare against -- never guess.
+    without = gc.parse_profiles(MOTION_CONFIG, "motionguard")
+    assert without[0]["is_default"] is False, without
+    return "is_default set only when the camera's own defaultInstance is available"
 
 
 def test_capabilities_have_no_classes_but_are_writable():

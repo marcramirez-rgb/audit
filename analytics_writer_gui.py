@@ -1378,6 +1378,10 @@ class WriterApp(ctk.CTk):
         # zone-crossing / conditional), richer than the three kinds this tool draws.
         detail_txt = f" [{s.detail}]" if s.detail else ""
         ro_txt = " (read-only)" if s.read_only else ""
+        # A factory profile is not a configured zone. Saying so stops the near
+        # full-frame default being read as "someone chose to watch everything".
+        if s.is_default:
+            ro_txt += "  <-- APP DEFAULT, covers the whole frame (not configured)"
         return (f"    '{s.name}'{loc_txt} {s.kind}{detail_txt}{dir_txt} classes={s.classes}"
                 + (f" dur={s.duration}" if s.duration else "")
                 + (f" excl={len(s.exclusions)}" if s.exclusions else "")
@@ -2355,6 +2359,29 @@ class WriterApp(ctk.CTk):
             self._log("[.] Push cancelled.")
             return
 
+        # A Guard app ships with a near full-frame factory profile. Leaving it in
+        # place means the app keeps detecting everywhere, so the zone being pushed
+        # here would change nothing. Ask once, at the only moment it matters.
+        drop_defaults = []
+        if hasattr(adapter, "factory_defaults"):
+            try:
+                drop_defaults = adapter.factory_defaults(sc.kind)
+            except Exception:                                     # noqa: BLE001
+                drop_defaults = []
+        if drop_defaults:
+            names = ", ".join(f"{d.app} profile {d.uid}" for d in drop_defaults)
+            if messagebox.askyesno(
+                "Remove the app's default profile?",
+                f"{names} is still the factory default -- a rectangle covering "
+                f"almost the whole frame.\n\nLeaving it means the app detects "
+                f"everywhere and '{sc.name}' will not narrow anything down.\n\n"
+                f"Remove the default profile as part of this push?"):
+                self._log(f"[.] Will also remove the factory default profile(s): {names}")
+            else:
+                drop_defaults = []
+                self._log("[.] Keeping the app's default profile -- it stays active "
+                          "alongside the new rule, so detection remains full-frame.")
+
         self.push_button.configure(state="disabled", text="Pushing...")
         self._log(f"[*] Backing up + pushing '{sc.name}' to {adapter.vendor} {ip}:{port} ...")
         backup_dir = HIK_BACKUP_DIR if adapter.vendor == "Hikvision" else BACKUP_DIR
@@ -2362,6 +2389,11 @@ class WriterApp(ctk.CTk):
         def work():
             try:
                 backup_path, _verify = adapter.apply_scenario(sc, backup_dir)
+                # Remove the factory default AFTER the new rule lands, never before:
+                # if the push fails, the camera is left exactly as it was rather than
+                # stripped of its only profile.
+                for dflt in drop_defaults:
+                    adapter.delete_scenario(dflt, backup_dir)
                 names = [s.name for s in adapter.read_scenarios()]
                 self.msg_queue.put(("push_done", Path(backup_path).name, names))
             except Exception as e:

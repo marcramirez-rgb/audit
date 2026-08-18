@@ -70,6 +70,11 @@ class Scenario:
     # the editor would imply a Push that cannot work.
     read_only: bool = False
     detail: str = ""                # vendor-specific type text, for display only
+    # True when this rule is the analytics app's UNTOUCHED factory profile rather
+    # than something a person configured. Axis Guard apps each ship one, covering
+    # ~97% of the frame -- see guard_config.is_factory_default for why that has to
+    # be visible instead of quietly drawn as if it were a real zone.
+    is_default: bool = False
 
 
 @dataclass
@@ -549,12 +554,23 @@ class GuardAdapter:
             except guard_config.GuardError as e:
                 log(f"[!] {app}: {e}")
                 continue
-            for p in guard_config.parse_profiles(cfg, app):
+            # Capabilities carry each trigger's defaultInstance, which is the only
+            # reliable way to tell a factory profile from a drawn one.
+            try:
+                caps = client.get_capabilities()
+            except guard_config.GuardError:
+                caps = None
+            for p in guard_config.parse_profiles(cfg, app, capabilities=caps):
+                if p["is_default"]:
+                    log(f"[!] AXIS {app} still holds its FACTORY DEFAULT profile "
+                        f"'{p['name']}', which covers almost the whole frame. While "
+                        f"that app runs it detects everywhere, so any zone drawn in "
+                        f"it has no effect until this profile is removed.")
                 out.append(Scenario(
                     name=p["name"], kind=p["kind"], points=p["points"],
                     classes=(), duration=p["duration"], direction=p["direction"],
                     exclusions=p["exclusions"], native_id=GuardRuleId(app, p["uid"]),
-                    detail=f"AXIS {app}"))
+                    detail=f"AXIS {app}", is_default=p["is_default"]))
         return out
 
     def apply_scenario(self, sc, backup_dir):
@@ -592,6 +608,24 @@ class GuardAdapter:
         backup_path, verify, started = client.apply_profile(profile, backup_dir)
         self._last_started = started
         return backup_path, verify
+
+    def factory_defaults(self, kind=None):
+        """GuardRuleIds of untouched factory profiles, optionally only in the app
+        that owns `kind`. Reading needs the app running, so a stopped app reports
+        nothing -- which is correct: a stopped app detects nothing either."""
+        apps = [guard_config.KIND_TO_APP[kind]] if kind else list(guard_config.APP_TRIGGER)
+        found = []
+        for app in apps:
+            client = self._client(app)
+            try:
+                cfg = client.get_config()
+                caps = client.get_capabilities()
+            except guard_config.GuardError:
+                continue
+            for p in guard_config.parse_profiles(cfg, app, capabilities=caps):
+                if p["is_default"]:
+                    found.append(GuardRuleId(app, p["uid"]))
+        return found
 
     def delete_scenario(self, native_id, backup_dir):
         """Remove one profile. native_id is the GuardRuleId read_scenarios gave."""
@@ -668,6 +702,9 @@ class AxisThermalAdapter:
 
     def delete_scenario(self, native_id, backup_dir):
         return self.guard.delete_scenario(native_id, backup_dir)
+
+    def factory_defaults(self, kind=None):
+        return self.guard.factory_defaults(kind)
 
 
 # ---------------------------------------------------------------- Hik

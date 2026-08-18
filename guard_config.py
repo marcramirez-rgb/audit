@@ -387,6 +387,45 @@ def add_exclude_zones(profile, zones_guard):
     return profile
 
 
+# ---------------------------------------------------------------- factory defaults
+
+def default_geometry(capabilities, trigger_type):
+    """The out-of-box trigger geometry the app advertises for `trigger_type`."""
+    for tr in (capabilities or {}).get("data", {}).get("triggers", []):
+        if tr.get("type") == trigger_type:
+            return tr.get("defaultInstance")
+    return None
+
+
+def _same_geometry(a, b, tol=1e-6):
+    if not a or not b or len(a) != len(b):
+        return False
+    return all(abs(float(p[0]) - float(q[0])) <= tol and abs(float(p[1]) - float(q[1])) <= tol
+               for p, q in zip(a, b))
+
+
+def is_factory_default(profile, capabilities):
+    """True when this profile is the app's UNTOUCHED out-of-box profile.
+
+    Every Guard app ships with one profile (named "Profile 1") whose trigger is
+    the capability's defaultInstance -- for Motion and Loitering Guard that is a
+    rectangle spanning -0.97..0.97, i.e. 97% of the frame.
+
+    This matters operationally, not just visually. Starting a Guard app to hold a
+    carefully drawn zone ALSO activates that default, so the app keeps detecting
+    across the whole image and the drawn zone stops meaning anything. Callers
+    surface these so an operator can see -- and remove -- them.
+
+    Matched on GEOMETRY, not on the name: someone who renamed the default but
+    never moved it still has a full-frame profile, and someone who kept the name
+    but redrew the area has a real zone that must not be offered for deletion."""
+    trig = (profile.get("triggers") or [{}])[0]
+    dflt = default_geometry(capabilities, trig.get("type"))
+    if dflt is None:
+        return False
+    return _same_geometry(trig.get("data") or [], dflt)
+
+
 # ---------------------------------------------------------------- validation
 
 def validate_profile(profile, app):
@@ -497,9 +536,11 @@ def remove_profile(config, uid):
     return new_config
 
 
-def parse_profiles(config, app):
+def parse_profiles(config, app, capabilities=None):
     """Full config -> [{name, uid, kind, points(frac), duration, direction,
-    exclusions(frac)}]. The inverse of the builders."""
+    exclusions(frac), is_default}]. The inverse of the builders.
+
+    `capabilities` (optional) enables is_default -- see is_factory_default."""
     out = []
     for p in config.get("data", {}).get("profiles", []):
         trig = (p.get("triggers") or [{}])[0]
@@ -521,5 +562,6 @@ def parse_profiles(config, app):
             "duration": duration,
             "direction": trig.get("alarmDirection") if trig.get("type") == "fence" else None,
             "exclusions": excl,
+            "is_default": is_factory_default(p, capabilities) if capabilities else False,
         })
     return out
