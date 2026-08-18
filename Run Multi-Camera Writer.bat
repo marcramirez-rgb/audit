@@ -21,14 +21,15 @@ REM being installed by setup.bat, so they go missing when someone updates by
 REM hand-copying a few files. Without this check that surfaces as a raw
 REM ImportError instead of a readable message.
 REM
-REM Import chain for this tool:
-REM   multi_camera_gui -> dry_run, ui_theme
-REM   dry_run          -> aoa_config, vendor_adapter
-REM   vendor_adapter   -> aoa_config, camera_engine, hik_config, pd_config
-REM   aoa_config       -> camera_engine
-REM   hik_config       -> camera_engine
-REM   pd_config        -> camera_engine
-set "CORE_FILES=multi_camera_gui.py dry_run.py ui_theme.py aoa_config.py vendor_adapter.py hik_config.py pd_config.py camera_engine.py"
+REM Import chain for this tool -- it SUBCLASSES the single-camera writer, so it
+REM needs everything that one needs, plus itself:
+REM   multi_writer_gui     -> analytics_writer_gui, vendor_adapter
+REM   analytics_writer_gui -> aoa_config, vendor_adapter, fleet_catalog, ui_theme
+REM   vendor_adapter       -> aoa_config, camera_engine, hik_config, pd_config
+REM   aoa_config           -> camera_engine
+REM   hik_config           -> camera_engine
+REM   pd_config            -> camera_engine
+set "CORE_FILES=multi_writer_gui.py analytics_writer_gui.py ui_theme.py aoa_config.py vendor_adapter.py hik_config.py pd_config.py camera_engine.py fleet_catalog.py"
 
 set "MISSING="
 for %%F in (%CORE_FILES%) do if not exist "%~dp0%%F" set "MISSING=1"
@@ -48,7 +49,7 @@ if defined MISSING (
   exit /b 1
 )
 
-"%VENV_PY%" "%~dp0multi_camera_gui.py"
+"%VENV_PY%" "%~dp0multi_writer_gui.py"
 if errorlevel 1 (
   echo.
   echo ============================================================
