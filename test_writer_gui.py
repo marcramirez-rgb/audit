@@ -153,6 +153,60 @@ def test_log_line_handles_every_native_id_shape(app):
 
 
 # --------------------------------------------------------------------------- #
+# Duplicate as new rule
+# --------------------------------------------------------------------------- #
+
+def test_duplicate_keeps_the_zone_but_clears_the_identity(app):
+    """The human/vehicle workflow: one polygon, two rules. The copy must keep the
+    geometry EXACTLY and drop the identity -- if editing survived, Push would
+    rename the original instead of creating a second rule."""
+    sc = vendor_adapter.Scenario(
+        name="Scene1_H_1s", kind="loiter",
+        points=[(0.1, 0.1), (0.9, 0.1), (0.9, 0.9), (0.3, 0.6)],
+        classes=("human",), duration=1, native_id=7)
+    app.adapter = _StubWritable()
+    app._apply_capabilities()
+    app.existing_scenarios = [sc]
+    app.edit_label_map = {sc.name: sc}
+    app.edit_var.set(sc.name)
+    app._on_edit_select(sc.name)
+    assert app.editing == 7, "precondition: the original is loaded for edit"
+    before = list(app.points)
+
+    app._duplicate_current()
+    assert app.editing is None, "duplicate must be a NEW rule, not an edit"
+    assert app.edit_var.get() == awg.NEW_SCENARIO
+    assert app.points == before, "geometry changed during duplicate"
+    assert app.name_var.get() == "Scene1_H_1s-2", app.name_var.get()
+    assert len(app.name_var.get()) <= 15, "AOA caps names at 15"
+    return "identity cleared, 4 points intact, auto-named Scene1_H_1s-2"
+
+
+def test_duplicate_with_an_empty_canvas_refuses(app):
+    app.points = []
+    app.editing = 3
+    app._duplicate_current()
+    assert app.editing == 3, "a refused duplicate must not touch the editor state"
+    return "nothing to copy -> no state change"
+
+
+def test_dup_name_is_unique_and_fits_the_cap(app):
+    """Pure naming rules: unique among what the camera holds, never longer than
+    the vendor cap, and the counter survives trimming (it is the unique part)."""
+    dup = awg.WriterApp._dup_name
+    assert dup("Zone", {"Zone"}, 15) == "Zone-2"
+    assert dup("Zone", {"Zone", "Zone-2"}, 15) == "Zone-3"
+    # 15-char base: the BASE gets trimmed, the counter survives.
+    got = dup("Scene1_Human_15", {"Scene1_Human_15"}, 15)
+    assert got == "Scene1_Human_-2" and len(got) == 15, got
+    # Eight collisions deep -> the two-digit counter trims one more base char.
+    taken = {"Scene1_Human_15"} | {f"Scene1_Human_-{n}" for n in range(2, 10)}
+    got = dup("Scene1_Human_15", taken, 15)
+    assert got == "Scene1_Human-10" and got not in taken, got
+    return "suffix counts up, base trims, cap never exceeded"
+
+
+# --------------------------------------------------------------------------- #
 # Fixed thermal (Perimeter Defender -- read-only)
 # --------------------------------------------------------------------------- #
 

@@ -964,6 +964,11 @@ class WriterApp(ctk.CTk):
                                            command=self._on_edit_select, fg_color=LVT_TEAL,
                                            button_color=LVT_DARK_TEAL, button_hover_color=LVT_DARK_TEAL_HOVER)
         self.edit_menu.pack(fill="x", padx=12, pady=4)
+        ctk.CTkButton(side, text="Duplicate as new rule", command=self._duplicate_current,
+                      fg_color=LVT_TEAL, hover_color=LVT_TEAL_HOVER).pack(fill="x", padx=12, pady=(0, 4))
+        ctk.CTkLabel(side, text="Same zone, new rule -- e.g. one rule for Human, one for Vehicle.",
+                     text_color=LVT_TEXT_MUTED, font=ctk.CTkFont(size=10),
+                     justify="left", wraplength=260).pack(anchor="w", padx=12)
 
         label("Scenario type")
         self.rule_var = tk.StringVar(value="Intrusion")
@@ -1388,6 +1393,46 @@ class WriterApp(ctk.CTk):
                 + (f" excl={len(s.exclusions)}" if s.exclusions else "")
                 + size_txt + ro_txt)
 
+
+    @staticmethod
+    def _dup_name(base, taken, max_len):
+        """A name for a copy of `base`: unique among `taken`, within `max_len`.
+
+        The counter is appended to a TRIMMED base rather than trimming the result,
+        because the counter is the part that guarantees uniqueness -- truncating it
+        off would hand back a name that collides with the rule being copied."""
+        for n in range(2, 100):
+            suffix = f"-{n}"
+            cand = base[:max_len - len(suffix)] + suffix
+            if cand not in taken:
+                return cand
+        return base[:max_len - 3] + "-99"
+
+    def _duplicate_current(self):
+        """Turn whatever is in the editor into a NEW rule with the same geometry.
+
+        The everyday case is one zone, two rules: a human rule and a vehicle rule
+        sharing a polygon (the fleet's own Scene1_H_1s / Scene1_V_10s convention).
+        Load or draw the first rule, push it, Duplicate, flip the class and dwell,
+        push again. Geometry, type, dwell, direction and exclusions all carry
+        over; only the IDENTITY is new -- editing is cleared so Push creates a
+        rule instead of renaming the one this was copied from."""
+        if not self.points:
+            self._log("[!] Nothing to duplicate -- draw a zone, or load one from "
+                      "'Edit existing' first.")
+            return
+        was = self.name_var.get().strip() or "zone"
+        # The current name joins the taken set even if it is not on the camera
+        # yet: two unpushed rules with one name would upsert into each other.
+        taken = {s.name for s in self.existing_scenarios} | {was}
+        new_name = self._dup_name(was, taken, self._max_name_len())
+        self.editing = None
+        self.edit_var.set(NEW_SCENARIO)
+        self.name_var.set(new_name)
+        self._log(f"[+] Duplicated '{was}' as new rule '{new_name}' -- same zone, "
+                  f"not on the camera until you push it.")
+        self._log("[.] Now change what differs (e.g. untick Human, tick Vehicle, "
+                  "set its dwell), rename if you like, then Push.")
 
     def _make_adapter(self):
         # Safety net for any path that changes the target without firing a widget

@@ -304,6 +304,67 @@ def test_fleet_pick_records_the_catalog_row_against_the_ip(app):
     return "catalog row stored per IP; a row-less pick is harmless"
 
 
+def test_fleet_pick_loads_all_three_cameras_of_the_unit(app):
+    """A TDC is one IP with three cameras behind fixed ports; picking a unit in
+    the Fleet Picker must load the whole unit, tabs named by TDC + position."""
+    _reset(app)
+    captured = {}
+    real = app._load_targets
+    app._load_targets = lambda targets: captured.setdefault("targets", targets)
+    try:
+        app._apply_fleet_pick("10.5.5.5", "Axis",
+                              {"LIVE_UNIT_SERIAL_NM": "TDC55555", "CLIENT_NM": "ACME",
+                               "LOCATION_NM": "Yard 9"})
+    finally:
+        app._load_targets = real
+    assert captured["targets"] == [("10.5.5.5", "5010"), ("10.5.5.5", "5015"),
+                                   ("10.5.5.5", "5020")], captured
+    assert app.fleet_info["10.5.5.5"]["tdc"] == "TDC55555"
+    # And the sessions those targets create would carry the TDC label.
+    s = mw.CameraSession("10.5.5.5", "5015", "Axis", fleet=app.fleet_info["10.5.5.5"])
+    assert s.label == "TDC55555 - Left", s.label
+    return "one pick -> Center + Left + Right, labelled by TDC"
+
+
+def test_fleet_pick_saves_the_active_edit_before_the_form_changes(app):
+    """The base pick handler changes the form target, which wipes the canvas. An
+    unsaved zone on the active tab must be captured into its session first."""
+    _reset(app)
+    _session(app, "10.6.6.6:5015", "10.6.6.6", "5015", "#ddd")
+    app.switch_to("10.6.6.6:5015")
+    app.name_var.set("KEEP-ME")
+    app.points = [app._frac_to_canvas(*p) for p in [(0.2, 0.2), (0.7, 0.2), (0.7, 0.7)]]
+    real = app._load_targets
+    app._load_targets = lambda targets: None
+    try:
+        app._apply_fleet_pick("10.7.7.7", "Axis", {"LIVE_UNIT_SERIAL_NM": "TDC77777"})
+    finally:
+        app._load_targets = real
+    kept = app.sessions["10.6.6.6:5015"]
+    assert kept.name == "KEEP-ME" and len(kept.points) == 3, (kept.name, kept.points)
+    return "active tab's unsaved zone survives picking the next unit"
+
+
+def test_load_targets_refuses_while_a_batch_is_running(app):
+    """Sessions created while the single-flight worker is busy would strand as
+    'loading' forever -- _run_bg refuses the second batch, so nothing may be
+    queued for it."""
+    _reset(app)
+
+    class _Busy:
+        @staticmethod
+        def is_alive():
+            return True
+
+    real, app.worker = app.worker, _Busy()
+    try:
+        app._load_targets([("10.8.8.8", "5010")])
+    finally:
+        app.worker = real
+    assert "10.8.8.8:5010" not in app.sessions, "session created for a refused batch"
+    return "busy batch refuses new loads instead of stranding tabs"
+
+
 def test_session_geometry_is_fractions_not_pixels(app):
     """Sessions must survive a resize, so nothing may be stored in canvas pixels."""
     _reset(app)

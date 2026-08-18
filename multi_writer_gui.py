@@ -260,7 +260,33 @@ class MultiWriterApp(WriterApp):
         ctk.CTkButton(dlg, text="Load", command=go, fg_color=LVT_DARK_TEAL,
                       hover_color=LVT_DARK_TEAL_HOVER, height=38).pack(fill="x", padx=14, pady=12)
 
+    def _apply_fleet_pick(self, ip, mfg_label, row=None):
+        """One Fleet Picker pick loads the WHOLE unit.
+
+        A TDC is one IP with its cameras behind the fixed position ports, so in a
+        multi-camera tool the useful unit of loading is the unit -- picking
+        Center, then Left, then Right one at a time is three trips through the
+        dialog for one physical box. The base handler runs first: it records the
+        catalog row against the IP, which is what names the three tabs
+        'TDC12345 - Center/Left/Right' instead of ip:port."""
+        # The base handler changes the form target, which wipes the canvas. Fold
+        # the active tab's edits into its session FIRST or an unsaved zone on the
+        # current camera silently dies when the operator picks the next unit.
+        self.capture_active()
+        super()._apply_fleet_pick(ip, mfg_label, row)
+        ports = [p for p in awg.PORT_LABEL_TO_VALUE.values() if p != "80"]
+        tdc = (self.fleet_info.get(ip) or {}).get("tdc") or ip
+        self._log(f"[*] Fleet pick: loading all {len(ports)} cameras of {tdc}.")
+        self._load_targets([(ip, p) for p in ports])
+
     def _load_targets(self, targets):
+        # Sessions must not be created unless the batch can actually start:
+        # _run_bg refuses while its worker is alive, which would strand brand-new
+        # tabs in "loading" forever with nothing underway to finish them.
+        if self.worker and self.worker.is_alive():
+            self._log("[!] A batch is already running -- wait for it to finish "
+                      "(or press Cancel) before loading more cameras.")
+            return
         user = self.user_entry.get().strip()
         password = self.pass_entry.get().strip()
         if not (user and password):
