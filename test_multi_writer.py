@@ -393,6 +393,57 @@ def test_cancel_drops_the_queue_instead_of_resurrecting_it(app):
     return "cancel clears the queue; the flag resets"
 
 
+def test_sidebar_actions_grey_out_during_a_batch(app):
+    """FIELD REPORT, round two. The camera-bar buttons greyed during a batch but
+    the sidebar's Fetch Snapshot / Read Config / Push did not -- and the canvas
+    hint even pointed at Fetch Snapshot -- so the operator's click was met with
+    'A request is already running.' and read as the fixes missing."""
+    _reset(app)
+    app._set_busy(True)
+    for name in ("fetch_button", "read_button", "push_button", "load_button"):
+        assert str(getattr(app, name).cget("state")) == "disabled", name
+    assert str(app.cancel_button.cget("state")) == "normal", "Cancel must stay live"
+    app._set_busy(False)
+    for name in ("fetch_button", "read_button", "load_button"):
+        assert str(getattr(app, name).cget("state")) == "normal", name
+    return "sidebar + bar buttons grey while busy; Cancel never does"
+
+
+def test_busy_refusal_message_explains_the_batch(app):
+    """If a click does slip through, the refusal must say what is happening and
+    what to do -- not the bare 'A request is already running.'"""
+    _reset(app)
+
+    class _Busy:
+        @staticmethod
+        def is_alive():
+            return True
+
+    real, app.worker = app.worker, _Busy()
+    try:
+        app._run_bg(lambda: None)
+    finally:
+        app.worker = real
+    tail = app.log_box.get("1.0", "end").strip().splitlines()[-1]
+    assert "batch" in tail and "automatically" in tail, tail
+    return "refusal names the batch and says snapshots arrive on their own"
+
+
+def test_queued_camera_hint_says_wait_not_click(app):
+    """The canvas hint for a still-loading camera must counsel patience -- telling
+    the operator to press a button the worker will refuse caused this loop."""
+    _reset(app)
+    _session(app, "11.1.1.1:5015", "11.1.1.1", "5015", "#eee")
+    waiting = _session(app, "11.1.1.1:5010", "11.1.1.1", "5010", "#fff")
+    waiting.pil_image, waiting.loaded, waiting.error = None, False, None
+    app.switch_to("11.1.1.1:5015")
+    app.switch_to("11.1.1.1:5010")
+    text = app.coord_label.cget("text")
+    assert "still loading" in text, text
+    assert "Fetch Snapshot" not in text, f"hint points at a refused button: {text}"
+    return "loading tab says the snapshot is on its way"
+
+
 def test_session_geometry_is_fractions_not_pixels(app):
     """Sessions must survive a resize, so nothing may be stored in canvas pixels."""
     _reset(app)

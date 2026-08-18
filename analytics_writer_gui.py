@@ -958,10 +958,15 @@ class WriterApp(ctk.CTk):
         self.pass_entry = ctk.CTkEntry(side, placeholder_text="Axis password", show="*")
         self.pass_entry.pack(fill="x", padx=12, pady=4)
 
-        ctk.CTkButton(side, text="Fetch Snapshot", command=self._fetch_snapshot,
-                      fg_color=LVT_DARK_TEAL, hover_color=LVT_DARK_TEAL_HOVER).pack(fill="x", padx=12, pady=(8, 4))
-        ctk.CTkButton(side, text="Read Current Config", command=self._read_config,
-                      fg_color=LVT_TEAL, hover_color=LVT_TEAL_HOVER).pack(fill="x", padx=12, pady=4)
+        # Refs kept so the multi-camera writer can grey these while a batch runs --
+        # they share the single-flight worker with the batch, so mid-batch clicks
+        # can only ever be refused.
+        self.fetch_button = ctk.CTkButton(side, text="Fetch Snapshot", command=self._fetch_snapshot,
+                                          fg_color=LVT_DARK_TEAL, hover_color=LVT_DARK_TEAL_HOVER)
+        self.fetch_button.pack(fill="x", padx=12, pady=(8, 4))
+        self.read_button = ctk.CTkButton(side, text="Read Current Config", command=self._read_config,
+                                         fg_color=LVT_TEAL, hover_color=LVT_TEAL_HOVER)
+        self.read_button.pack(fill="x", padx=12, pady=4)
         ctk.CTkButton(side, text="Clear Overlays", command=self._clear_overlays,
                       fg_color=LVT_TEAL, hover_color=LVT_TEAL_HOVER).pack(fill="x", padx=12, pady=(0, 4))
 

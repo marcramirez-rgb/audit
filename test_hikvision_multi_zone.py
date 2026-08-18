@@ -87,8 +87,32 @@ def test_axis_saved_debug_vertices():
     assert img_buf.readable()
 
 
+def test_hik_edge_zones_stay_on_the_camera_grid():
+    """REGRESSION (10.23.101.11:5020). The Hik grid tops out at 999 -- the
+    camera's own UI never writes 1000, and a PUT containing one is rejected whole
+    with 400 'Invalid XML Content'. An edge-hugging zone's 999s drift to 1000
+    through the fraction->canvas->fraction round-trip (999 -> 0.999 -> canvas
+    pixel int -> back -> rounds to 1000), so duplicating a native full-frame rule
+    used to build an unpushable document. Every emitted coordinate must clamp."""
+    import vendor_adapter as va
+    # The exact drift: fractions that round to 1000.
+    for frac, expect in [(1.0, 999), (0.9995, 999), (0.999, 999), (0.5, 500),
+                         (0.0, 0), (-0.01, 0)]:
+        got = va._hik_coord(frac)
+        assert got == expect, f"_hik_coord({frac}) = {got}, expected {expect}"
+    # The full-frame duplicate from the field report, through the real conversion.
+    pts = [(0.001, 0.998), (0.005, 0.072), (1.0, 0.069), (1.0, 1.0)]
+    region = [(va._hik_coord(fx), va._hik_coord(1 - fy)) for fx, fy in pts]
+    assert all(0 <= x <= 999 and 0 <= y <= 999 for x, y in region), region
+    # Size boxes go through the same clamp.
+    rect = va.HikAdapter._frac_rect_to_hik((0.0, 0.0, 1.0, 1.0))
+    assert rect == (0, 0, 999, 999), rect
+    assert va.HikAdapter._frac_rect_to_hik(None) is None
+
+
 if __name__ == '__main__':
     test_hikvision_multi_zone_parse_and_render()
     test_axis_polygon_order_preserved()
     test_axis_saved_debug_vertices()
+    test_hik_edge_zones_stay_on_the_camera_grid()
     print('PASS: Hikvision multi-zone and Axis polygon regression tests')

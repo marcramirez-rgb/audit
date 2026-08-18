@@ -469,17 +469,35 @@ class MultiWriterApp(WriterApp):
                     raise
         raise last
 
+    def _run_bg(self, fn):
+        """Same single-flight guard as the base, but the refusal explains the
+        situation instead of the bare 'A request is already running.' -- which,
+        right after the queue message, read as though the fixes were not in."""
+        if self.worker and self.worker.is_alive():
+            self._log("[!] Busy: a batch is loading/pushing cameras. Snapshots for "
+                      "queued tabs arrive automatically -- wait for the tabs to "
+                      "settle, or press Cancel.")
+            return
+        super()._run_bg(fn)
+
     def _set_busy(self, busy):
-        """Grey the multi-camera buttons while any camera work is in flight, so a
-        second click cannot queue work the base class will just refuse."""
+        """Grey every button that would only be refused while camera work is in
+        flight. Includes the SIDEBAR's Fetch Snapshot / Read Config / Push: they
+        share the single-flight worker with the batch, and the field report was an
+        operator following the 'no snapshot yet' hint straight into a refusal."""
         state = "disabled" if busy else "normal"
-        for name in ("push_all_button", "load_button", "retry_button", "clear_button"):
+        for name in ("push_all_button", "load_button", "retry_button", "clear_button",
+                     "fetch_button", "read_button", "push_button"):
             b = getattr(self, name, None)
             if b is not None:
                 b.configure(state=state)
         # Cancel is the one control that must stay live while work is running.
         if getattr(self, "cancel_button", None) is not None:
             self.cancel_button.configure(state="normal")
+        if not busy:
+            # Blanket re-enable is wrong for Push: on a read-only camera (fixed
+            # thermal) capabilities keep it disabled. Re-gate rather than assume.
+            self._apply_capabilities()
 
     def retry_failed(self):
         """Re-load every camera that errored. A ReadTimeout on a PTZ dome that was
@@ -548,9 +566,19 @@ class MultiWriterApp(WriterApp):
                 self.pil_image = self.tk_image = None
                 self.img_w = self.img_h = 0
                 self.canvas.delete("all")
-                self.coord_label.configure(
-                    text=f"{s.target}: no snapshot ({s.error or 'not loaded yet'}). "
-                         f"Use Retry failed, or Fetch Snapshot.")
+                # Only point at the buttons once there is actually something for
+                # them to do -- a camera still in the batch queue needs patience,
+                # not a click that the single-flight worker will refuse.
+                if s.error:
+                    hint = (f"{s.label}: no snapshot ({s.error}). "
+                            f"Use Retry failed, or Fetch Snapshot.")
+                elif not s.loaded:
+                    hint = (f"{s.label}: still loading -- its snapshot appears "
+                            f"when the batch reaches it.")
+                else:
+                    hint = (f"{s.label}: loaded without a snapshot. "
+                            f"Use Fetch Snapshot to try again.")
+                self.coord_label.configure(text=hint)
 
             self.existing_scenarios = s.existing_scenarios
             self.existing_overlays = s.existing_overlays

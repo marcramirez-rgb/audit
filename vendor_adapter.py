@@ -614,7 +614,7 @@ class HikAdapter:
         Editing patches the existing rule in place so its SizeFilter (min/max object
         size) and other settings are preserved, not rebuilt away."""
         _require(self.capabilities, sc)
-        region_hik = [(round(fx * 1000), round((1 - fy) * 1000)) for (fx, fy) in sc.points]
+        region_hik = [(_hik_coord(fx), _hik_coord(1 - fy)) for (fx, fy) in sc.points]
         target = _classes_to_hik_target(sc.classes)
         direction = _NEUTRAL_DIR_TO_HIK.get(sc.direction, "left-right")
         # Min/max size boxes: neutral fraction rect -> Hik 0..1000 (x,y,w,h) with the
@@ -690,12 +690,27 @@ class HikAdapter:
 
     @staticmethod
     def _frac_rect_to_hik(rect):
-        """Neutral (fx,fy,fw,fh) top-left fraction -> Hik (x,y,w,h) in 0..1000 with the
-        region Y-flip. Inverse of _size_rect. None -> None."""
+        """Neutral (fx,fy,fw,fh) top-left fraction -> Hik (x,y,w,h) on the camera's
+        grid, with the region Y-flip. Inverse of _size_rect. None -> None."""
         if not rect:
             return None
         fx, fy, fw, fh = rect
-        return (round(fx * 1000), round((1 - fy - fh) * 1000), round(fw * 1000), round(fh * 1000))
+        return (_hik_coord(fx), _hik_coord(1 - fy - fh), _hik_coord(fw), _hik_coord(fh))
+
+
+#: Highest coordinate the Hik firmware accepts. The grid is nominally 0..1000,
+#: but rules written by the camera's OWN UI never exceed 999, and a PUT carrying
+#: a 1000 is rejected whole with 400 "Invalid XML Content" -- proven live on
+#: 10.23.101.11:5020: duplicating a native edge-hugging zone drifted its 999s to
+#: 1000 through the fraction->canvas->fraction round-trip, and the camera refused
+#: the entire document. Clamp at the single conversion choke point so no caller
+#: can emit an out-of-grid value.
+HIK_COORD_MAX = 999
+
+
+def _hik_coord(frac):
+    """One [0,1] fraction -> a value the Hik grid actually accepts."""
+    return max(0, min(HIK_COORD_MAX, round(frac * 1000)))
 
 
 # Neutral direction (Axis API values, plus "both") <-> Hik directionSensitivity.
