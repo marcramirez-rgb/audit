@@ -131,6 +131,9 @@ class MultiWriterApp(WriterApp):
         # so this is checked between cameras and during the retry wait: the camera
         # being contacted finishes, then the batch stops.
         self._cancel = threading.Event()
+        # Cameras picked while a batch is still running. Loaded automatically when
+        # the worker frees up; dropped by Cancel and Clear.
+        self._pending_targets = []
         super().__init__()
         self.title("Multi-Camera Analytics Writer")
         self._build_camera_bar()
@@ -266,26 +269,49 @@ class MultiWriterApp(WriterApp):
         A TDC is one IP with its cameras behind the fixed position ports, so in a
         multi-camera tool the useful unit of loading is the unit -- picking
         Center, then Left, then Right one at a time is three trips through the
-        dialog for one physical box. The base handler runs first: it records the
-        catalog row against the IP, which is what names the three tabs
-        'TDC12345 - Center/Left/Right' instead of ip:port."""
-        # The base handler changes the form target, which wipes the canvas. Fold
-        # the active tab's edits into its session FIRST or an unsaved zone on the
-        # current camera silently dies when the operator picks the next unit.
+        dialog for one physical box.
+
+        Deliberately does NOT call the base handler: that one retargets the
+        editor (new IP in the sidebar, canvas wiped, 'set the port then Fetch
+        Snapshot' guidance), which is right for the single-camera tool and wrong
+        here -- the canvas must stay on the tab being edited while the picked
+        unit's cameras arrive as new tabs, or queue behind a batch in flight."""
+        # Fold the active tab's edits into its session first: switching the
+        # vendor below re-gates the UI, and unsaved state must survive a pick.
         self.capture_active()
-        super()._apply_fleet_pick(ip, mfg_label, row)
+        self._record_fleet_row(ip, row)
+        if mfg_label and mfg_label != self.mfg_var.get():
+            # The picked vendor decides which API and which prefilled credentials
+            # the new batch loads with. _switching suppresses the base class's
+            # target-change reset -- nothing about the CURRENT tab has changed.
+            self._switching = True
+            try:
+                self.mfg_var.set(mfg_label)
+                self._on_mfg_change()
+            finally:
+                self._switching = False
         ports = [p for p in awg.PORT_LABEL_TO_VALUE.values() if p != "80"]
         tdc = (self.fleet_info.get(ip) or {}).get("tdc") or ip
         self._log(f"[*] Fleet pick: loading all {len(ports)} cameras of {tdc}.")
         self._load_targets([(ip, p) for p in ports])
 
     def _load_targets(self, targets):
-        # Sessions must not be created unless the batch can actually start:
-        # _run_bg refuses while its worker is alive, which would strand brand-new
-        # tabs in "loading" forever with nothing underway to finish them.
+        # A batch already in flight does not REFUSE new cameras -- it QUEUES them.
+        # Refusing broke the natural rhythm of the persistent Fleet Picker (pick a
+        # unit, pick the next, pick the next...): the second pick landed while the
+        # first unit's slowest camera was still timing out, and simply vanished.
+        # Sessions are still only created when their batch actually starts, so a
+        # queued camera can never strand as a "loading" tab with no work underway.
         if self.worker and self.worker.is_alive():
-            self._log("[!] A batch is already running -- wait for it to finish "
-                      "(or press Cancel) before loading more cameras.")
+            fresh = [(ip, p) for ip, p in targets
+                     if f"{ip}:{p}" not in self.sessions
+                     and (ip, p) not in self._pending_targets]
+            self._pending_targets.extend(fresh)
+            if fresh:
+                self._log(f"[*] Batch in progress -- queued {len(fresh)} camera(s); "
+                          f"they load automatically when it finishes.")
+            else:
+                self._log("[.] Those cameras are already loaded or queued.")
             return
         user = self.user_entry.get().strip()
         password = self.pass_entry.get().strip()
@@ -377,6 +403,22 @@ class MultiWriterApp(WriterApp):
                 camera_engine.STRICT_TIMEOUT = original
         return wrapped
 
+    def _drain_pending(self):
+        """Start the queued cameras once the worker is truly free.
+
+        bg_idle is posted as the batch thread's LAST act, so the thread can still
+        be alive for a moment after the message is handled -- starting the next
+        batch in that window would be refused by _run_bg and the queue would sit
+        forever (no further bg_idle is coming to retry it). Poll briefly instead."""
+        if not self._pending_targets:
+            return
+        if self.worker and self.worker.is_alive():
+            self.after(200, self._drain_pending)
+            return
+        nxt, self._pending_targets = self._pending_targets, []
+        self._log(f"[*] Starting the queued batch: {len(nxt)} camera(s).")
+        self._load_targets(nxt)
+
     def cancel_batch(self):
         """Stop after the camera currently being contacted."""
         if not (self.worker and self.worker.is_alive()):
@@ -393,6 +435,7 @@ class MultiWriterApp(WriterApp):
             self._log("[!] Still working -- press Cancel first, then Clear.")
             return
         self.sessions.clear()
+        self._pending_targets = []
         self.active = None
         self.points, self.exclude_zones, self.current_exclude = [], [], []
         self.perspective_bars, self.current_bar = [], []
@@ -629,8 +672,16 @@ class MultiWriterApp(WriterApp):
                 elif kind == "bg_idle":
                     self._set_busy(False)
                     if self._cancel.is_set():
-                        self._log("[*] Batch cancelled. Clear, or Load cameras again.")
+                        # Cancel means STOP -- auto-starting the queue right after
+                        # would un-cancel the operator's decision.
+                        dropped = len(self._pending_targets)
+                        self._pending_targets = []
+                        self._log("[*] Batch cancelled."
+                                  + (f" {dropped} queued camera(s) dropped." if dropped else "")
+                                  + " Clear, or Load cameras again.")
                         self._cancel.clear()
+                    elif self._pending_targets:
+                        self._drain_pending()
                 elif kind == "log":
                     self._log(msg[1])
                 elif kind == "push_all_done":

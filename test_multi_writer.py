@@ -41,6 +41,7 @@ def _session(app, target, ip, port, colour):
 
 def _reset(app):
     app.sessions.clear()
+    app._pending_targets = []
     app.active = None
     app._switching = False
     app.points, app.exclude_zones, app.current_exclude = [], [], []
@@ -345,10 +346,12 @@ def test_fleet_pick_saves_the_active_edit_before_the_form_changes(app):
     return "active tab's unsaved zone survives picking the next unit"
 
 
-def test_load_targets_refuses_while_a_batch_is_running(app):
-    """Sessions created while the single-flight worker is busy would strand as
-    'loading' forever -- _run_bg refuses the second batch, so nothing may be
-    queued for it."""
+def test_a_pick_mid_batch_queues_instead_of_vanishing(app):
+    """THE FIELD REPORT. Pick unit A, then pick unit B while A's slowest camera
+    is still timing out: B used to be refused with a log line and silently lost,
+    which broke the pick-a-whole-location rhythm. It must queue -- without
+    creating sessions (a session with no batch underway strands as 'loading'
+    forever), without duplicates, and it must start once the worker frees."""
     _reset(app)
 
     class _Busy:
@@ -358,11 +361,36 @@ def test_load_targets_refuses_while_a_batch_is_running(app):
 
     real, app.worker = app.worker, _Busy()
     try:
-        app._load_targets([("10.8.8.8", "5010")])
+        app._load_targets([("10.8.8.8", "5010"), ("10.8.8.8", "5015")])
+        app._load_targets([("10.8.8.8", "5010")])      # picked again -> no dupe
     finally:
         app.worker = real
-    assert "10.8.8.8:5010" not in app.sessions, "session created for a refused batch"
-    return "busy batch refuses new loads instead of stranding tabs"
+    assert "10.8.8.8:5010" not in app.sessions, "session created for a queued batch"
+    assert app._pending_targets == [("10.8.8.8", "5010"), ("10.8.8.8", "5015")]
+
+    captured = {}
+    real_load = app._load_targets
+    app._load_targets = lambda targets: captured.setdefault("targets", targets)
+    try:
+        app._drain_pending()                           # worker is free again
+    finally:
+        app._load_targets = real_load
+    assert captured["targets"] == [("10.8.8.8", "5010"), ("10.8.8.8", "5015")]
+    assert app._pending_targets == []
+    return "mid-batch picks queue (deduped) and start when the worker frees"
+
+
+def test_cancel_drops_the_queue_instead_of_resurrecting_it(app):
+    """Cancel means STOP: auto-starting queued cameras right after a cancel would
+    quietly overrule the operator."""
+    _reset(app)
+    app._pending_targets = [("10.9.9.9", "5010")]
+    app._cancel.set()
+    app.msg_queue.put(("bg_idle", None))
+    app._poll_queue()
+    assert app._pending_targets == [], "queued cameras survived a cancel"
+    assert not app._cancel.is_set(), "cancel flag must reset for the next batch"
+    return "cancel clears the queue; the flag resets"
 
 
 def test_session_geometry_is_fractions_not_pixels(app):

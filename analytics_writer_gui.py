@@ -744,6 +744,21 @@ class WriterApp(ctk.CTk):
         else:
             self._fleet_picker = FleetPickerDialog(self, self._apply_fleet_pick)
 
+    def _record_fleet_row(self, ip, row):
+        """Remember a Fleet Picker catalog row against its IP, so cameras can be
+        named by unit (TDC) and position instead of by address. A None/empty row
+        (hand-typed IP) records nothing and is harmless -- every consumer of
+        fleet_info already falls back to the address."""
+        if not row:
+            return
+        serial = (row.get("LIVE_UNIT_SERIAL_NM") or row.get("LIVE_UNIT_SERIAL_NR") or "")
+        self.fleet_info[ip] = {
+            "tdc": serial.strip(),
+            "client": (row.get("CLIENT_NM") or "").strip(),
+            "location": (row.get("LOCATION_NM") or "").strip(),
+            "model": (row.get("MODEL") or "").strip(),
+        }
+
     def _apply_fleet_pick(self, ip, mfg_label, row=None):
         """Callback from FleetPickerDialog: drop the chosen camera's IP + vendor
         into the sidebar. Port/channel stay as the operator set them.
@@ -752,14 +767,7 @@ class WriterApp(ctk.CTk):
         name a camera the way an operator thinks of it -- by unit (TDC) and
         position -- rather than by address. Row is optional: an IP typed by hand
         has no catalog entry, and must keep working."""
-        if row:
-            serial = (row.get("LIVE_UNIT_SERIAL_NM") or row.get("LIVE_UNIT_SERIAL_NR") or "")
-            self.fleet_info[ip] = {
-                "tdc": serial.strip(),
-                "client": (row.get("CLIENT_NM") or "").strip(),
-                "location": (row.get("LOCATION_NM") or "").strip(),
-                "model": (row.get("MODEL") or "").strip(),
-            }
+        self._record_fleet_row(ip, row)
         if mfg_label and mfg_label != self.mfg_var.get():
             self.mfg_var.set(mfg_label)
             self._on_mfg_change()
