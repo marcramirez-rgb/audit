@@ -56,3 +56,16 @@ fleet_picker_prefs.json
 
 # Per-operator UI prefs (Light/Dark choice) -- machine-local, not project config
 ui_prefs.json
+
+# Captured GraphQL request payloads + probe output for the alert-staleness
+# investigation (probe_alerts.py). Contain customer location ids -- keep local.
+request.json
+active_request.json
+alert_probes/
+
+# DevTools "Copy as cURL" pastes used to authenticate vms_drift.py. These hold a
+# LIVE VMS session cookie -- it is a working login, not a config value. Broad
+# glob on purpose: these get saved ad hoc with whatever name is convenient.
+*curl*.txt
+*.curl
+vms_frames/
