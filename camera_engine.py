@@ -30,9 +30,17 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 STRICT_TIMEOUT = (3.05, 5.0)
 
-#: Snapshot sizes to try, largest first. A camera on a constrained uplink drops
+#: Snapshot WIDTHS to try, largest first. A camera on a constrained uplink drops
 #: the connection part way through a big JPEG, so falling back to a smaller frame
-#: is the difference between a usable picture and none at all.
+#: is the difference between a usable picture and none at all. Only the width is
+#: fixed -- the height is computed per camera from its OWN aspect ratio, because
+#: asking an Axis for an off-aspect size makes it CROP rather than letterbox (see
+#: AxisHandler._resolution_ladder).
+SNAPSHOT_LADDER_WIDTHS = (1280, 640, 320)
+
+#: Fallback ladder used only when the camera won't tell us its aspect ratio.
+#: These are the 16:9 sizes this tool hard-coded for every camera before the
+#: aspect was read from the device; they remain correct for the 16:9 majority.
 SNAPSHOT_RESOLUTIONS = ("1280x720", "640x360", "320x180")
 MAX_WORKER_THREADS = 15
 
@@ -219,6 +227,11 @@ class CameraHandler:
 
     def fetch_snapshot(self, session, port):
         raise NotImplementedError
+
+    def fallback_size(self, session, port, channel_idx=None):
+        """Canvas size to use when the snapshot failed. Vendors that can report
+        their real frame shape override this; the rest keep their fixed default."""
+        return self.fallback_dim
 
     def fetch_analytics(self, session, port):
         raise NotImplementedError
@@ -533,6 +546,9 @@ class AxisHandler(CameraHandler):
     def __init__(self, ip, user, password):
         super().__init__(ip, user, password)
         self.fallback_dim = (1280, 720)
+        # Raw Properties.Image/ImageSource param text per port. One small read per
+        # unit feeds every sensor's ladder, so a quad-sensor audit pays for it once.
+        self._image_params_cache = {}
 
     # LVT's Axis units are PTZ domes (Q6135-LE) and their AOA scenarios bind to a
     # saved preset -- 143 of 149 scenarios across local fleet backups carry one
@@ -612,6 +628,125 @@ class AxisHandler(CameraHandler):
             return False
         return self.goto_preset(session, port, preset, camera=camera)
 
+    # ---------------------------------------------------------------- aspect ratio
+    #
+    # WHY THIS EXISTS. VAPIX image.cgi honours whatever `resolution=` you ask for,
+    # but when the requested aspect ratio differs from the sensor's it satisfies the
+    # request by CROPPING, not by letterboxing -- and it says nothing about having
+    # done so. This tool used to ask every camera for 16:9 (1280x720). On a 4:3
+    # camera that silently returns the middle 75% of the frame.
+    #
+    # Measured on the P3747-PLVE quad-sensor at 10.23.135.100:5010 (all four
+    # sensors report Sensor.AspectRatio=4:3, and its ONLY offered JPEG sizes are
+    # 4:3): a 1280x720 request returns rows 120..840 of the 960-row frame -- the
+    # top 12.5% and bottom 12.5% of the field of view are gone.
+    #
+    # That breaks BOTH tools, because AOA normalises zone coordinates over the FULL
+    # frame: the audit renders zones onto a picture 1/8th of the scene short at the
+    # top, and the writer converts drawn pixels back to normalised coordinates
+    # against that same short frame, so a pushed zone lands misaligned on the
+    # camera. The zone data was never wrong -- the canvas under it was.
+    #
+    # So: ask the camera what shape its frames are, and build the ladder to match.
+
+    #: param.cgi groups that answer "what shape is this camera's image?".
+    ASPECT_PARAM_GROUPS = "Properties.Image,ImageSource"
+
+    def _image_params(self, session, port):
+        """Raw param.cgi text describing this unit's image geometry, or None.
+
+        Cached per port: ~8KB, read once per unit even for a quad-sensor audit.
+        A failure here is not fatal -- the caller falls back to the legacy ladder."""
+        if port in self._image_params_cache:
+            return self._image_params_cache[port]
+        url = (f"http://{self.ip}:{port}/axis-cgi/param.cgi"
+               f"?action=list&group={self.ASPECT_PARAM_GROUPS}")
+        text = None
+        for auth in self.auth_strategies:
+            try:
+                r = session.get(url, auth=auth, timeout=STRICT_TIMEOUT, verify=False)
+            except requests.exceptions.RequestException:
+                break
+            if r.status_code == 200 and "=" in (r.text or ""):
+                text = r.text
+                break
+            if r.status_code != 401:
+                break   # a non-auth error won't be fixed by the other strategy
+        self._image_params_cache[port] = text
+        return text
+
+    def _native_aspect(self, session, port, channel_idx=None):
+        """(w, h) aspect of the frames this view actually produces, or None.
+
+        `channel_idx` is the 1-based VAPIX `camera=` number; the parameter tree is
+        0-based, so camera=2 is I1. Single-sensor cameras pass None and read the
+        unsuffixed keys."""
+        text = self._image_params(session, port)
+        if not text:
+            return None
+
+        keys = []
+        if channel_idx is not None:
+            view = int(channel_idx) - 1
+            keys += [f"Properties.Image.I{view}.JPEG.Resolution",
+                     f"Properties.Image.I{view}.Resolution"]
+        keys += ["Properties.Image.JPEG.Resolution", "Properties.Image.Resolution"]
+
+        dims = None
+        for key in keys:
+            m = re.search(rf"^root\.{re.escape(key)}=(\d+)x(\d+)", text, re.M)
+            if m:
+                dims = (int(m.group(1)), int(m.group(2)))
+                break
+        if not dims:
+            return None
+
+        # Corridor format: a rotated view delivers transposed frames while the
+        # resolution list stays sensor-native. Every sensor on the verified P3747
+        # reports Rotation=0, so this swap is reasoned-from-the-API rather than
+        # measured -- but getting it wrong the other way (ignoring rotation) is the
+        # exact bug this whole block exists to fix.
+        src = int(channel_idx) - 1 if channel_idx is not None else 0
+        rot = re.search(rf"^root\.ImageSource\.I{src}\.Rotation=(\d+)", text, re.M)
+        if rot and int(rot.group(1)) in (90, 270):
+            dims = (dims[1], dims[0])
+        return dims
+
+    def _resolution_ladder(self, session, port, channel_idx=None):
+        """Snapshot sizes to try, largest first, in THIS camera's aspect ratio.
+
+        A 16:9 camera yields exactly ("1280x720", "640x360", "320x180") -- the sizes
+        this tool always used -- so nothing changes for the PTZ dome fleet. A 4:3
+        camera yields ("1280x960", "640x480", "320x240") instead. Axis scales to any
+        aspect-correct size on request (320x240 = 13KB was verified on the P3747),
+        so the bandwidth step-down still works; it is only the off-aspect sizes that
+        trigger the crop."""
+        aspect = self._native_aspect(session, port, channel_idx)
+        if not aspect:
+            return SNAPSHOT_RESOLUTIONS
+        aw, ah = aspect
+        if aw <= 0 or ah <= 0:
+            return SNAPSHOT_RESOLUTIONS
+        ladder = []
+        for w in SNAPSHOT_LADDER_WIDTHS:
+            h = int(round(w * ah / aw))
+            h -= h % 2          # encoders dislike odd dimensions
+            if h > 0:
+                ladder.append(f"{w}x{h}")
+        return tuple(ladder) or SNAPSHOT_RESOLUTIONS
+
+    def fallback_size(self, session, port, channel_idx=None):
+        """Canvas to draw rules on when the snapshot itself failed. Matching the
+        camera's real aspect keeps those zone-only renders correctly proportioned
+        instead of squashing a 4:3 scene into a 16:9 box."""
+        aspect = self._native_aspect(session, port, channel_idx)
+        if not aspect:
+            return self.fallback_dim
+        aw, ah = aspect
+        w = self.fallback_dim[0]
+        h = int(round(w * ah / aw))
+        return (w, h - (h % 2)) if h > 0 else self.fallback_dim
+
     def fetch_snapshot(self, session, port, channel_idx=None):
         # channel_idx selects a sensor on multi-sensor Axis units (e.g. P3747) via the
         # VAPIX `camera=` query param. Verified against a real P3747 (10.23.135.24:5010):
@@ -631,7 +766,7 @@ class AxisHandler(CameraHandler):
         # reports its rules but never its picture. Step down rather than lose the
         # snapshot entirely -- zones are stored as fractions of the frame, so a
         # smaller capture still draws and pushes correctly, just less sharply.
-        for resolution in SNAPSHOT_RESOLUTIONS:
+        for resolution in self._resolution_ladder(session, port, channel_idx):
             img_url = (f"http://{self.ip}:{port}/axis-cgi/jpg/image.cgi"
                        f"?resolution={resolution}{suffix}")
             result = self._try_snapshot_url(session, img_url)
@@ -1716,7 +1851,7 @@ def process_camera_row(args):
             # Capture background snapshot immediately so auth-restricted analytics cannot block it
             camera_image, snap_url, snap_err, snap_auth_rejected = handler.fetch_snapshot(sess, port)
             if camera_image is None:
-                img_w, img_h = handler.fallback_dim
+                img_w, img_h = handler.fallback_size(sess, port)
                 if snap_auth_rejected:
                     results["logs"].append(f"    [!] Port {port} REJECTED THE LOGIN (HTTP 401) -- wrong Axis username/password for this unit. This is NOT a camera-type/manufacturer problem; re-run with the correct Axis credentials. Defaulting to {img_w}x{img_h} canvas.")
                 else:
@@ -1756,7 +1891,7 @@ def process_camera_row(args):
             # Fetch snapshot: fetch_snapshot will try Channel 201 first and fallback to 101 automatically
             camera_image, snap_url, snap_err, snap_auth_rejected = handler.fetch_snapshot(sess, port)
             if camera_image is None:
-                img_w, img_h = handler.fallback_dim
+                img_w, img_h = handler.fallback_size(sess, port)
                 if snap_auth_rejected:
                     results["logs"].append(f"    [!] Port {port} REJECTED THE LOGIN (HTTP 401) -- wrong Hikvision username/password for this unit. This is NOT a camera-type/manufacturer problem; re-run with the correct Hikvision credentials. Defaulting to {img_w}x{img_h} canvas.")
                 else:
@@ -1785,7 +1920,7 @@ def process_camera_row(args):
                     sensor_auth_rejected = True
 
                 if sensor_img is None:
-                    sensor_img_w, sensor_img_h = handler.fallback_dim
+                    sensor_img_w, sensor_img_h = handler.fallback_size(sess, port, channel_idx=device_id)
                     # Not a miss: this whole branch only runs because the analytics read
                     # SUCCEEDED, so the camera is demonstrably reachable -- one sensor's
                     # image just didn't come back. The rows below say so.
