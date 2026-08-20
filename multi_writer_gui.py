@@ -648,6 +648,16 @@ class MultiWriterApp(WriterApp):
         self._log(f"[*] Now editing {s.label} ({target})"
                   + (f" -- {len(s.existing_scenarios)} existing rule(s)." if s.loaded else "."))
 
+    def _adopt_scenarios(self, scenarios):
+        """Also write the refreshed rules back into the active camera's session, so
+        switching away and back does not resurrect the pre-push baseline and get the
+        operator's next push refused as drift."""
+        super()._adopt_scenarios(scenarios)
+        s = self.sessions.get(self.active)
+        if s is not None:
+            s.existing_scenarios = scenarios
+            s.existing_overlays = self.existing_overlays
+
     # ------------------------------------------------------------------ push all
 
     def _push_all(self):
@@ -695,7 +705,7 @@ class MultiWriterApp(WriterApp):
             results = []
             for s in pending:
                 if self._cancel.is_set():
-                    results.append((s.target, False, "cancelled before this camera"))
+                    results.append((s.target, False, "cancelled before this camera", None))
                     continue
                 try:
                     c_user, c_pass = creds[s.target]
@@ -710,10 +720,17 @@ class MultiWriterApp(WriterApp):
                         direction=s.direction, exclusions=[list(z) for z in s.exclusions],
                         native_id=s.editing,
                         perspective=s.perspective or None)
-                    backup, _verify = adapter.apply_scenario(sc, awg.BACKUP_DIR)
-                    results.append((s.target, True, f"OK (backup {backup.name})"))
+                    backup, _verify = adapter.apply_scenario(
+                        sc, awg.BACKUP_DIR,
+                        expect=vendor_adapter.fingerprint(s.existing_scenarios) or None)
+                    # Re-read so this camera's baseline reflects our own write; without
+                    # it the next push here is refused as somebody else's edit.
+                    fresh = adapter.read_scenarios()
+                    results.append((s.target, True, f"OK (backup {backup.name})", fresh))
+                except vendor_adapter.ConcurrentEditError as e:
+                    results.append((s.target, False, f"NOT WRITTEN -- {e}", None))
                 except Exception as e:                            # noqa: BLE001
-                    results.append((s.target, False, f"{type(e).__name__}: {e}"))
+                    results.append((s.target, False, f"{type(e).__name__}: {e}", None))
             self.msg_queue.put(("push_all_done", results))
         self._cancel.clear()
         self._set_busy(True)
@@ -771,13 +788,18 @@ class MultiWriterApp(WriterApp):
                     self.push_all_button.configure(text="Push ALL edited cameras")
                     ok = [r for r in msg[1] if r[1]]
                     bad = [r for r in msg[1] if not r[1]]
+                    for target, good, _detail, fresh in msg[1]:
+                        if good and fresh is not None:
+                            self.sessions[target].existing_scenarios = fresh
+                            if target == self.active:
+                                self._adopt_scenarios(fresh)
                     self._log(f"[+] Pushed {len(ok)}/{len(msg[1])} camera(s):")
-                    for target, good, detail in msg[1]:
+                    for target, good, detail, _fresh in msg[1]:
                         self._log(f"    {'[+]' if good else '[!]'} {target}: {detail}")
                     if bad:
                         awg.messagebox.showwarning(
                             "Some cameras failed",
-                            "\n".join(f"{t}: {d}" for t, _g, d in bad))
+                            "\n\n".join(f"{t}: {d}" for t, _g, d, _f in bad))
                     self._refresh_tabs()
                 else:
                     self.msg_queue.put(msg)

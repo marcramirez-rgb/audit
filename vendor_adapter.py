@@ -55,6 +55,10 @@ class Scenario:
     # the editor would imply a Push that cannot work.
     read_only: bool = False
     detail: str = ""                # vendor-specific type text, for display only
+    # Object-size filter as TEXT, for vendors whose size filter has no position and
+    # so cannot honestly be drawn as a box (Axis -- see AxisAdapter._axis_size_text).
+    # Hikvision's SizeFilter IS a positioned min/max pair and uses min_size/max_size.
+    size_text: str = ""
 
 
 @dataclass
@@ -81,6 +85,87 @@ class Capabilities:
     # reads as a bug in this tool.
     read_only_reason: str = ""
     notes: str = ""
+
+
+def _join_size_notes(notes):
+    """Collapse repeated identical size notes into one entry with a count.
+
+    Cameras really do carry the same sizePerspective filter twice -- 4 of the 6
+    scenarios on 10.23.0.148:5015 did, from before this tool ever touched them. That
+    is worth showing (it is a genuine oddity in the camera's config, and the writer
+    preserves filters it does not manage rather than tidying them away), but printing
+    the identical sentence twice reads as a bug in the reader."""
+    counts = {}
+    for n in notes:
+        counts[n] = counts.get(n, 0) + 1
+    return "; ".join(n if c == 1 else f"{n} x{c}" for n, c in counts.items())
+
+
+class ConcurrentEditError(RuntimeError):
+    """Raised INSTEAD of writing when the camera's rules no longer match the ones
+    this edit was based on.
+
+    setConfiguration has no per-scenario patch: every write is a read-modify-write
+    of the WHOLE config (see aoa_config's module docstring). That is safe against
+    another writer only for the instant between our read and our write -- it does
+    nothing about the far more common race, which is a SECOND EDITOR holding a copy
+    of the config that predates our pushes and saving it back minutes later.
+
+    The camera's own AOA web page is exactly such an editor: it loads the full config
+    when the page opens and writes the full config on Save, so a browser tab left
+    open on the analytics page silently reverts every zone this tool pushed since the
+    page was loaded. Confirmed in the field on 10.23.0.148:5015 (2026-08-19), where
+    two saves from a stale page rolled six edited zones back to older geometry. The
+    pushes themselves all landed -- readback confirmed each one -- which is exactly
+    why the tool reported OK and the operator saw no change in the web UI.
+
+    The fix cannot be on the write side -- there is nothing to write more carefully.
+    It has to be detection: compare the camera against the state this edit was drawn
+    on top of, and refuse rather than clobber."""
+
+
+# 4 places in [0,1] frame fractions == 0.01% of the frame: far below any edit a
+# human can make by dragging, far above vendor round-trip noise (measured: exactly
+# 0 on Axis, whose only difference was JSON rendering 1.0 as 1).
+_FP_PLACES = 4
+
+
+def _round_points(points):
+    return tuple((round(float(x), _FP_PLACES), round(float(y), _FP_PLACES))
+                 for (x, y) in (points or []))
+
+
+def fingerprint(scenarios):
+    """A comparable snapshot of what a camera's rules ARE, from the neutral
+    Scenario list read_scenarios() returns.
+
+    Keyed by native id as a string because an Axis bidirectional line's id is an
+    AxisLinePair and a Hik rule's is a (channel, sid, ruleId) tuple. Coordinates are
+    rounded to _FP_PLACES: each vendor round-trips them through its own coordinate
+    space, so an untouched zone comes back a few float-ulps different and must not
+    read as an edit."""
+    return {str(s.native_id): (
+        s.name, s.kind, tuple(s.classes or ()), s.duration, s.direction,
+        _round_points(s.points),
+        tuple(_round_points(z) for z in (s.exclusions or [])),
+    ) for s in scenarios}
+
+
+def drifted_rules(expect, actual):
+    """Names of the rules that differ between the fingerprint an edit was based on
+    and the camera's fingerprint now. Empty means nothing else has written.
+
+    A rule that VANISHED counts as drift; one that merely appeared does not -- a new
+    rule added elsewhere does not invalidate geometry drawn on the rules we did see,
+    and blocking on it would make this tool refuse to work alongside any other."""
+    out = []
+    for key, was in expect.items():
+        now = actual.get(key)
+        if now is None:
+            out.append(f"{was[0]} (deleted)")
+        elif now != was:
+            out.append(was[0] if now[0] == was[0] else f"{was[0]} (now '{now[0]}')")
+    return out
 
 
 # ---------------------------------------------------------------- Axis
@@ -150,8 +235,12 @@ class AxisAdapter:
             return None
         return presets[0] if presets else None
 
-    def read_scenarios(self):
-        cfg = self.client.get_config()
+    def read_scenarios(self, cfg=None):
+        """Rules on this camera. `cfg` reuses a getConfiguration response the caller
+        already holds instead of spending another round trip -- the push path reads
+        the config anyway, both to diff against the edit's baseline and to read back
+        what landed."""
+        cfg = self.client.get_config() if cfg is None else cfg
         persp_defs = {p.get("id"): p for p in cfg.get("data", {}).get("perspectives", [])}
         out = []
         for s in cfg.get("data", {}).get("scenarios", []):
@@ -178,7 +267,7 @@ class AxisAdapter:
                         dur = int(d["time"])
                         break
             direction = trig.get("alarmDirection") if s.get("type") == "fence" else None
-            min_size = self._axis_min_size(s.get("filters", []))
+            size_text = self._axis_size_text(s.get("filters", []))
             persp = None
             pids = s.get("perspectives") or []
             if pids and pids[0] in persp_defs:
@@ -187,7 +276,7 @@ class AxisAdapter:
                          for b in persp_defs[pids[0]].get("bars", [])]
             out.append(Scenario(name=s.get("name", ""), kind=kind, points=verts,
                                 classes=classes or ("human",), duration=dur, direction=direction,
-                                exclusions=excl, native_id=s.get("id"), min_size=min_size,
+                                exclusions=excl, native_id=s.get("id"), size_text=size_text,
                                 perspective=persp))
         return self._fold_line_pairs(out)
 
@@ -224,35 +313,75 @@ class AxisAdapter:
                     name=base, kind="line", points=lr.points, classes=lr.classes,
                     duration=lr.duration, direction="both",
                     native_id=AxisLinePair(lr.native_id, rl.native_id),
-                    perspective=lr.perspective, min_size=lr.min_size, max_size=lr.max_size)
+                    perspective=lr.perspective, size_text=lr.size_text)
                 consumed.add(id(rl))
 
         # Rebuild in read order, with each pair sitting where its -LR half was.
         return [merged.get(id(s), s) for s in scenarios if id(s) not in consumed]
 
     @staticmethod
-    def _axis_min_size(filters):
-        """AOA minimum object size as a reference box. sizePercentage is width%/height%
-        with NO position (unlike Hik's positioned boxes), so it's anchored bottom-left
-        purely as a size legend. sizePerspective (real-world cm) can't be scaled without
-        perspective calibration, so it's skipped here."""
-        for f in filters:
-            if f.get("type") == "sizePercentage":
-                w, h = f.get("width", 0) / 100.0, f.get("height", 0) / 100.0
-                if w > 0 and h > 0:
-                    return (0.02, max(0.0, 0.97 - h), w, h)
-        return None
+    def _axis_size_text(filters):
+        """AOA's object-size filter as TEXT, because it cannot honestly be drawn.
+
+        getConfigurationCapabilities (real probe, aoa_probes/) declares exactly two
+        size filters, and both are a MINIMUM expressed as a width/height pair:
+            sizePercentage   3..100      percent of the frame
+            sizePerspective  10..9999    real-world cm, which only means anything
+                                         once the scene is calibrated -- and on AOA
+                                         that calibration IS the perspective height
+                                         bars, not a box
+        Neither carries a position, and neither has a maximum. Drawing one as a
+        positioned "min" rectangle (as this used to) invented a location the camera
+        never gave us, implied a min/max pair AOA does not have, and -- because the
+        writer loaded it into the size editor -- offered a draggable box that no push
+        could ever write, since Axis capabilities set size_boxes=False. Hikvision is
+        the vendor with real positioned boxes; that path still uses min_size/max_size.
+        """
+        return _join_size_notes(
+            f"min object {f['width']}%x{f['height']}% of frame" if f.get("type") == "sizePercentage"
+            else f"min object {f['width']}x{f['height']}cm (perspective bars)"
+            for f in filters
+            if f.get("type") in ("sizePercentage", "sizePerspective")
+            and f.get("width") and f.get("height"))
 
     @staticmethod
     def _to_aoa(points):
         return [(2 * fx - 1, 1 - 2 * fy) for (fx, fy) in points]
 
-    def apply_scenario(self, sc, backup_dir):
+    def _check_no_drift(self, current, expect):
+        """Refuse the write if the camera's rules no longer match `expect`.
+
+        Raised rather than warned: a push is a whole-config write, so going ahead
+        would overwrite whatever the other editor did with a config assembled from
+        rules the operator has not seen."""
+        drift = drifted_rules(expect, fingerprint(self.read_scenarios(current)))
+        if not drift:
+            return
+        raise ConcurrentEditError(
+            "This camera's analytics changed after you loaded it, so pushing now "
+            "would overwrite those changes with what was on screen.\n\n"
+            "Changed since you loaded: " + ", ".join(drift) + "\n\n"
+            "The usual cause is the camera's own web page open in a browser: it saves "
+            "the WHOLE analytics config, so its Save reverts every zone pushed since "
+            "that page was loaded. Close the camera's analytics page, then use "
+            "'Read Current Config' here to reload the rules and redo this edit.")
+
+    def apply_scenario(self, sc, backup_dir, expect=None):
         """Create or edit-in-place. If sc.native_id matches an existing scenario, patch
         it (preserving perspective/presets/filters); otherwise build a new one. If
         sc.perspective is set, its calibration bars are written to the top-level
-        perspectives and linked to the scenario (updating the existing one when editing)."""
+        perspectives and linked to the scenario (updating the existing one when editing).
+
+        `expect` is the fingerprint() of the rules this edit was drawn on top of. When
+        given, the camera is compared against it first and a ConcurrentEditError is
+        raised -- BEFORE anything is written -- if another editor has changed the rules
+        since. Omitting it keeps the old unguarded behaviour."""
         _require(self.capabilities, sc)
+        # One read serves three jobs below (drift check, locating the scenario being
+        # edited, and nothing else needing a second round trip), so take it once.
+        current = self.client.get_config() if expect is not None else None
+        if current is not None:
+            self._check_no_drift(current, expect)
         # Bidirectional lines (and any edit of one) need two scenarios written together,
         # so they take their own path.
         if sc.kind == "line" and (sc.direction == "both" or isinstance(sc.native_id, AxisLinePair)):
@@ -262,7 +391,8 @@ class AxisAdapter:
 
         orig = None
         if sc.native_id is not None:
-            current = self.client.get_config()
+            if current is None:
+                current = self.client.get_config()
             orig = next((s for s in current.get("data", {}).get("scenarios", [])
                          if s.get("id") == sc.native_id), None)
 
@@ -281,7 +411,11 @@ class AxisAdapter:
         else:
             scenario = aoa_config.build_intrusion(sc.name, verts, classes=sc.classes,
                                                   device_id=self.device_id or 1)
-        if excl and sc.kind != "line":
+        # CREATE ONLY. On the edit path update_scenario_geometry has already replaced
+        # the scenario's excludeArea filters with `excl`; appending here as well wrote
+        # every drawn exclusion zone TWICE -- silently at 1-2 zones, and at 3 it broke
+        # the push outright on AOA's cap of 5 ("at most 5 exclusion zones per scenario").
+        if orig is None and excl and sc.kind != "line":
             aoa_config.add_exclude_zones(scenario, excl)
 
         if orig is None:
@@ -444,7 +578,9 @@ class PerimeterDefenderAdapter:
                          native_id=None, read_only=True, detail=r["pd_type"])
                 for r in pd_config.merge(zones, scenarios)]
 
-    def apply_scenario(self, sc, backup_dir):
+    def apply_scenario(self, sc, backup_dir, expect=None):
+        # `expect` is accepted so callers need no vendor branch; there is no write
+        # to guard against a concurrent editor here, because there is no write.
         raise PDWriteUnsupported(self.capabilities.read_only_reason)
 
     def backup(self, backup_dir):
@@ -609,11 +745,29 @@ class HikAdapter:
                                 max_size=_size_rect(ri, "MaxObjectSize")))
         return out
 
-    def apply_scenario(self, sc, backup_dir):
+    def apply_scenario(self, sc, backup_dir, expect=None):
         """Add or edit-in-place (upsert by ruleName). Cannot delete on this firmware.
         Editing patches the existing rule in place so its SizeFilter (min/max object
-        size) and other settings are preserved, not rebuilt away."""
+        size) and other settings are preserved, not rebuilt away.
+
+        `expect` is the fingerprint() of the rules this edit was drawn on top of; a
+        mismatch raises ConcurrentEditError before anything is written. A PUT here
+        replaces a whole behaviorRule DOCUMENT (all of that scene's rules at once),
+        so a second editor holding a stale copy of it clobbers exactly the way the
+        Axis web page does -- see ConcurrentEditError. The check costs one extra
+        document scan, paid once per push."""
         _require(self.capabilities, sc)
+        if expect is not None:
+            drift = drifted_rules(expect, fingerprint(self.read_scenarios()))
+            if drift:
+                raise ConcurrentEditError(
+                    "This camera's analytics changed after you loaded it, so pushing "
+                    "now would overwrite those changes with what was on screen.\n\n"
+                    "Changed since you loaded: " + ", ".join(drift) + "\n\n"
+                    "The usual cause is the camera's own web page open in a browser: "
+                    "saving there rewrites every rule in that scene at once. Close the "
+                    "camera's analytics page, then use 'Read Current Config' here to "
+                    "reload the rules and redo this edit.")
         region_hik = [(_hik_coord(fx), _hik_coord(1 - fy)) for (fx, fy) in sc.points]
         target = _classes_to_hik_target(sc.classes)
         direction = _NEUTRAL_DIR_TO_HIK.get(sc.direction, "left-right")

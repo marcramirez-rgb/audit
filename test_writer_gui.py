@@ -228,6 +228,44 @@ def test_a_fully_read_only_camera_still_refuses_and_explains(app):
 
 # --------------------------------------------------------------------------- #
 
+def test_axis_gets_no_draggable_size_box(app):
+    """AOA has no positioned size box -- its size filter is a scalar minimum and its
+    spatial calibration is the perspective height bars. Selecting an Axis rule must
+    not put a draggable "min" rectangle on the canvas: Axis capabilities set
+    size_boxes=False, so the size editor is hidden and no push could ever write it."""
+    _reset(app)
+    app.mfg_var.set("Axis")
+    sc = vendor_adapter.Scenario(
+        name="Scene1_V_10s", kind="intrusion", points=[(.1, .1), (.1, .5), (.5, .5)],
+        classes=("vehicle",), native_id=2,
+        size_text="min object 75x75cm (perspective bars)",
+        perspective=[{"height": 183, "points": [(.2, .8), (.2, .6)]},
+                     {"height": 183, "points": [(.7, .9), (.7, .7)]}])
+    app.existing_scenarios = [sc]
+    app.edit_label_map = {sc.name: sc}
+    app._on_edit_select(sc.name)
+    assert app.edit_size == [], f"Axis grew a size box: {app.edit_size}"
+    assert len(app.perspective_bars) == 2, app.perspective_bars
+    return "no size box; both perspective bars kept"
+
+
+def test_hikvision_keeps_its_real_size_boxes(app):
+    """Hikvision's SizeFilter genuinely IS a positioned min/max pair, so the gate
+    must not take those away."""
+    _reset(app)
+    app.mfg_var.set("Hikvision")
+    sc = vendor_adapter.Scenario(
+        name="RULE1", kind="intrusion", points=[(.1, .1), (.1, .5), (.5, .5)],
+        classes=("human",), native_id=("1", 1, 1),
+        min_size=(.1, .8, .05, .05), max_size=(.6, .2, .3, .4))
+    app.existing_scenarios = [sc]
+    app.edit_label_map = {sc.name: sc}
+    app._on_edit_select(sc.name)
+    labels = sorted(lbl for _r, lbl in app.edit_size)
+    assert labels == ["max", "min"], f"Hik lost its size boxes: {app.edit_size}"
+    return "min + max boxes still editable on Hikvision"
+
+
 def main() -> int:
     tests = [(name, fn) for name, fn in sorted(globals().items())
              if name.startswith("test_") and callable(fn)]

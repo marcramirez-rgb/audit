@@ -907,17 +907,28 @@ class AxisHandler(CameraHandler):
                     if len(pts) >= 2:
                         bars.append({"points": pts, "label": f"{b.get('height')}cm"})
 
-            # Minimum object size (sizePercentage = width%/height%, no position) shown as
-            # a bottom-left reference box. sizePerspective (real-world cm) needs calibration
-            # to scale, so it isn't drawn here.
+            # Minimum object size, as a NOTE rather than a box. AOA's two size filters
+            # (sizePercentage = percent of frame, sizePerspective = real-world cm) are
+            # both a minimum width/height pair with NO position and no maximum, so the
+            # bottom-left rectangle this used to draw was a location the camera never
+            # reported -- and it read as a configured box next to Hikvision's real ones.
+            # AOA's actual spatial calibration is the perspective height bars, drawn above.
             size_boxes = []
+            counts = {}
             for f in scenario.get("filters", []):
+                w, h = f.get("width"), f.get("height")
+                if not (w and h):
+                    continue
                 if f.get("type") == "sizePercentage":
-                    w, h = f.get("width", 0), f.get("height", 0)
-                    if w and h:
-                        wpx, hpx = int(w / 100.0 * img_w), int(h / 100.0 * img_h)
-                        x0, y1 = int(0.02 * img_w), int(0.97 * img_h)
-                        size_boxes.append({"box": (x0, y1 - hpx, x0 + wpx, y1), "label": "min size"})
+                    note = f"min object {w}%x{h}% of frame"
+                elif f.get("type") == "sizePerspective":
+                    note = f"min object {w}x{h}cm"
+                else:
+                    continue
+                # A camera can hold the same size filter twice (seen in the field);
+                # count it rather than repeating the sentence.
+                counts[note] = counts.get(note, 0) + 1
+            size_note = "; ".join(n if c == 1 else f"{n} x{c}" for n, c in counts.items())
 
             # Line-crossing direction (fence alarmDirection: leftToRight / rightToLeft).
             direction = triggers[0].get("alarmDirection") if triggers and triggers[0].get("type") == "fence" else None
@@ -933,6 +944,7 @@ class AxisHandler(CameraHandler):
             parsed_rules.append({"is_placeholder": False, "name": rule_name, "type": rule_type,
                                  "duration": duration_val, "target": target_detection,
                                  "vertices": vertices, "bars": bars, "size_boxes": size_boxes,
+                                 "size_note": size_note,
                                  "direction": direction, "devices": scenario_devices})
         return parsed_rules
 
@@ -987,7 +999,7 @@ def _draw_crossing_direction(draw, p0, p1, direction):
 
 
 def render_overlay_image(camera_image, vertices, index, img_w, img_h, rule_type="",
-                         size_boxes=None, bars=None, direction=None):
+                         size_boxes=None, bars=None, direction=None, size_note=""):
     snapshot_missing = (camera_image is None)
     if camera_image is not None:
         base_img = camera_image.copy().convert("RGBA")
@@ -1121,6 +1133,12 @@ def render_overlay_image(camera_image, vertices, index, img_w, img_h, rule_type=
         for (bx, by) in pts:
             draw.line([(bx - 6, by), (bx + 6, by)], fill=(81, 207, 102, 255), width=3)
         draw.text((pts[0][0] + 6, pts[0][1]), bar.get("label", ""), fill=(81, 207, 102, 255), font=label_font)
+
+    # Size filters that carry no position (Axis) are written as a caption instead of
+    # being drawn somewhere arbitrary -- the reader still learns the minimum object
+    # size without being shown a box the camera never placed.
+    if size_note:
+        draw.text((8, img_h - 16), size_note, fill=(177, 151, 252, 255), font=label_font)
 
     if snapshot_missing:
         try:
@@ -1660,7 +1678,8 @@ def process_camera_row(args):
             for index, rule in enumerate(rules):
                 try:
                     img_buf = render_overlay_image(camera_image, rule["vertices"], index, img_w, img_h, rule["type"],
-                                                       size_boxes=rule.get("size_boxes"), bars=rule.get("bars"), direction=rule.get("direction"))
+                                                       size_boxes=rule.get("size_boxes"), bars=rule.get("bars"), direction=rule.get("direction"),
+                                                       size_note=rule.get("size_note", ""))
                     display_name = rule["name"]
                     if camera_image is None:
                         display_name = f"Snapshot Failed: {display_name}"
@@ -1787,7 +1806,8 @@ def process_camera_row(args):
                         display_name = f"Snapshot Failed: {display_name}"
                     try:
                         img_buf = render_overlay_image(sensor_img, rule["vertices"], index, sensor_img_w, sensor_img_h, rule["type"],
-                                                         size_boxes=rule.get("size_boxes"), bars=rule.get("bars"), direction=rule.get("direction"))
+                                                         size_boxes=rule.get("size_boxes"), bars=rule.get("bars"), direction=rule.get("direction"),
+                                                         size_note=rule.get("size_note", ""))
                         add_main_row({
                             "data": [client_name, location, serial, sensor_pos, display_name, rule["type"], rule["target"], rule["duration"]],
                             "bg": bg_color, "img": img_buf, "err": ""
@@ -1843,7 +1863,8 @@ def process_camera_row(args):
                 display_name = f"Snapshot Failed: {display_name}"
             try:
                 img_buf = render_overlay_image(camera_image, rule["vertices"], index, img_w, img_h, rule["type"],
-                                                       size_boxes=rule.get("size_boxes"), bars=rule.get("bars"), direction=rule.get("direction"))
+                                                       size_boxes=rule.get("size_boxes"), bars=rule.get("bars"), direction=rule.get("direction"),
+                                                       size_note=rule.get("size_note", ""))
                 add_main_row({
                     "data": [client_name, location, serial, pos, display_name, rule["type"], rule["target"], rule["duration"]],
                     "bg": bg_color, "img": img_buf, "err": ""

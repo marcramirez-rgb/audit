@@ -1361,7 +1361,12 @@ class WriterApp(ctk.CTk):
         self.points = [self._frac_to_canvas(fx, fy) for (fx, fy) in sc.points]
         self.exclude_zones = [[self._frac_to_canvas(fx, fy) for (fx, fy) in z] for z in sc.exclusions]
         self.current_exclude = []
-        self.edit_size = [(r, lbl) for r, lbl in ((sc.min_size, "min"), (sc.max_size, "max")) if r]
+        # Only for vendors whose size filter really IS a positioned box the push can
+        # write back (Hikvision). Axis reports a size filter with no position and no
+        # maximum, and its size editor is hidden -- loading one anyway put a draggable
+        # rectangle on the canvas that could never be pushed or cleared.
+        self.edit_size = ([(r, lbl) for r, lbl in ((sc.min_size, "min"), (sc.max_size, "max")) if r]
+                          if self._caps().size_boxes else [])
         self.perspective_bars = [{"height": b.get("height"),
                                   "points": [self._frac_to_canvas(fx, fy) for (fx, fy) in b.get("points", [])]}
                                  for b in (sc.perspective or [])]
@@ -1372,6 +1377,9 @@ class WriterApp(ctk.CTk):
         extras = []
         if self.edit_size:
             extras.append("min/max size")
+        elif sc.size_text:
+            # Axis: real config, but a scalar filter -- say it, do not draw it.
+            extras.append(sc.size_text)
         if self.perspective_bars:
             extras.append(f"{len(self.perspective_bars)} perspective bar(s)")
         msg = (" Showing " + ", ".join(extras) + ".") if extras else ""
@@ -1395,7 +1403,10 @@ class WriterApp(ctk.CTk):
             ch, sid, rid = s.native_id
             loc_txt = f" @ch{ch}/s{sid}/r{rid}"
 
-        size_txt = " size[min/max]" if (s.min_size or s.max_size) else ""
+        if s.min_size or s.max_size:
+            size_txt = " size[min/max]"          # positioned boxes (Hikvision)
+        else:
+            size_txt = f" {s.size_text}" if s.size_text else ""
         dir_txt = f" dir={s.direction}" if s.kind == "line" and s.direction else ""
         # Perimeter Defender has its own scenario vocabulary (intrusion / loitering /
         # zone-crossing / conditional), richer than the three kinds this tool draws.
@@ -1503,6 +1514,27 @@ class WriterApp(ctk.CTk):
                 self.msg_queue.put(("log", f"[!] Snapshot failed: {e}"))
         self._run_bg(work)
 
+    @staticmethod
+    def _overlays_for(scenarios):
+        """Gold-overlay dicts for a list of neutral Scenarios. Shared by the read path
+        and the push path -- after a write the overlay must show what is now ON the
+        camera, not the geometry that was there when the camera was loaded."""
+        overlays = []
+        for s in scenarios:
+            overlays.append({"name": s.name, "kind": "fence" if s.kind == "line" else "area",
+                             "verts": s.points,
+                             "direction": s.direction if s.kind == "line" else None})
+            for ex in s.exclusions:
+                overlays.append({"name": f"{s.name} (exclude)", "kind": "exclude", "verts": ex})
+            if s.min_size:
+                overlays.append({"name": f"{s.name} min", "kind": "size", "rect": s.min_size})
+            if s.max_size:
+                overlays.append({"name": f"{s.name} max", "kind": "size", "rect": s.max_size})
+            for bar in (s.perspective or []):
+                overlays.append({"name": f"{bar.get('height')}cm", "kind": "bar",
+                                 "verts": bar.get("points", [])})
+        return overlays
+
     def _read_config(self):
         adapter = self._make_adapter()
         if not adapter:
@@ -1516,23 +1548,9 @@ class WriterApp(ctk.CTk):
                     snap_log = lambda m: self.msg_queue.put(("log", m))
                     self.msg_queue.put(("snapshot", adapter.fetch_snapshot(log=snap_log)))
                 scenarios = adapter.read_scenarios()
-                overlays = []
                 lines = [f"[+] {len(scenarios)} scenario(s) configured:"]
-                for s in scenarios:
-                    ov_kind = "fence" if s.kind == "line" else "area"
-                    overlays.append({"name": s.name, "kind": ov_kind, "verts": s.points,
-                                     "direction": s.direction if s.kind == "line" else None})
-                    for ex in s.exclusions:
-                        overlays.append({"name": f"{s.name} (exclude)", "kind": "exclude", "verts": ex})
-                    if s.min_size:
-                        overlays.append({"name": f"{s.name} min", "kind": "size", "rect": s.min_size})
-                    if s.max_size:
-                        overlays.append({"name": f"{s.name} max", "kind": "size", "rect": s.max_size})
-                    for bar in (s.perspective or []):
-                        overlays.append({"name": f"{bar.get('height')}cm", "kind": "bar",
-                                         "verts": bar.get("points", [])})
-                    lines.append(self._scenario_log_line(s))
-                self.msg_queue.put(("overlays", overlays, lines, scenarios))
+                lines += [self._scenario_log_line(s) for s in scenarios]
+                self.msg_queue.put(("overlays", self._overlays_for(scenarios), lines, scenarios))
             except Exception as e:
                 self.msg_queue.put(("log", f"[!] Read failed: {e}"))
         self._run_bg(work)
@@ -2359,14 +2377,41 @@ class WriterApp(ctk.CTk):
         self._log(f"[*] Backing up + pushing '{sc.name}' to {adapter.vendor} {ip}:{port} ...")
         backup_dir = HIK_BACKUP_DIR if adapter.vendor == "Hikvision" else BACKUP_DIR
 
+        # What this edit was drawn on top of. apply_scenario compares the camera
+        # against it and refuses rather than overwriting a change made elsewhere --
+        # see vendor_adapter.ConcurrentEditError. Empty (nothing read yet) skips the
+        # check: there is no baseline to be stale.
+        expect = vendor_adapter.fingerprint(self.existing_scenarios) or None
+
         def work():
             try:
-                backup_path, _verify = adapter.apply_scenario(sc, backup_dir)
-                names = [s.name for s in adapter.read_scenarios()]
-                self.msg_queue.put(("push_done", Path(backup_path).name, names))
+                backup_path, _verify = adapter.apply_scenario(sc, backup_dir, expect=expect)
+                # This read already happened before the guard existed (it produced the
+                # "Scenarios now:" list), so re-basing the guard on it is free. Without
+                # it the NEXT push would see our OWN successful write as drift.
+                fresh = adapter.read_scenarios()
+                self.msg_queue.put(("push_done", Path(backup_path).name,
+                                    [s.name for s in fresh], fresh))
+            except vendor_adapter.ConcurrentEditError as e:
+                self.msg_queue.put(("push_stale", str(e)))
             except Exception as e:
                 self.msg_queue.put(("push_err", str(e)))
         self._run_bg(work)
+
+    def _adopt_scenarios(self, scenarios):
+        """Make `scenarios` the tool's picture of this camera: the gold overlay, the
+        'Edit existing' list, and the baseline the next push is checked against.
+
+        Called after every successful push. Skipping it is not cosmetic -- the drift
+        guard would then compare the camera against a baseline predating our own
+        write and refuse the operator's next push as somebody else's edit."""
+        self.existing_scenarios = scenarios
+        self.existing_overlays = self._overlays_for(scenarios)
+        self.edit_label_map = self._build_edit_labels(scenarios)
+        # The selection is left alone: the operator is usually still on the rule they
+        # just pushed, and re-setting edit_var would reload the canvas under them.
+        self.edit_menu.configure(values=[NEW_SCENARIO] + list(self.edit_label_map.keys()))
+        self._redraw()
 
     def _restore_backup(self):
         if not self._caps().can_delete:
@@ -2468,9 +2513,18 @@ class WriterApp(ctk.CTk):
                             self._log(f"[+] Overlaid {len(overlays)} existing zone(s) in gold. "
                                       f"Pick one from 'Edit existing' to modify it, or draw a new one.")
                 elif msg[0] == "push_done":
-                    _, backup_name, names = msg
+                    _, backup_name, names, fresh = msg
                     self.push_button.configure(state="normal", text="Push to Camera")
-                    self._log(f"[+] Pushed OK. Backup: {backup_name}. Scenarios now: {names}")
+                    self._adopt_scenarios(fresh)
+                    self._log(f"[+] Pushed OK and read back. Backup: {backup_name}. "
+                              f"Scenarios now: {names}")
+                elif msg[0] == "push_stale":
+                    # Nothing was written -- this is a refusal, not a failed write, and
+                    # saying "Push failed" would send someone hunting for a camera fault.
+                    self.push_button.configure(state="normal", text="Push to Camera")
+                    self._log("[!] Push refused -- the camera changed since you loaded it. "
+                              "Nothing was written.")
+                    messagebox.showwarning("Camera changed since you loaded it", msg[1])
                 elif msg[0] == "push_err":
                     self.push_button.configure(state="normal", text="Push to Camera")
                     self._log(f"[!] Push failed: {msg[1]}")
