@@ -40,6 +40,10 @@ LVT_LOG_BG = ui_theme.LVT_LOG_BG
 LVT_LOG_TEXT = ui_theme.LVT_LOG_TEXT
 LVT_WHITE = ui_theme.LVT_WHITE      # literal white: text that sits ON teal, both modes
 
+# Labels for the report-layout toggle; also the values persisted in ui_prefs.json.
+LAYOUT_TABS = ui_theme.LAYOUT_TABS
+LAYOUT_SINGLE = ui_theme.LAYOUT_SINGLE
+
 WIN_W, WIN_H = 980, 950          # preferred window size, clamped to the actual screen
 WIN_MIN_W, WIN_MIN_H = 820, 730  # smallest window that still fits every stacked section.
                                  # Measured against the CONTENT-SIZED tabs (Single/CSV),
@@ -611,24 +615,40 @@ class App(ctk.CTk):
     def _build_controls(self):
         frame = ctk.CTkFrame(self, fg_color="transparent")
         frame.grid(row=ROW_CONTROLS, column=0, sticky="ew", padx=20, pady=(4, 8))
-        frame.grid_columnconfigure(0, weight=1)
+        frame.grid_columnconfigure(2, weight=1)
 
         self.start_button = ctk.CTkButton(frame, text="Start Processing", command=self._start_processing,
                                            fg_color=LVT_DARK_TEAL, hover_color=LVT_DARK_TEAL_HOVER, text_color=LVT_WHITE,
                                            font=ctk.CTkFont(size=14, weight="bold"), height=40)
         self.start_button.grid(row=0, column=0, sticky="w")
 
+        # How the finished workbook is arranged -- a tab per location, or every camera
+        # on one sheet. Presentation only: the same cameras get audited either way, so
+        # this is safe to flip between runs. Rides on the same row as the buttons so it
+        # costs no extra height, and persists like the appearance choice does.
+        ctk.CTkLabel(frame, text="Report layout:", text_color=LVT_TEXT_MUTED,
+                     font=ctk.CTkFont(size=12)).grid(row=0, column=1, sticky="e", padx=(18, 6))
+        self.layout_var = tk.StringVar(value=ui_theme.load_report_layout())
+        self.layout_toggle = ctk.CTkSegmentedButton(
+            frame, values=[LAYOUT_TABS, LAYOUT_SINGLE], variable=self.layout_var,
+            command=ui_theme.save_report_layout, height=32, font=ctk.CTkFont(size=12),
+            selected_color=LVT_DARK_TEAL, selected_hover_color=LVT_DARK_TEAL_HOVER,
+            unselected_color=LVT_TEAL, unselected_hover_color=LVT_TEAL_HOVER,
+            text_color=LVT_WHITE,
+        )
+        self.layout_toggle.grid(row=0, column=2, sticky="w")
+
         self.open_folder_button = ctk.CTkButton(frame, text="Open Report Folder", command=self._open_report_folder,
                                                  fg_color=LVT_TEAL, hover_color=LVT_TEAL_HOVER, text_color=LVT_WHITE,
                                                  state="disabled", height=40)
-        self.open_folder_button.grid(row=0, column=1, sticky="e", padx=(8, 0))
+        self.open_folder_button.grid(row=0, column=3, sticky="e", padx=(8, 0))
 
         self.progress_bar = ctk.CTkProgressBar(frame, progress_color=LVT_TEAL)
         self.progress_bar.set(0)
-        self.progress_bar.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(10, 2))
+        self.progress_bar.grid(row=1, column=0, columnspan=4, sticky="ew", pady=(10, 2))
 
         self.progress_label = ctk.CTkLabel(frame, text="Idle", text_color=LVT_TEXT_MUTED)
-        self.progress_label.grid(row=2, column=0, columnspan=2, sticky="w")
+        self.progress_label.grid(row=2, column=0, columnspan=4, sticky="w")
 
         self.last_report_path = None
 
@@ -801,20 +821,29 @@ class App(ctk.CTk):
         self.progress_bar.set(0)
         self.progress_label.configure(text="Starting...")
         self.start_button.configure(state="disabled", text="Processing...")
+        # Lock the layout toggle for the duration: the run already froze its value, so
+        # leaving it live would let the button disagree with the report being written.
+        self.layout_toggle.configure(state="disabled")
         self.open_folder_button.configure(state="disabled")
 
+        # Read the toggle here, on the main thread: Tk variables are not safe to
+        # touch from the worker, and this also freezes the choice for the run so
+        # flipping it mid-batch can't change the layout out from under it.
+        split_by_location = self.layout_var.get() == LAYOUT_TABS
+
         self.worker_thread = threading.Thread(
-            target=self._run_worker, args=(camera_rows, credentials, base_filename), daemon=True
+            target=self._run_worker, args=(camera_rows, credentials, base_filename, split_by_location), daemon=True
         )
         self.worker_thread.start()
 
-    def _run_worker(self, camera_rows, credentials, base_filename):
+    def _run_worker(self, camera_rows, credentials, base_filename, split_by_location):
         try:
             output_dir = camera_engine.default_output_dir()
             path = camera_engine.run_batch(
                 camera_rows, credentials, output_dir, base_filename,
                 log_cb=lambda line: self.msg_queue.put(("log", line)),
                 progress_cb=lambda done, total: self.msg_queue.put(("progress", done, total)),
+                split_by_location=split_by_location,
             )
             self.msg_queue.put(("done", path))
         except Exception as e:
@@ -908,11 +937,13 @@ class App(ctk.CTk):
     def _on_run_complete(self, output_path):
         self.last_report_path = output_path
         self.start_button.configure(state="normal", text="Start Processing")
+        self.layout_toggle.configure(state="normal")
         self.open_folder_button.configure(state="normal")
         self.progress_label.configure(text=f"Done -- report saved as {output_path.name}")
 
     def _on_run_error(self, error_text):
         self.start_button.configure(state="normal", text="Start Processing")
+        self.layout_toggle.configure(state="normal")
         self.progress_label.configure(text="Failed -- see log for details")
         self._append_log(f"\n[!] FATAL ERROR: {error_text}")
         messagebox.showerror("Processing failed", f"An error stopped the run:\n\n{error_text}")

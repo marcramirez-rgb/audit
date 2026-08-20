@@ -102,14 +102,19 @@ looks off (e.g. a port's data looking wrong for the vendor label it got).
 Build the command from `scripts/run_audit.py` in this skill's folder:
 
 ```
-python <skill_dir>/scripts/run_audit.py --ip <ip> --manufacturer <axis|hikvision|mixed> [--client "..."] [--location "..."] [--serial "..."] [--tag "<job name>"]
+python <skill_dir>/scripts/run_audit.py --ip <ip> --manufacturer <axis|hikvision|mixed> [--client "..."] [--location "..."] [--serial "..."] [--tag "<job name>"] [--single-sheet]
 ```
 
 or, for CSV batch mode:
 
 ```
-python <skill_dir>/scripts/run_audit.py --csv "<path/to/file.csv>" [--tag "<job name>"]
+python <skill_dir>/scripts/run_audit.py --csv "<path/to/file.csv>" [--tag "<job name>"] [--single-sheet]
 ```
+
+By default the analytics are split into one worksheet tab per location. Pass
+`--single-sheet` only if the user asks for everything on one spreadsheet -- it
+changes the layout alone, not which cameras are audited, and the global Missed
+Cameras tab is there either way.
 
 Launch it in a new window so the credential prompts are genuinely interactive.
 On Windows, from PowerShell:

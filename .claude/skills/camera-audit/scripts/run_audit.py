@@ -118,6 +118,11 @@ def main():
     parser.add_argument("--location", help="Location name (single-camera mode only).")
     parser.add_argument("--serial", help="Unit serial (single-camera mode only).")
     parser.add_argument("--tag", help="Custom tag/job name used in the output filename.")
+    parser.add_argument("--single-sheet", action="store_true",
+                        help="Put every camera on one 'Camera Analytics' sheet instead of "
+                             "splitting the analytics into a tab per location. Presentation "
+                             "only -- the same cameras are audited either way, and the global "
+                             "Missed Cameras tab is unaffected.")
     args = parser.parse_args()
 
     if args.ip and not args.manufacturer:
@@ -168,7 +173,8 @@ def _run(args):
     credentials = prompt_credentials(needs_axis, needs_hik)
 
     output_dir = camera_engine.default_output_dir()
-    final_path = camera_engine.run_batch(camera_rows, credentials, output_dir, base_filename, log_cb=print)
+    final_path = camera_engine.run_batch(camera_rows, credentials, output_dir, base_filename, log_cb=print,
+                                         split_by_location=not args.single_sheet)
 
     print(f"\n[DONE] Report written to: {final_path}")
     print("[*] Opening results folder...")

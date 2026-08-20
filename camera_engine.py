@@ -1221,6 +1221,9 @@ MAIN_HEADERS = ["Client Name", "Location", "Live Unit Serial", "Camera Position"
                 "Rule Visual Overlay Thumbnail"]
 MAIN_WIDTHS = [22, 24, 22, 16, 20, 20, 20, 14, 95]
 
+# Tab name for the undivided analytics sheet (run_batch's split_by_location=False).
+COMBINED_SHEET_TITLE = "Camera Analytics"
+
 
 def _safe_sheet_title(name, used_titles):
     """Excel-worksheet-title-safe version of a location name: strip the characters
@@ -1284,11 +1287,22 @@ def add_location_sheet(wb, location_label, timeline_text, used_titles):
     return _style_analytics_sheet(ws, location_label, timeline_text)
 
 
+def add_combined_sheet(wb, timeline_text):
+    """Create and style the one flat analytics worksheet used when the report is NOT
+    split per location -- same columns, same styling, just undivided. Every row still
+    names its own Client and Location (columns 1 and 2), so flattening costs the tabs
+    and nothing else; a reader who wants the grouping back can sort or filter on
+    Location. Callers pick between this and add_location_sheet via run_batch's
+    split_by_location."""
+    ws = wb.create_sheet(title=COMBINED_SHEET_TITLE)
+    return _style_analytics_sheet(ws, "All Locations", timeline_text)
+
+
 def create_master_workbook():
     """Build the workbook with just the global 'Missed Cameras' sheet. The analytics
-    data is split into one tab per unique location, and those sheets are created on
-    demand during the batch run via add_location_sheet() -- so this no longer creates
-    a single 'Camera Analytics' sheet up front.
+    sheets are created on demand during the batch run -- one per unique location via
+    add_location_sheet(), or a single flat one via add_combined_sheet() when the
+    caller turns off run_batch's split_by_location -- so nothing is created up front.
 
     The Missed sheet lists only ports that returned NOTHING (no snapshot and no
     analytics). Cameras that answered -- including ones with no analytics configured --
@@ -1862,13 +1876,18 @@ def process_camera_row(args):
     return results
 
 
-def run_batch(camera_rows, credentials, output_dir, base_filename, log_cb=None, progress_cb=None):
+def run_batch(camera_rows, credentials, output_dir, base_filename, log_cb=None, progress_cb=None,
+              split_by_location=True):
     """Runs the full batch: spins up the thread pool, processes every row, writes
     the Excel report, and returns the saved Path.
 
     credentials: dict with any of AXIS_USER/AXIS_PASS/HIK_USER/HIK_PASS.
     log_cb(str): called for every line of progress output (defaults to a no-op).
     progress_cb(done, total): called after each row finishes (defaults to a no-op).
+    split_by_location: True (default) gives each location its own analytics tab;
+        False puts every camera on one flat "Camera Analytics" sheet. Presentation
+        only -- the same cameras are audited and the same rows are written either
+        way, and the global Missed Cameras tab is unaffected.
     """
     log = log_cb or (lambda _msg: None)
     report_progress = progress_cb or (lambda _done, _total: None)
@@ -1883,14 +1902,17 @@ def run_batch(camera_rows, credentials, output_dir, base_filename, log_cb=None, 
 
     # One analytics tab per unique location, created on demand. Each entry tracks
     # its worksheet and the next free row on that sheet (data starts at row 4).
+    # With split_by_location off, every location keys to the same single sheet, so
+    # the write loop below stays identical -- it never has to know which mode it is in.
     timeline_text = f"Batch Processing Timeline Context: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
     loc_sheets = {}
     used_titles = set()
 
     def get_location_sheet(loc):
-        key = (loc or "").strip() or "Unspecified Location"
+        key = ((loc or "").strip() or "Unspecified Location") if split_by_location else COMBINED_SHEET_TITLE
         if key not in loc_sheets:
-            ws = add_location_sheet(wb, key, timeline_text, used_titles)
+            ws = (add_location_sheet(wb, key, timeline_text, used_titles) if split_by_location
+                  else add_combined_sheet(wb, timeline_text))
             loc_sheets[key] = {"ws": ws, "row": 4}
         return loc_sheets[key]
 
@@ -1970,7 +1992,7 @@ def run_batch(camera_rows, credentials, output_dir, base_filename, log_cb=None, 
             done_count += 1
             report_progress(done_count, total_cameras)
 
-    # Keep the global Missed Cameras tab last so the report opens on a location tab.
+    # Keep the global Missed Cameras tab last so the report opens on an analytics tab.
     missed = wb["Missed Cameras"]
     wb._sheets.remove(missed)
     wb._sheets.append(missed)
@@ -1987,6 +2009,7 @@ def run_batch(camera_rows, credentials, output_dir, base_filename, log_cb=None, 
     log(f"=================================================================")
     log(f" -> Total Run Duration: {minutes}m {seconds}s ({round(elapsed_seconds, 2)} total seconds)")
     log(f" -> Threads Utilized: {active_worker_count}")
+    log(f" -> Report Layout: {'one tab per location' if split_by_location else 'single combined sheet'}")
     log(f" -> Master Report Saved: {final_output_path.name}")
     log(f"=================================================================\n")
 

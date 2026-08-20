@@ -41,6 +41,15 @@ LVT_ON_TEAL = "#E5F5F5"
 APPEARANCE_MODES = ("Light", "Dark", "System")
 DEFAULT_APPEARANCE = "Light"
 
+# --- Audit report layout (audit_gui.py) -------------------------------------------
+# Not look-and-feel, but it is an operator preference that has to survive a relaunch,
+# and this module already owns the prefs file -- so it lives here rather than opening
+# a second store. The strings double as the segmented button's labels.
+LAYOUT_TABS = "Tab per location"
+LAYOUT_SINGLE = "One sheet"
+REPORT_LAYOUTS = (LAYOUT_TABS, LAYOUT_SINGLE)
+DEFAULT_REPORT_LAYOUT = LAYOUT_TABS
+
 # Remembers the operator's Light/Dark choice between launches. Machine-local
 # convenience only -- no fleet data in it, but there's no reason to commit it either.
 UI_PREFS = Path(__file__).with_name("ui_prefs.json")
@@ -57,22 +66,51 @@ def resolve(color):
     return color
 
 
-def load_appearance():
-    """The saved appearance choice, or the default when nothing is stored yet.
-    Best-effort: a missing or corrupt prefs file must never stop the GUI opening."""
+def load_prefs():
+    """Every stored UI preference as a dict, or an empty one when nothing is saved
+    yet. Best-effort: a missing or corrupt prefs file must never stop the GUI
+    opening, so a bad read reads as "no preferences" rather than raising."""
     try:
-        saved = json.loads(UI_PREFS.read_text(encoding="utf-8")).get("appearance")
+        prefs = json.loads(UI_PREFS.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return DEFAULT_APPEARANCE
+        return {}
+    return prefs if isinstance(prefs, dict) else {}
+
+
+def save_pref(key, value):
+    """Persist one preference, leaving the others alone. Read-modify-write rather
+    than a plain overwrite: the file holds several unrelated keys now, and writing
+    just the one being changed would silently drop the rest."""
+    prefs = load_prefs()
+    prefs[key] = value
+    try:
+        UI_PREFS.write_text(json.dumps(prefs, indent=2, sort_keys=True), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def load_appearance():
+    """The saved appearance choice, or the default when nothing is stored yet."""
+    saved = load_prefs().get("appearance")
     return saved if saved in APPEARANCE_MODES else DEFAULT_APPEARANCE
 
 
 def save_appearance(mode):
     """Persist the appearance choice for the next launch (best-effort)."""
-    try:
-        UI_PREFS.write_text(json.dumps({"appearance": mode}, indent=2), encoding="utf-8")
-    except OSError:
-        pass
+    save_pref("appearance", mode)
+
+
+def load_report_layout():
+    """The saved audit-report layout, or the default when nothing is stored yet.
+    Anything unrecognized falls back to the default rather than being trusted --
+    a hand-edited prefs file must not be able to pick a layout that doesn't exist."""
+    saved = load_prefs().get("report_layout")
+    return saved if saved in REPORT_LAYOUTS else DEFAULT_REPORT_LAYOUT
+
+
+def save_report_layout(layout):
+    """Persist the audit-report layout choice for the next launch (best-effort)."""
+    save_pref("report_layout", layout)
 
 
 def init_appearance():
